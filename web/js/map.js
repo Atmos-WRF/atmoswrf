@@ -79,6 +79,105 @@ class MapView {
   setRaster(r) { this.raster = r; this.redraw(); }
   setPPI(p) { this.ppi = p; this._ppiCache = null; this.redraw(); }
 
+  // ---------------------------------------------------------------- map tiles (arhtmodelviewer/tiles.py)
+  // The background: 'plain' (the dark map), 'osm' / 'osmdark' (OpenStreetMap, light or darkened here), 'sat'
+  // (Esri World Imagery) or 'satlabels' (with roads and place names over the radar).  Web-Mercator tiles are
+  // warped onto the Lambert plane piece by piece (each tile cut into n x n quads, each drawn with its own affine
+  // map), so they line up with the county lines and the radar; a tile still loading is stood in for by the
+  // nearest coarser one already here.  dim: 0..0.8 of darkening over the imagery, so the radar stands out.
+  setBase(name, dim) {
+    this.base = name || 'plain';
+    if (dim !== undefined) this.baseDim = dim;
+    this.redraw();
+  }
+
+  static BASES = {
+    osm: { under: ['osm'], over: [], filter: 'none', attribution: '© OpenStreetMap contributors' },
+    osmdark: { under: ['osm'], over: [], filter: 'invert(1) hue-rotate(180deg) brightness(0.9) contrast(0.85) saturate(0.6)',
+               attribution: '© OpenStreetMap contributors' },
+    sat: { under: ['sat'], over: [], filter: 'none',
+           attribution: 'Imagery © Esri, Maxar, Earthstar Geographics, and the GIS User Community' },
+    satlabels: { under: ['sat'], over: ['roads', 'places'], filter: 'none',
+                 attribution: 'Imagery, roads and labels © Esri, Maxar, Earthstar Geographics, and the GIS User Community' },
+  };
+
+  _tile(src, z, x, y) {
+    const T = this._tiles || (this._tiles = new Map());
+    const key = `${src}/${z}/${x}/${y}`;
+    let t = T.get(key);
+    if (t) { T.delete(key); T.set(key, t); return t; }         // most recently used last
+    t = { img: new Image(), ok: false };
+    this._inflight = this._inflight || 0;
+    if (this._inflight > 16) return null;                    // not now: asked again on a later frame
+    this._inflight++;
+    t.img.onload = () => { t.ok = true; this._inflight--; this.redraw(); };
+    t.img.onerror = () => { t.bad = true; this._inflight--; };
+    t.img.src = `/tiles/${src}/${z}/${x}/${y}`;
+    T.set(key, t);
+    while (T.size > 700) T.delete(T.keys().next().value);
+    return t;
+  }
+
+  _tileLL(z, tx, ty) {             // tile coordinates (fractional) at zoom z -> [lat, lon]
+    const n = 2 ** z;
+    return [Math.atan(Math.sinh(Math.PI * (1 - 2 * ty / n))) * 180 / Math.PI, tx / n * 360 - 180];
+  }
+
+  _drawTileImage(g, dpr, img, z, tx, ty, span, sx, sy, ss) {
+    // the part (sx, sy, ss px) of img that covers tile-space [tx, tx+span] x [ty, ty+span] at zoom z
+    const nq = z < 6 ? 6 : z < 9 ? 3 : 2, d = span / nq, sd = ss / nq;
+    for (let j = 0; j < nq; j++) for (let i = 0; i < nq; i++) {
+      const p = (a, b) => { const [la, lo] = this._tileLL(z, tx + a * d, ty + b * d); return this.toScreen(...this.fwd(la, lo)); };
+      const p00 = p(i, j), p10 = p(i + 1, j), p01 = p(i, j + 1);
+      const ax = (p10[0] - p00[0]) / sd, ay = (p10[1] - p00[1]) / sd, bx = (p01[0] - p00[0]) / sd, by = (p01[1] - p00[1]) / sd;
+      g.setTransform(dpr * ax, dpr * ay, dpr * bx, dpr * by, dpr * p00[0], dpr * p00[1]);
+      g.drawImage(img, sx + i * sd, sy + j * sd, sd, sd, -0.3, -0.3, sd + 0.6, sd + 0.6);   // a hair of overlap: no seams
+    }
+  }
+
+  _drawTiles(g, dpr, layers, filter) {
+    if (!this.proj || !layers.length) return;
+    const W = this.W, H = this.H;
+    // the view's corners and edges in lat / lon, and the zoom whose pixels are about the screen's
+    const pts = [];
+    for (let a = 0; a <= 4; a++) for (let b = 0; b <= 4; b++) pts.push(this.inv(...this.toWorld(a * W / 4, b * H / 4)));
+    const clat = this.inv(this.cx, this.cy)[0];
+    const mpp = 1000 / this.scale / Math.min(dpr, 2);
+    let z = Math.round(Math.log2(156543.03 * Math.cos(clat * Math.PI / 180) / mpp));
+    z = Math.max(2, Math.min(18, z));
+    const tileXY = (la, lo, zz) => { const n = 2 ** zz, lr = Math.max(-85, Math.min(85, la)) * Math.PI / 180;
+      return [(lo + 180) / 360 * n, (1 - Math.log(Math.tan(lr) + 1 / Math.cos(lr)) / Math.PI) / 2 * n]; };
+    let x0, x1, y0, y1;
+    for (;;) {
+      const xy = pts.map(([la, lo]) => tileXY(la, lo, z));
+      x0 = Math.floor(Math.min(...xy.map(q => q[0]))); x1 = Math.floor(Math.max(...xy.map(q => q[0])));
+      y0 = Math.floor(Math.min(...xy.map(q => q[1]))); y1 = Math.floor(Math.max(...xy.map(q => q[1])));
+      if ((x1 - x0 + 1) * (y1 - y0 + 1) <= 160 || z <= 2) break;
+      z--;
+    }
+    const n = 2 ** z;
+    g.save();
+    g.filter = filter || 'none';
+    for (const src of layers) {
+      for (let y = Math.max(0, y0); y <= Math.min(n - 1, y1); y++) for (let x = x0; x <= x1; x++) {
+        const xx = ((x % n) + n) % n;
+        const t = this._tile(src, z, xx, y);
+        if (t && t.ok) { this._drawTileImage(g, dpr, t.img, z, x, y, 1, 0, 0, t.img.width); continue; }
+        // a coarser tile already here stands in
+        for (let up = 1; up <= 4 && z - up >= 0; up++) {
+          const f = 2 ** up, px = Math.floor(xx / f), py = Math.floor(y / f);
+          const k = this._tiles && this._tiles.get(`${src}/${z - up}/${px}/${py}`);
+          if (k && k.ok) {
+            const ss = k.img.width / f;
+            this._drawTileImage(g, dpr, k.img, z, x, y, 1, (xx - px * f) * ss, (y - py * f) * ss, ss);
+            break;
+          }
+        }
+      }
+    }
+    g.restore();
+  }
+
   // ---------------------------------------------------------------- input
   _bind() {
     const c = this.canvas;
@@ -167,8 +266,15 @@ class MapView {
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.fillStyle = '#0b0e13'; g.fillRect(0, 0, W, H);
     const s = this.scale, ox = W / 2 - this.cx * s, oy = H / 2 + this.cy * s;
+    const base = MapView.BASES[this.base];
+    if (base) {
+      this._drawTiles(g, dpr, base.under, base.filter);
+      const dim = this.baseDim ?? (this.base === 'osm' ? 0 : 0.25);
+      if (dim > 0) { g.setTransform(dpr, 0, 0, dpr, 0, 0); g.fillStyle = `rgba(11,14,19,${dim})`; g.fillRect(0, 0, W, H); }
+    }
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
     // world (km) -> screen: x' = s x + ox, y' = -s y + oy
-    if (this.paths && this.paths.lakes) {
+    if (!base && this.paths && this.paths.lakes) {
       g.save(); g.setTransform(dpr * s, 0, 0, -dpr * s, dpr * ox, dpr * oy);
       g.lineWidth = 0.8 / s; g.strokeStyle = '#1f3550'; g.stroke(this.paths.lakes); g.restore();
     }
@@ -184,6 +290,7 @@ class MapView {
       g.restore();
     }
     if (this.ppi) this._drawPPI(g, dpr);
+    if (base && base.over.length) { this._drawTiles(g, dpr, base.over, 'none'); g.setTransform(dpr, 0, 0, dpr, 0, 0); }
     // map lines
     if (this.paths) {
       g.save(); g.setTransform(dpr * s, 0, 0, -dpr * s, dpr * ox, dpr * oy);
@@ -197,6 +304,12 @@ class MapView {
       g.restore();
     }
     if (this.overlay) { g.save(); this.overlay(g, this); g.restore(); }
+    if (base) {                    // the tiles' attribution, as their terms ask
+      g.save(); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.font = '10px Segoe UI, sans-serif';
+      const tw = g.measureText(base.attribution).width + 10;
+      g.fillStyle = 'rgba(0,0,0,.55)'; g.fillRect(W - tw, H - 15, tw, 15);
+      g.fillStyle = '#d8dee8'; g.fillText(base.attribution, W - tw + 5, H - 4); g.restore();
+    }
     // hodograph brush stroke being painted: as wide as the brush
     if (this._drag && this.tool === 'brush' && this._drag.path) {
       g.save(); g.strokeStyle = 'rgba(167,139,250,.45)'; g.lineCap = 'round'; g.lineJoin = 'round';

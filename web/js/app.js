@@ -1690,6 +1690,17 @@ function bindUI() {
   };
   $('showPatches').onchange = () => map.redraw();
   $('showCounties').onchange = () => { map.showCounties = $('showCounties').checked; map.redraw(); };
+  {
+    let b = 'plain';
+    try { b = localStorage.getItem('arht.basemap') || 'plain'; } catch (e) { /* private window */ }
+    if (![...$('basemap').options].some(o => o.value === b)) b = 'plain';
+    $('basemap').value = b; map.setBase(b);
+    $('basemap').onchange = () => {
+      map.setBase($('basemap').value);
+      try { localStorage.setItem('arht.basemap', $('basemap').value); } catch (e) { /* private window */ }
+      if (window.volBaseChanged) window.volBaseChanged($('basemap').value);
+    };
+  }
   $('showTorTracks').onchange = () => map.redraw();
   $('showWarnings').onchange = () => map.redraw();
   $('showStarts').onchange = () => map.redraw();

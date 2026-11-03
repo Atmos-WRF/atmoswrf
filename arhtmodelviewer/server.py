@@ -297,6 +297,35 @@ class Handler(BaseHTTPRequestHandler):
                                    "boundary_kinds": boundaries.KINDS,
                                    "microphysics": [{"id": k, "label": MICROPHYSICS[k]} for k in MICROPHYSICS_MENU],
                                    "suites": _suites(), "poll": _poll_links()})
+            if path.startswith("/tiles/"):
+                # a map tile (tiles.py): fetched from its provider once, then from the cache
+                from . import tiles
+                parts = path.split("/")
+                try:
+                    src, z, x, y = parts[2], int(parts[3]), int(parts[4]), int(parts[5].split(".")[0])
+                    data = tiles.tile(src, z, x, y)
+                except (IndexError, ValueError) as e:
+                    return self._error(404, str(e))
+                except Exception as e:
+                    return self._error(502, f"map tile unavailable: {e}")
+                ctype = "image/jpeg" if data[:3] == b"\xff\xd8\xff" else "image/png"
+                return self._send(200, data, ctype, cache=True)
+            if path == "/api/tiles":
+                from . import tiles
+                return self._json(tiles.info())
+            if path == "/api/volume/ground":
+                # the 3-D view's ground: the map tiles of its box, on the model's plane (tiles.ground)
+                from . import tiles
+                sim = APP.sim
+                if sim is None:
+                    return self._error(404, "no run")
+                srcs = [s for s in [q.get("src", "sat")] + (["roads", "places"] if q.get("labels") == "1" else []) if s in tiles.SOURCES]
+                try:
+                    png = tiles.ground(sim.proj, [float(q[k]) for k in ("x0", "y0", "x1", "y1")], srcs,
+                                       max(256, min(int(q.get("px", 1024)), 2048)))
+                except Exception as e:
+                    return self._error(404, str(e))
+                return self._send(200, png, "image/png")
             if path == "/remote":
                 return self._send(200, (WEB / "remote.html").read_bytes(), "text/html; charset=utf-8")
             if path.startswith("/api/r/"):

@@ -25,6 +25,7 @@ const Vol = (() => {
     { v: 20, c: [255, 140, 30, 255] }, { v: 40, c: [225, 30, 30, 255] }, { v: 64, c: [255, 100, 240, 255] },
   ];
   let gl = null, prog = null, cloudProg = null, volTex = null, lutTex = null, gndTex = null, vao = null;
+  let mapTex = null, mapKey = '', mapOn = false;            // the map picture on the ground (tiles.py ground())
   let head = null, box = null, busy = false, again = false, timer = null, lastKey = '';
   let tor = false, paths = null;               // the tornado view (tornado.py): its box, followed; its parcels' paths
   const CAM0 = { yaw: -0.75, pitch: 0.38, dist: 3.6, px: 0, py: 0 };
@@ -91,6 +92,15 @@ const Vol = (() => {
   uniform mat4 invVP; uniform vec3 eye; uniform vec3 size;        // box: x in [-size.x/2, size.x/2], z in [0, size.z]
   uniform float thrHi, thrLo, opacity, gridStep; uniform int mode, signedField; uniform vec3 texel;
   uniform sampler2D gnd; uniform int hasG;
+  uniform sampler2D mapTex; uniform int hasMap, mapDark;
+  vec3 mapAt(vec2 xy, vec3 fallback) {      // the map picture (OSM / satellite) on the ground under xy
+    if (hasMap == 0) return fallback;
+    vec2 uv = vec2(xy.x / size.x + 0.5, xy.y / size.y + 0.5);
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return fallback;
+    vec3 c = texture(mapTex, uv).rgb;
+    if (mapDark == 1) { float L = dot(c, vec3(0.333)); c = clamp(1.0 - 2.0 * L + c, 0.0, 1.0) * 0.8; }
+    return c;
+  }
   float gz(vec2 xy) {                       // the ground's height (box units) under xy; 0 outside the box / flat runs
     if (hasG == 0) return 0.0;
     vec2 uv = vec2(xy.x / size.x + 0.5, xy.y / size.y + 0.5);
@@ -180,8 +190,9 @@ const Vol = (() => {
       float w = 0.0025 * length(eye);
       float line = (f.x < w || f.y < w) ? 1.0 : 0.0;
       vec3 c = mix(vec3(0.15, 0.19, 0.16), vec3(0.30, 0.27, 0.22), clamp(g.z / (0.25 * size.z), 0.0, 1.0));
+      c = mapAt(g.xy, c);
       c = c * (0.45 + 0.75 * d);
-      rgb += rest * mix(c, vec3(0.30, 0.35, 0.40), line * 0.6); rest = 0.0;
+      rgb += rest * mix(c, vec3(0.30, 0.35, 0.40), line * (hasMap == 1 ? 0.25 : 0.6)); rest = 0.0;
     }
     if (!hit && rest > 0.0) {
       // the ground (z = 0) under the box, with a grid
@@ -193,7 +204,8 @@ const Vol = (() => {
           vec2 f = abs(fract(g.xy / gridStep + 0.5) - 0.5) * gridStep;
           float w = 0.0025 * length(eye);
           float line = (f.x < w || f.y < w) ? 1.0 : 0.0;
-          ground = mix(vec3(0.13, 0.15, 0.18), vec3(0.27, 0.31, 0.36), line);
+          ground = hasMap == 1 ? mix(mapAt(g.xy, vec3(0.13)) * 0.85, vec3(0.45, 0.50, 0.56), line * 0.3)
+                               : mix(vec3(0.13, 0.15, 0.18), vec3(0.27, 0.31, 0.36), line);
           rgb += rest * ground; rest = 0.0;
         }
       }
@@ -215,6 +227,15 @@ const Vol = (() => {
   uniform sampler3D vol;
   uniform mat4 invVP; uniform vec3 eye; uniform vec3 size; uniform vec3 toKm; uniform vec3 sunDir; uniform float density;
   uniform sampler2D gnd; uniform int hasG; uniform float relief; uniform vec3 texel;
+  uniform sampler2D mapTex; uniform int hasMap, mapDark;
+  vec3 mapAt(vec2 xy, vec3 fallback) {      // the map picture (OSM / satellite) on the ground under xy
+    if (hasMap == 0) return fallback;
+    vec2 uv = vec2(xy.x / size.x + 0.5, xy.y / size.y + 0.5);
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return fallback;
+    vec3 c = texture(mapTex, uv).rgb;
+    if (mapDark == 1) { float L = dot(c, vec3(0.333)); c = clamp(1.0 - 2.0 * L + c, 0.0, 1.0) * 0.8; }
+    return c;
+  }
   float gz(vec2 xy) {                       // the ground's height (box units) under xy; 0 outside the box / flat runs
     if (hasG == 0) return 0.0;
     vec2 uv = vec2(xy.x / size.x + 0.5, xy.y / size.y + 0.5);
@@ -284,7 +305,9 @@ const Vol = (() => {
       float lit = exp(-sunTau(g + vec3(0, 0, 1e-4), wd, kmPerW));
       vec3 n = hasG == 1 ? gnormal(g.xy) : vec3(0, 0, 1);
       float sl = max(dot(n, sunDir), 0.0);
-      vec3 grd = mix(vec3(0.17, 0.24, 0.10), vec3(0.26, 0.24, 0.17), clamp(g.z / (0.12 * size.z), 0.0, 1.0)) *
+      vec3 alb = mix(vec3(0.17, 0.24, 0.10), vec3(0.26, 0.24, 0.17), clamp(g.z / (0.12 * size.z), 0.0, 1.0));
+      if (hasMap == 1) { alb = pow(mapAt(g.xy, pow(alb, vec3(1.0 / 2.2))), vec3(2.2)) * 0.9; }
+      vec3 grd = alb *
                  (SUN * sl * lit * 0.35 + amb * (0.25 + 0.15 * n.z));
       float dist = length((g - ro) * toKm);
       bg = mix(grd, vec3(0.62, 0.70, 0.80), 1.0 - exp(-dist / 260.0));
@@ -353,7 +376,7 @@ const Vol = (() => {
     prog = link(FS);
     cloudProg = link(FS_CLOUD);
     vao = gl.createVertexArray();
-    volTex = gl.createTexture(); lutTex = gl.createTexture(); gndTex = gl.createTexture();
+    volTex = gl.createTexture(); lutTex = gl.createTexture(); gndTex = gl.createTexture(); mapTex = gl.createTexture();
     return true;
   }
 
@@ -442,6 +465,7 @@ const Vol = (() => {
           gl.texParameteri(gl.TEXTURE_2D, k, v);
       }
       if (!two) await uploadLUT();
+      await loadMap();
       const run = S.run && S.run.t !== undefined ? `  ·  model +${fmtDur(S.run.t)}` : '';
       $('volStatus').textContent = (tor ? `Tornado zoom (${Math.round(header.dx)} m grid) · ` : '') +
         `${(box[2] - box[0]).toFixed(tor ? 1 : 0)} × ${(box[3] - box[1]).toFixed(tor ? 1 : 0)} km, ` +
@@ -479,7 +503,34 @@ const Vol = (() => {
   function bindGround(u) {
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, gndTex); gl.uniform1i(u('gnd'), 2);
     gl.uniform1i(u('hasG'), head && head.ground ? 1 : 0);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, mapTex); gl.uniform1i(u('mapTex'), 3);
+    gl.uniform1i(u('hasMap'), mapOn ? 1 : 0);
+    gl.uniform1i(u('mapDark'), baseName() === 'osmdark' ? 1 : 0);
   }
+
+  // the map picked on the map bar (app.js), drawn on the ground: one picture of the box from the server
+  const baseName = () => { const e = $('basemap'); return e ? e.value : 'plain'; };
+  async function loadMap() {
+    const b = baseName();
+    if (!box || b === 'plain') { mapOn = false; mapKey = ''; return; }
+    const src = b.startsWith('sat') ? 'sat' : 'osm', labels = b === 'satlabels' ? 1 : 0;
+    const key = `${box.join(',')}/${src}/${labels}`;
+    if (key === mapKey) return;
+    try {
+      const r = await api(`/api/volume/ground?x0=${box[0]}&y0=${box[1]}&x1=${box[2]}&y1=${box[3]}&src=${src}&labels=${labels}&px=1536`);
+      const bmp = await createImageBitmap(await r.blob());
+      gl.bindTexture(gl.TEXTURE_2D, mapTex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);         // row 0 (north) at the top: v = 1
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                            [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+        gl.texParameteri(gl.TEXTURE_2D, k, v);
+      mapKey = key; mapOn = true;
+    } catch (e) { mapOn = false; }
+  }
+  window.volBaseChanged = () => { if (gl && box) loadMap().then(() => { if (head) draw(); }); };
 
   function drawCloud(G, eye, VP) {
     const az = +$('volSun').value * Math.PI / 180, el = +$('volSunH').value * Math.PI / 180;

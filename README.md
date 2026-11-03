@@ -19,6 +19,9 @@ STP, CAPE or "+ 500 hPa" over any map. Needs internet (~70 MB per forecast hour,
 start of this version adds the small HRRR decoder to the shared setup by itself (a few seconds).
 
 New in 3.0:
+- Real maps (map toolbar, the dropdown next to the color table): OpenStreetMap, OpenStreetMap dark,
+  satellite imagery, or satellite with roads and place names, under the radar and on the 3-D view's ground.
+  Needs the internet the first time; tiles are kept in output\cache	iles for 30 days.
 - Tornado list (map toolbar, and by itself when a run with tornadoes ends): every tornado named after the
   biggest town it hit and rated like an NWS office before a survey, strongest first. With it the damage
   survey: each track's EF contours from the model's winds, as Google Earth KML, a CSV, and a GR2Analyst

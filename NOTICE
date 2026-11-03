@@ -17,3 +17,8 @@ Map and ground data in data/ (each folder's SOURCES.md has the details and downl
 - GMTED2010 terrain, USGS / NGA (public domain).
 - MODIS land use (WRF's WPS_GEOG modis_landuse_20class_30s, NCAR / UCAR; NASA MODIS data, free of restrictions).
 - Iowa Environmental Mesonet station list (Iowa State University).
+
+Map tiles fetched while running (not included; attribution is drawn on the map):
+
+- OpenStreetMap tiles, (c) OpenStreetMap contributors (ODbL), tile.openstreetmap.org under its tile usage policy.
+- Esri World Imagery and World Reference layers, (c) Esri, Maxar, Earthstar Geographics, and the GIS User Community.

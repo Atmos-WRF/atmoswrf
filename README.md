@@ -8,3 +8,4 @@
  open setup, then open Atmos-WRF.
  If you have failed setup, it is likely due to you not meeting the required specifications.
  discord : https://discord.gg/bGDPG9xkkg
+ credits to ArWen-WRF, Sprzzy, Garammaslala

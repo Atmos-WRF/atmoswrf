@@ -1,4 +1,5 @@
 **atmos-wrf**
+MADE BY WAZAP
 
  a simple gpu based app that runs a modified version of WRF. Can run ERA-5, HRRR, and single sounding based runs.
 

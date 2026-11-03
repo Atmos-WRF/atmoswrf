@@ -1,0 +1,6 @@
+# Atmos-WRF runtime, installed into runtime\venv by Setup.cmd (Python 3.13, Windows, NVIDIA GPU).
+# ArWen's GPU WRF core (Apache-2.0); brings NumPy, CuPy and the CUDA 12 toolkit (about 4 GB).
+gpuwm[gpu-cu12]==2.9.2
+# Optional, only for tests\radar_loop.py (reads the Level II files back): MetPy==1.7.1
+# Reads NOAA's HRRR model data (GRIB2) for the Weather tab's HRRR source; its decoder library is bundled.
+eccodes==2.50.0

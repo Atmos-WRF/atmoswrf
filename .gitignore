@@ -1,0 +1,13 @@
+# What stays on this PC (never uploaded)
+runtime/
+output/
+dist/
+data/imported/
+
+# Python and editor leftovers
+__pycache__/
+*.pyc
+*.part
+.vscode/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1318">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Atmos-WRF Remote">
+<title>Atmos-WRF Remote</title>
+<style>
+  :root { --bg: #0f1318; --panel: #171c23; --panel2: #1e252e; --line: #2a333e; --ink: #e8edf3; --muted: #8b97a6;
+          --accent: #4aa3ff; --good: #3ecf8e; --warn: #f2b84b; --bad: #ff5c5c; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.4 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  header { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+           background: rgba(15, 19, 24, .92); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+  header b { font-size: 16px; letter-spacing: .2px; }
+  .chip { padding: 3px 10px; border-radius: 99px; font-size: 12px; font-weight: 600; background: var(--panel2); color: var(--muted); }
+  .chip.running { background: rgba(62, 207, 142, .15); color: var(--good); }
+  .chip.paused, .chip.waiting { background: rgba(242, 184, 75, .15); color: var(--warn); }
+  .chip.error { background: rgba(255, 92, 92, .15); color: var(--bad); }
+  .grow { flex: 1; }
+  main { padding: 12px 16px 90px; display: flex; flex-direction: column; gap: 12px; max-width: 760px; margin: 0 auto; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .card h3 { margin: 0; padding: 12px 14px 6px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .6px; }
+  .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--line); }
+  .stats div { background: var(--panel); padding: 10px 12px; }
+  .stats small { display: block; color: var(--muted); font-size: 11px; }
+  .stats span { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .radar { position: relative; background: #0b0d10; aspect-ratio: 1 / 1; }
+  .radar img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .radar .stamp { position: absolute; right: 8px; bottom: 8px; font-size: 11px; color: var(--muted); background: rgba(0,0,0,.55); padding: 2px 6px; border-radius: 6px; }
+  .seg { display: flex; gap: 6px; padding: 10px; flex-wrap: wrap; }
+  .seg button, select { flex: 1; min-width: 60px; height: 38px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel2);
+           color: var(--ink); font: inherit; font-size: 14px; }
+  .seg button.on { background: var(--accent); border-color: var(--accent); color: #07121f; font-weight: 600; }
+  ul { list-style: none; margin: 0; padding: 0 14px 10px; }
+  li { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  li:last-child { border-bottom: none; }
+  li .meta { color: var(--muted); font-size: 12px; }
+  .ef { display: inline-block; min-width: 38px; text-align: center; border-radius: 6px; padding: 1px 6px; font-weight: 700; color: #111; margin-right: 6px; }
+  .live { color: var(--bad); font-size: 12px; font-weight: 600; }
+  .controls { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 10px; padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+              background: rgba(15, 19, 24, .94); backdrop-filter: blur(8px); border-top: 1px solid var(--line); }
+  .controls button { flex: 1; height: 46px; border-radius: 12px; border: none; font: inherit; font-weight: 700; font-size: 15px; }
+  #bPause { background: var(--warn); color: #241a05; }
+  #bStop { background: var(--bad); color: #2a0707; }
+  .login { min-height: 80vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 24px; text-align: center; }
+  .login input { width: 220px; height: 52px; font-size: 26px; text-align: center; letter-spacing: 8px; border-radius: 12px;
+                 border: 1px solid var(--line); background: var(--panel2); color: var(--ink); }
+  .login button { width: 220px; height: 48px; border-radius: 12px; border: none; background: var(--accent); color: #07121f; font: inherit; font-weight: 700; }
+  .err { color: var(--bad); min-height: 20px; }
+  .hint { color: var(--muted); font-size: 13px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="login" class="login hidden">
+  <div style="font-size:40px">🌪️</div>
+  <b style="font-size:20px">Atmos-WRF Remote</b>
+  <div class="hint">Enter the PIN shown in the viewer (Radar tab → Phone remote).<br>The watch PIN looks, the control PIN can pause and stop.</div>
+  <input id="pin" inputmode="numeric" autocomplete="one-time-code" maxlength="12" placeholder="••••••">
+  <button id="go">Sign in</button>
+  <div id="err" class="err"></div>
+</div>
+
+<div id="app" class="hidden">
+  <header><b>Atmos-WRF Remote</b><span id="status" class="chip">…</span><span class="grow"></span><span id="role" class="chip"></span></header>
+  <main>
+    <div class="card">
+      <div class="stats">
+        <div><small>Model time</small><span id="sClock">–</span></div>
+        <div><small>Run time</small><span id="sT">–</span></div>
+        <div><small>Speed</small><span id="sSpeed">–</span></div>
+        <div><small>Storms</small><span id="sStorms">–</span></div>
+        <div><small>Tornadoes</small><span id="sTor">–</span></div>
+        <div><small>Warnings</small><span id="sWarn">–</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="seg"><select id="site"></select></div>
+      <div class="radar"><img id="img" alt="" class="hidden"><span id="stamp" class="stamp">No radar volume yet</span></div>
+      <div class="seg" id="prod"><button data-p="BR" class="on">Reflectivity</button><button data-p="BV">Velocity</button><button data-p="CC">CC</button></div>
+      <div class="seg" id="view"><button data-v="storm" class="on">Tornado</button><button data-v="60">60 km</button><button data-v="150">150 km</button><button data-v="230">230 km</button></div>
+    </div>
+    <div class="card"><h3>Tornadoes</h3><ul id="tors"><li class="meta">None yet.</li></ul></div>
+    <div class="card"><h3>Warnings</h3><ul id="warns"><li class="meta">None.</li></ul></div>
+    <div class="card"><h3>Log</h3><ul id="log"></ul></div>
+    <div class="hint" style="text-align:center"><a href="#" id="out" style="color:var(--muted)">Sign out</a></div>
+  </main>
+  <div id="controls" class="controls hidden"><button id="bPause">Pause</button><button id="bStop">Stop run</button></div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const EF = ['#00b4e6', '#00c800', '#e6d700', '#ff8000', '#ff0000', '#ff00ff'];
+  let token = localStorage.getItem('arhtRemote') || '', role = '', prod = 'BR', view = 'storm', site = '', last = null, imgKey = '';
+  const api = async (path, body) => {
+    const r = await fetch('/api/r/' + path, body ? { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Remote-Token': token }, body: JSON.stringify(body) }
+      : { headers: { 'X-Remote-Token': token } });
+    if (r.status === 401) { signOut(); throw new Error('signed out'); }
+    const d = await r.json(); if (!r.ok) throw new Error(d.error || r.statusText); return d;
+  };
+  function signOut() { token = ''; localStorage.removeItem('arhtRemote'); $('app').classList.add('hidden'); $('login').classList.remove('hidden'); }
+  $('out').onclick = e => { e.preventDefault(); signOut(); };
+  $('go').onclick = async () => {
+    $('err').textContent = '';
+    try {
+      const r = await fetch('/api/r/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: $('pin').value }) });
+      const d = await r.json(); if (!r.ok) throw new Error(d.error || 'wrong PIN');
+      token = d.token; localStorage.setItem('arhtRemote', token); start();
+    } catch (e) { $('err').textContent = e.message; }
+  };
+  $('pin').onkeydown = e => { if (e.key === 'Enter') $('go').click(); };
+  const fmt = s => { s = Math.max(0, Math.round(s || 0)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? `${h} h ${m} min` : `${m} min`; };
+  function seg(id, attr, set) {
+    $(id).onclick = e => { const b = e.target.closest('button'); if (!b) return;
+      $(id).querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b)); set(b.dataset[attr]); imgKey = ''; refreshImage(); };
+  }
+  seg('prod', 'p', v => prod = v); seg('view', 'v', v => view = v);
+  $('site').onchange = () => { site = $('site').value; imgKey = ''; refreshImage(); };
+  $('bPause').onclick = async () => { await api('control', { action: last && last.status === 'paused' ? 'resume' : 'pause' }).catch(e => alert(e.message)); tick(); };
+  $('bStop').onclick = async () => { if (confirm('Stop the run? It cannot be resumed.')) { await api('control', { action: 'stop' }).catch(e => alert(e.message)); tick(); } };
+
+  async function tick() {
+    let d;
+    try { d = await api('state'); } catch (e) { $('status').textContent = 'offline'; return; }
+    last = d; role = d.role;
+    $('role').textContent = role === 'control' ? 'control' : 'watch';
+    $('controls').classList.toggle('hidden', role !== 'control' || !['running', 'paused', 'waiting'].includes(d.status));
+    $('bPause').textContent = d.status === 'paused' ? 'Resume' : 'Pause';
+    $('status').textContent = d.status === 'none' ? 'no run' : d.status; $('status').className = 'chip ' + (d.status || '');
+    $('sClock').textContent = d.model_ms ? new Date(d.model_ms).toISOString().slice(11, 16) + 'Z' : '–';
+    $('sT').textContent = d.t !== undefined ? fmt(d.t) : '–';
+    $('sSpeed').textContent = d.speed ? d.speed.toFixed(1) + '×' : '–';
+    $('sStorms').textContent = d.storms ?? '–';
+    $('sTor').textContent = (d.tornadoes || []).length + ((d.tornadoes || []).some(t => t.active) ? ' ●' : '');
+    $('sWarn').textContent = (d.warnings || []).filter(w => w.active).length;
+    const radars = d.radars || [];
+    if (radars.map(r => r.icao).join() !== [...$('site').options].map(o => o.value).join()) {
+      $('site').innerHTML = radars.map(r => `<option value="${r.icao}">${r.icao}${r.kind === 'dow' ? ' (DOW)' : ''}</option>`).join('');
+      site = site && radars.some(r => r.icao === site) ? site : (d.display_radar || (radars[0] || {}).icao || '');
+      $('site').value = site;
+    }
+    $('tors').innerHTML = (d.tornadoes || []).slice().reverse().map(t => `<li><span class="ef" style="background:${EF[Math.max(0, t.ef || 0)]}">EF${t.ef}</span>
+      T${t.id} ${t.active ? '<span class="live">on the ground</span>' : ''}<div class="meta">${fmt(t.t0)} – ${fmt(t.t1)}, peak ${Math.round((t.wind || 0) * 2.237)} mph</div></li>`).join('') || '<li class="meta">None yet.</li>';
+    $('warns').innerHTML = (d.warnings || []).slice().reverse().map(w => `<li><b>${w.code}</b> ${w.active ? '' : '<span class="meta">(expired)</span>'}<div class="meta">${w.hazard || ''}</div></li>`).join('') || '<li class="meta">None.</li>';
+    $('log').innerHTML = (d.events || []).slice().reverse().slice(0, 12).map(e => `<li><span class="meta">${fmt(e.t)} · ${e.kind}</span><div>${e.text.replace(/</g, '&lt;')}</div></li>`).join('');
+    refreshImage();
+  }
+  function refreshImage() {
+    if (!site) return;
+    const key = [site, prod, view, last && last.radars ? (last.radars.find(r => r.icao === site) || {}).volumes : 0].join('|');
+    if (key === imgKey) return;
+    imgKey = key;
+    const px = Math.min(1400, Math.round(Math.min(window.innerWidth, 760) * (window.devicePixelRatio || 1)));
+    fetch(`/api/r/image?site=${site}&product=${prod}&view=${view}&px=${px}`, { headers: { 'X-Remote-Token': token } })
+      .then(r => r.ok ? r.blob() : Promise.reject(r.status)).then(b => {
+        const u = URL.createObjectURL(b); const old = $('img').src; $('img').src = u; $('img').classList.remove('hidden'); if (old.startsWith('blob:')) URL.revokeObjectURL(old);
+        $('stamp').textContent = `${site} · ${prod} · updated ${new Date().toLocaleTimeString()}`;
+      }).catch(() => { $('stamp').textContent = `${site}: no volume yet`; });
+  }
+  function start() { $('login').classList.add('hidden'); $('app').classList.remove('hidden'); tick(); }
+  setInterval(() => { if (token) tick(); }, 10000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden && token) tick(); });
+  if (token) start(); else $('login').classList.remove('hidden');
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,791 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atmos-WRF</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<script>try { if (localStorage.getItem("arht-theme") === "dark") document.documentElement.setAttribute("data-theme", "dark"); } catch (e) {}</script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="top">
+  <div class="brand"><span class="mark" aria-hidden="true"></span><span class="name">Atmos-<b>WRF</b></span> <span class="sub">ArWen WRF core</span></div>
+  <div id="status" class="status idle">No run</div>
+  <div id="clock" class="clock"></div>
+  <div id="perf" class="perf"></div>
+  <button id="themeToggle" class="theme-toggle" type="button" title="Dark mode" aria-label="Switch between light and dark mode">☾</button>
+</header>
+<main>
+  <aside id="panel">
+    <nav class="tabs rail">
+      <div class="rail-group">Set up</div>
+      <button data-tab="atmos" class="on" title="Atmosphere: the sounding"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg><span>Atmosphere</span></button>
+      <button data-tab="domain" title="Domain: place, time and grid"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3a14 14 0 0 1 0 18"/><path d="M12 3a14 14 0 0 0 0 18"/></svg><span>Domain</span></button>
+      <button data-tab="storms" title="Storms: where and how they start (auto outbreak, placed cells, initiation zones, mergers)"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 16.9A5 5 0 0 0 18 7h-1.26a8 8 0 1 0-11.62 9"/><polyline points="13 11 9 17 15 17 11 23"/></svg><span>Storms</span></button>
+      <button data-tab="fronts" title="Fronts, drylines and outflow"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 17c3-6 6-6 9 0s6 6 9 0"/><path d="M6 13l-2-3 4 0z" fill="currentColor"/><path d="M14 13l-2-3 4 0z" fill="currentColor"/></svg><span>Fronts</span></button>
+      <button data-tab="radars" title="Radar sites and the GR2Analyst feed"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><line x1="12" y1="12" x2="18.5" y2="5.5"/><circle cx="12" cy="12" r="1" fill="currentColor"/></svg><span>Radar</span></button>
+      <button data-tab="physics" title="Physics and run speed"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v4"/><path d="M12 18v4"/><path d="M4.93 4.93l2.83 2.83"/><path d="M16.24 16.24l2.83 2.83"/><path d="M2 12h4"/><path d="M18 12h4"/><path d="M4.93 19.07l2.83-2.83"/><path d="M16.24 7.76l2.83-2.83"/><circle cx="12" cy="12" r="3"/></svg><span>Physics</span></button>
+      <div class="rail-group">Modes</div>
+      <button data-tab="weather" title="Weather: simulate the whole atmosphere (troughs, fronts, drylines) instead of one sounding"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9z"/><path d="M2 7c2-2 4-2 6 0"/></svg><span>Weather</span></button>
+      <button data-tab="tropics" title="Tropics: hurricane mode (the sea, its SST map, surface lows, the tropical sounding)"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/><path d="M14.5 9.5C14 5 10 3 6 4c3 1 4.5 3 4.5 5.5"/><path d="M9.5 14.5C10 19 14 21 18 20c-3-1-4.5-3-4.5-5.5"/></svg><span>Tropics</span></button>
+      <div class="rail-spacer"></div>
+      <button data-tab="files" title="Saved setups and library folders"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span>Files</span></button>
+      <button data-tab="log" title="Console: the run's messages"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg><span>Console</span></button>
+      <button data-tab="help" title="Guide: how to use Atmos-WRF"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg><span>Guide</span></button>
+      <button data-tab="credits" title="About"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg><span>About</span></button>
+    </nav>
+    <div class="panel-main">
+
+    <section id="tab-atmos" class="tab on">
+      <div class="subtabs" role="tablist">
+        <button data-sub="snd" class="on" title="The sounding and its basic adjustments">Sounding</button>
+        <button data-sub="adv" title="More changes to the sounding (moisture, cap, ice saturation, low-level jet, winds aloft) and the hodograph brush">Advanced</button>
+      </div>
+      <div id="sub-snd" class="sub on">
+      <h3>Storm environment</h3>
+      <div class="row"><select id="envSource" title="Where the storms' air comes from: one sounding everywhere, real soundings at every point from NOAA's HRRR model, or Atmos-WRF's own simulated weather">
+        <option value="sounding">One sounding everywhere (below)</option>
+        <option value="hrrr">NOAA HRRR: real soundings at every point</option>
+        <option value="era5">ERA5 reanalysis: any past day since 1940 (past outbreaks)</option>
+        <option value="sim">Atmos-WRF's simulated weather (Weather tab)</option></select></div>
+      <div id="envHrrrSlot"></div>
+      <p id="synAtmosNote" class="hint hidden"><b>Synoptic mode is on</b> (Weather tab): the run's air comes from the simulated weather, and its base sounding is the simulated column at the map centre at the start. The sounding below is not used.</p>
+      <h3>Sounding</h3>
+      <div class="row">
+        <select id="sndSource">
+          <option value="library">Pick from the library</option>
+          <option value="paste">Paste text (SHARPpy / input_sounding)</option>
+          <option value="wk">Weisman–Klemp (analytic)</option>
+        </select>
+      </div>
+      <div id="sndLibrary" class="row col">
+        <div class="buttons">
+          <input id="sndFilter" type="search" placeholder="Filter soundings…" style="flex:1">
+          <label class="filebtn" title="Open sounding files from anywhere (SHARPpy, Wyoming, input_sounding, JSON); they are kept in the library">Open file…<input id="sndOpen" type="file" multiple hidden></label>
+        </div>
+        <select id="sndList" size="6"></select>
+      </div>
+      <div id="sndPaste" class="row col hidden">
+        <textarea id="sndText" rows="6" placeholder="%RAW% … %END%   or   psfc thsfc qvsfc / z th qv u v"></textarea>
+        <button id="sndParse">Use this sounding</button>
+      </div>
+      <div id="sndWK" class="row col hidden">
+        <label>Surface θ (K) <input id="wkTh" type="number" value="300" step="1"></label>
+        <label>Mixing ratio cap (g/kg) <input id="wkQv" type="number" value="14" step="0.5"></label>
+        <label>Shear 0–6 km (m/s) <input id="wkShear" type="number" value="35" step="1"></label>
+        <label>Hodograph <select id="wkHodo"><option value="quarter">Quarter circle</option><option value="half">Half circle</option><option value="straight">Straight</option></select></label>
+        <button id="wkApply">Use analytic sounding</button>
+      </div>
+      <h3>Adjust</h3>
+      <div class="row checks">
+        <label title="Mix the lowest layer to constant θ and mixing ratio, like afternoon heating. Removes shallow caps and saturated surface layers that keep storms elevated.">
+          <input id="mixOn" type="checkbox"> Mix boundary layer</label>
+        <label class="chk">depth <input id="mixDepth" type="number" value="100" step="10" style="width:58px"> hPa</label>
+        <label class="chk">+<input id="mixHeat" type="number" value="0" step="0.5" style="width:48px"> K</label>
+      </div>
+      <div class="row checks">
+        <label title="Hours of sunny-afternoon surface heating put into the sounding before the run: the boundary layer grows, warms and gains the evaporated moisture (Bowen ratio 1), wearing a morning or evening cap down from below. The run itself has no surface heating, so a capped sounding otherwise stays capped and its storms barely lift their inflow, which starves their low-level rotation (May 3 1999's 00Z sounding: 2 h took MLCIN from -55 to -9 and low-level Vrot from 8 to 14 m/s). 0 = off.">
+          Surface heating <input id="heatHours" type="number" value="0" min="0" max="8" step="0.5" style="width:48px"> h</label>
+        <label class="chk">at <input id="heatFlux" type="number" value="300" min="50" max="600" step="25" style="width:58px"> W/m²</label>
+      </div>
+      <p id="heatHint" class="hint hidden">Not used with this setup: the physics package's land surface heats the ground itself as the run goes, and with the steady environment off the two would add up (the whole domain fires). Tick <b>Steady environment</b> to keep this pre-heating, or set it to 0.</p>
+      <div class="row checks">
+        <label title="Large-scale (synoptic) ascent during the whole run, like the lift ahead of an upper trough: the environment's mid levels cool and its moisture deepens a little every minute (-w dθ/dz, -w dq/dz, peaking at half the top height), so storms keep getting fresh instability for hours instead of living on what the sounding started with. Typical: 2-5 cm/s ahead of a trough, 5-10 under a strong one. Single-sounding runs only (ERA5 / HRRR / synoptic weather brings its own). 0 = off.">
+          Large-scale ascent <input id="lsW" type="number" value="0" min="0" max="30" step="0.5" style="width:48px"> cm/s</label>
+        <label class="chk">to <input id="lsTop" type="number" value="10" min="4" max="16" step="1" style="width:44px"> km</label>
+      </div>
+      <div class="row checks">
+        <label class="chk" title="Multiply every wind in the sounding by this factor: shear, helicity and storm motion scale with it. Lower it when the shear is too strong for the CAPE (storms that peak and then fall apart). 1 = as given.">
+          Scale winds × <input id="windScale" type="number" value="1" min="0.25" max="2" step="0.05" style="width:58px"></label>
+      </div>
+      </div>
+      <div id="sub-adv" class="sub">
+      <h3>Moisture &amp; cap</h3>
+      <div class="row checks">
+        <label class="chk" title="Raise the dewpoint of the lowest layer (after any mixing), tapering off at its top and never past saturation: moister inflow, a lower cloud base, more CAPE and less rain evaporating below cloud, so weaker cold pools. Temperatures are kept. 0 = as given.">
+          Moisten low levels: Td + <input id="moistDtd" type="number" value="0" min="0" max="8" step="0.5" style="width:48px"> °C</label>
+        <label class="chk">over <input id="moistDepth" type="number" value="100" min="20" max="300" step="10" style="width:58px"> hPa</label>
+      </div>
+      <div class="row checks">
+        <label class="chk" title="Raise the relative humidity between these two levels to at least this much (tapering off 50 hPa beyond each), never drying anything. Dry mid-level air is what rain and hail evaporate into on the way down: it drives the downdraft CAPE (DCAPE) and the cold outflow that undercuts a storm's inflow and starves tornadoes. 27 April 2011 had ~76 % (DCAPE 625 J/kg), May 20 2019 ~45 % (1280). 0 = as given.">
+          Moisten mid levels: RH ≥ <input id="midRh" type="number" value="0" min="0" max="95" step="5" style="width:48px"> %</label>
+        <label class="chk">from <input id="midBottom" type="number" value="750" min="400" max="900" step="25" style="width:58px"> to
+          <input id="midTop" type="number" value="450" min="200" max="800" step="25" style="width:58px"> hPa</label>
+      </div>
+      <div class="row checks">
+        <label class="chk" title="Add a cap (an elevated mixed layer) just warm enough that the mixed-layer parcel has this much CIN: an inversion at the base, then a steep lapse rate up to the sounding's own profile. Storms then go up only where the boundary layer is lifted hard (your storm starts, boundaries, strong gust fronts) instead of off every outflow, so they stay discrete. 25–75 J/kg is typical of a capped warm sector; 0 = as given. Applied after mixing and moistening, and never below a mixed layer.">
+          Cap: MLCIN − <input id="capCin" type="number" value="0" min="0" max="300" step="5" style="width:52px"> J/kg</label>
+        <label class="chk">base <input id="capBase" type="number" value="100" min="100" max="300" step="10" style="width:58px"> hPa above ground</label>
+      </div>
+      <h3>Winds</h3>
+      <div class="row checks">
+        <label class="chk" title="Add a low-level jet: this much extra wind along the wind's own direction at the jet height, nothing at the ground, fading out 1.5 km above the jet. Raises the near-ground shear and helicity that tornadoes feed on (the evening jet a 00Z sounding can predate) without touching CAPE or the winds aloft. 0 = as given.">
+          Low-level jet + <input id="lljSpeed" type="number" value="0" min="0" max="30" step="1" style="width:48px"> m/s</label>
+        <label class="chk">at <input id="lljHeight" type="number" value="750" min="200" max="2000" step="50" style="width:58px"> m</label>
+      </div>
+      <div class="row checks">
+        <label class="chk" title="Add this much wind along the mean upper-level wind direction: nothing below the base height, full from 4 km above it, held 3 km, fading out 4 km higher. The storm-relative wind at 9–11 km sets the supercell type: under ~18 m/s the rain wraps around the updraft (HP, cold wet outflow), 18–28 is classic (27 April 2011: 20). Raises deep shear too. 0 = as given.">
+          Winds aloft + <input id="aloftSpeed" type="number" value="0" min="0" max="40" step="1" style="width:48px"> m/s</label>
+        <label class="chk">above <input id="aloftBase" type="number" value="5" min="2" max="10" step="0.5" style="width:52px"> km</label>
+      </div>
+      <h3>Aloft</h3>
+      <div class="row checks">
+        <label title="Limit the humidity below freezing to ice saturation. Model soundings through cirrus or anvil debris are supersaturated over ice aloft; spread over the whole map that air snows out everywhere at once and buries the storms in echo. Storms still make their own anvils.">
+          <input id="iceCap" type="checkbox" checked> Dry to ice saturation aloft</label>
+      </div>
+      <p class="hint">These apply on top of the sounding every time it loads, like Mix boundary layer and Scale winds.</p>
+      <h3>Hodograph brush (painted on the map)</h3>
+      <div class="row grid2">
+        <label title="Half width of the stroke: full change within 40 % of it, feathered to nothing at its edge">Brush size (km) <input id="brSize" type="number" value="30" min="5" max="150" step="5"></label>
+        <label title="Turn the low-level winds counter-clockwise (backed: more helicity in the northern hemisphere); negative veers them">Back winds (°) <input id="brBack" type="number" value="20" min="-90" max="90" step="5"></label>
+        <label title="Extra low-level wind along its (new) direction: a stronger low-level jet">Add wind (m/s) <input id="brAdd" type="number" value="5" min="-15" max="25" step="1"></label>
+        <label title="Depth of the changed layer; it fades out by 1.15 x this">Depth (m) <input id="brDepth" type="number" value="1500" min="200" max="6000" step="100"></label>
+      </div>
+      <div class="row buttons"><button id="toolBrush" class="tool" title="Hold the mouse and paint on the map: the low-level winds under the stroke change as set above, smoothed out toward its edge and its ends">Paint on the map</button>
+        <button id="brClear" title="Remove every hodograph brush stroke">Clear strokes</button></div>
+      <div id="brushList" class="list"></div>
+      </div>
+      <div id="sndTitle" class="title"></div>
+      <div class="row buttons snd-actions"><button id="sndEdit" title="Open the sounding in an editor: every level in a table, points to drag on a large skew-T and hodograph, the parameters recomputed as you go (or double-click the skew-T)">Edit level by level…</button>
+        <button id="sndSkewtLab" class="accent" title="Open the sounding in Skew-T Lab: drag temperature, dewpoint and wind points with a brush, change the resolution, smooth, and see the full SHARPpy-style parameter set; then use it here">Open in Skew-T Lab</button></div>
+      <div class="plots"><canvas id="skewt" width="250" height="250" title="Double-click to edit the sounding"></canvas><canvas id="hodo" width="150" height="150"></canvas></div>
+      <div id="diag" class="diag"></div>
+    </section>
+
+    <section id="tab-weather" class="tab">
+      <h3>Simulated weather</h3>
+      <div class="row checks">
+        <label title="Instead of one sounding everywhere, the whole country's weather is simulated: the jet stream's troughs and surface cyclones, Gulf moisture return under the elevated mixed layer, fronts and drylines, the day's heating and the evening low-level jet. Every storm patch takes its air from it, and storms form on their own where CAPE, CIN and lift allow."><input id="synOn" type="checkbox"> Simulate the atmosphere (synoptic mode)</label>
+      </div>
+      <select id="synSource" class="hidden"><option value="sim"></option><option value="hrrr"></option></select>
+      <select id="hrrrModel" class="hidden"><option value="hrrr"></option><option value="era5"></option></select>
+      <p id="synHrrrElsewhere" class="hint hidden"><b>NOAA HRRR is the storm environment</b> (Atmosphere tab, Storm environment): its run, maps, storm domain and soundings are there.</p>
+      <p id="synSimHint" class="hint">The sounding, drawn fronts, hodograph brushes and the auto outbreak are not needed: the simulated weather makes its own. Place the map centre where you want the action (Domain tab) and pick the start time; the scenario puts its cyclone so the centre is in play at the peak.</p>
+      <div id="synPanel">
+      <div id="synHrrrBox" class="hidden">
+        <p class="hint era5Only hidden">Every point of the map gets ERA5's sounding for that hour (ECMWF's reanalysis: temperature, moisture and wind from the ground up, any hour since 1940), and Atmos-WRF's storms form and grow in it with the run's physics: a past outbreak's real environment, the storms the run's own. ERA5 is a 30 km model, so it has no storms of its own: ours start where its CAPE, cap and lift let them. Needs internet, ~30 s per hour the first time, then cached. The map centre stays where you put it (Domain tab).</p>
+        <p class="hint hrrrOnly">Every point of the map gets the HRRR's own sounding (temperature, moisture and wind from the ground up), hour by hour, and Atmos-WRF's storms form and grow in it with the run's physics; the HRRR's own radar is not used. Any run since mid-2014, or a time up to ~2 days ahead from the newest run (needs internet, ~70 MB per forecast hour the first time, then cached). The map centre stays where you put it (Domain tab).</p>
+        <div class="row hrrrOnly"><label title="Pick an HRRR run yourself, or a time (past, now or ahead) and let the newest run that reaches it be used">Pick <select id="hrrrMode"><option value="time">A time (now or ahead: the newest run reaching it)</option><option value="run">A run (date and cycle)</option></select></label></div>
+        <div id="hrrrTimeRow" class="row">
+          <label title="When the run starts (UTC). A future time uses the newest HRRR run whose forecast reaches it">Start (UTC) <input id="hrrrValid" type="datetime-local" step="3600"></label>
+          <button id="hrrrFind" title="Find the HRRR run for this time">Find the run</button>
+        </div>
+        <div class="row grid2">
+          <label title="The HRRR run's date (UTC)">Date (UTC) <input id="hrrrDate" type="date" min="2014-07-30"></label>
+          <label title="The HRRR run (cycle) that day, UTC: 00, 06, 12 and 18Z go out 48 h, the others 18 h"><span id="hrrrCycleLab">Cycle</span> <select id="hrrrCycle"></select></label>
+          <label class="hrrrOnly" title="Start the run this many hours into that HRRR forecast (0 = its analysis)">Start at forecast hour <input id="hrrrStart" type="number" min="0" max="47" step="1" value="0"></label>
+          <label title="How many forecast hours to load from the start hour (the weather holds still after the last)">Hours to load <input id="hrrrHours" type="number" min="1" max="48" step="1" value="12"></label>
+        </div>
+        <div class="row buttons hrrrOnly"><button id="hrrrLatest" title="The newest HRRR run in NOAA's archive">Latest run</button>
+          <button id="hrrrCheck" title="Is this run in the archive?">Check it's there</button></div>
+        <p id="hrrrNote" class="hint"></p>
+      </div>
+      <div class="row grid2">
+        <label class="synSimOnly" title="Which day of the model's climate to run: the cyclone is placed relative to the map centre at the peak time">Scenario <select id="synScenario"><option value="outbreak">Tornado outbreak</option><option value="squall">Squall line</option><option value="dryline">Dryline day</option><option value="triple">Triple point &amp; warm front</option><option value="dixie">Dixie Alley / cool season</option><option value="derecho">Ridge-riding MCS / derecho</option><option value="random">Random weather</option></select></label>
+        <label class="synSimOnly" title="Hours after the start time when the scenario's cyclone is in place (storms usually go in the following hours)">Cyclone peaks after (h) <input id="synPeak" type="number" min="0" max="24" step="1" value="6"></label>
+        <label title="0: storms form anywhere on the map the simulated weather allows. A number limits them to a square that wide around the map centre. Every storm gets its own GPU patch, so Max storms at once is what keeps the GPU in check">Storm area (km, 0 = anywhere) <input id="synArea" type="number" min="0" max="5000" step="50" value="0"></label>
+        <label title="Scales how often storms form where the weather allows (1 = as the environment says)">Storm rate × <input id="synRate" type="number" min="0" max="10" step="0.1" value="1.5"></label>
+        <label title="At most this many storms forming within 90 minutes, so the GPU keeps up (storms far apart each need their own patch)">Max storms at once <input id="synMax" type="number" min="1" max="60" step="1" value="10"></label>
+        <label title="How far apart storms that form on their own keep (discrete supercells on a dryline are typically 30-60 km apart); squall-line cells on a cold front are 15-22 km apart">Storm spacing (km) <input id="synSpacing" type="number" min="10" max="200" step="5" value="45"></label>
+      </div>
+      <p id="synScenarioHint" class="hint synSimOnly"></p>
+      <div class="row buttons"><button id="synDomainTool" class="tool" title="Drag a rectangle on the map (look at STP, CAPE or the 500 hPa map while you do): new storms only form inside it. Storms keep going once they leave it">Drag out the storm domain</button>
+        <button id="synDomainClear" title="Storms may form anywhere the weather allows">Clear</button></div>
+      <p id="synDomainNote" class="hint"></p>
+      <div class="row buttons"><button id="synPreview" class="primary" title="Build the weather for this setup and show it on the map; the run gets exactly this weather">Preview the weather</button>
+        <button id="synNew" class="synSimOnly" title="Another day of the same kind">New weather</button></div>
+      <p id="synSeed" class="hint"></p>
+      <div id="synStatus" class="hint"></div>
+      <h3>Weather map</h3>
+      <div id="synShowRow" class="row hidden"><button id="synShow" title="A run in synoptic mode has its own weather, evolving with its storms; a preview is the setup for the next run. Pick which one the map shows"></button></div>
+      <div class="row"><label>Show <select id="synLayer">
+        <option value="sfcradar" selected>Surface analysis + simulated radar</option><option value="radar">Simulated radar</option>
+        <option value="sat">Simulated infrared satellite</option><option value="lines">Fronts, isobars, highs &amp; lows</option>
+        <option value="t2m">2 m temperature</option><option value="td2m">2 m dewpoint</option><option value="mlcape">MLCAPE</option>
+        <option value="mlcin">MLCIN (the cap)</option><option value="stp">Significant tornado parameter</option>
+        <option value="srh1">0–1 km SRH</option><option value="shear6">0–6 km shear</option>
+        <option value="ci">Where storms can form</option><option value="z500">500 hPa heights &amp; wind</option>
+        <option value="none">Nothing</option></select></label>
+        <label title="Draw the 500 hPa heights and wind barbs over whatever is shaded (STP, CAPE, radar...)"><input id="synZ500Over" type="checkbox"> + 500 hPa</label></div>
+      <div id="synLegend" class="row col hidden"><canvas id="synLegendBar" width="240" height="10"></canvas><span id="synLegendText" class="hint"></span></div>
+      <div id="synHourRow" class="row col">
+        <label title="The preview's forecast hour after the start time">Forecast hour <input id="synHour" type="range" min="0" max="24" step="1" value="0"> <span id="synHourVal">+0 h</span></label>
+        <div class="row buttons"><button id="synPlay" title="Loop through the forecast hours that are ready">▶ Loop</button><span id="synReady" class="hint"></span></div>
+      </div>      <div class="row buttons"><button id="synSndTool" class="tool" title="Click anywhere on the map: the simulated sounding there, at the forecast hour (or now, in a run)">Sounding at a point</button></div>
+      <div id="synSndTitle" class="title"></div>
+      <div class="plots"><canvas id="synSkewt" width="250" height="250"></canvas><canvas id="synHodo" width="150" height="150"></canvas></div>
+      <div id="synDiag" class="diag"></div>
+      </div>
+      <div id="synWeatherSlot"></div>
+    </section>
+
+    <section id="tab-domain" class="tab">
+      <h3>Location &amp; start time</h3>
+      <div class="row grid2">
+        <label>Center lat <input id="lat0" type="number" step="0.1"></label>
+        <label>Center lon <input id="lon0" type="number" step="0.1"></label>
+      </div>
+      <div class="row"><button id="pickCenter" class="tool">Pick center on map</button></div>
+      <div class="row"><label>Start (UTC) <input id="startTime" type="datetime-local"></label></div>
+      <h3>Grid</h3>
+      <div class="row"><label>Grid <select id="grid"></select></label></div>
+      <div class="row"><label title="Unlimited: storms live in patches that grow, shift and merge around them anywhere on the map, using as much GPU memory as they need (up to ¾ of what is free). Fixed size: one square domain that shifts to keep its storms away from its edges but never grows, so the run's GPU memory stays what it is at the start. Storms can then start only inside it.">Domain <select id="domainMode">
+        <option value="unlimited">Grows with the storms (unlimited)</option>
+        <option value="fixed">Fixed size (saves GPU memory)</option></select></label></div>
+      <div id="domainSizeRow" class="row hidden"><label title="Side of the square domain. It follows the storms; once they spread wider than it, it keeps the strongest one well inside.">Size (km, square) <input id="domainSize" type="number" min="48" max="1000" step="16" value="160"></label>
+        <div id="domainMem" class="hint"></div></div>
+      <div id="domainMaxRow" class="row"><label title="The largest a storm's patch may grow, in km a side. A patch that reaches it shifts with its storms instead of growing, as a fixed-size domain does, and once its storms spread wider it keeps the strongest one well inside. Patches that meet become one only if that one fits; otherwise they stay side by side. New storms still start anywhere. Empty or 0: no limit.">Largest size (km, square) <input id="domainMax" type="number" min="0" max="1000" step="16" placeholder="no limit"></label>
+        <div id="domainMaxMem" class="hint"></div></div>
+      <div class="row"><label title="Storm-following refinement nests (two-way, like WRF's moving nests): a finer grid over each of the strongest storms, its edges driven by the run's grid every step and its air fed back to it, so the storm keeps what the fine grid resolves (tighter mesocyclones, stronger updrafts, tornado-scale circulations the radar can see). A nest costs about ratio^3 x its own area's work: 2:1 is cheap, 4:1 is heavy. None finer than 100 m.">Refinement nests <select id="refineRatio">
+        <option value="0">Off</option><option value="2">2:1 (half the spacing)</option>
+        <option value="3">3:1 (a third)</option><option value="4">4:1 (a quarter)</option></select></label></div>
+      <div id="refineRow" class="row grid2 hidden">
+        <label title="Each nest's side. It sits on its storm's updraft and moves with it.">Nest size (km) <input id="refineKm" type="number" min="4" max="400" step="any" value="40"></label>
+        <label title="At most this many nests at once, on the strongest storms followed for 10 min or more.">Nests at once <input id="refineMax" type="number" min="1" max="12" step="1" value="2"></label>
+        <label title="A second, finer level inside each nest, on its low-level mesocyclone (the 0-3 km updraft helicity maximum), placed once the nest has run 5 min and moved with the mesocyclone. With 2:1 nests on a 1 km grid, 2:1 here gives 1 km, 500 m on the storm and 250 m on the mesocyclone. None finer than 100 m.">Inner nests <select id="refineInner">
+          <option value="0">Off</option><option value="2">2:1</option><option value="3">3:1</option><option value="4">4:1</option></select></label>
+        <label title="Each inner nest's side.">Inner size (km) <input id="refineInnerKm" type="number" min="2" max="200" step="any" value="16"></label>
+      </div>
+      <div class="row"><label title="Hills and valleys under the storms. Real: the ground of the place on the map (GMTED2010, ~1 km), measured from the sounding's own ground. The atmosphere is the sounding's at every height above sea level, so high ground starts higher up the sounding (drier, cooler) and the wind flows over and around it. Ridge / hill: one idealized ridge or hill for experiments. The grid then stays fixed to the ground and steps along with the storms. Not yet with nests, hurricane or synoptic runs, and the radar beam does not see the hills yet.">Terrain <select id="terrainKind">
+        <option value="">Flat (off)</option><option value="real">Real (GMTED2010)</option>
+        <option value="ridge">Idealized ridge</option><option value="hill">Idealized hill</option></select></label></div>
+      <div id="terrainRealRow" class="row hidden"><label title="Multiplies the real heights above the sounding's ground (1 = as they are).">Height scale <input id="terrainScale" type="number" min="0" max="5" step="0.25" value="1"></label></div>
+      <div id="terrainIdealRow" class="row grid2 hidden">
+        <label title="Height of the crest above the sounding's ground.">Height (m) <input id="terrainH" type="number" min="0" max="4000" step="50" value="800"></label>
+        <label title="Distance from the crest to where the ground is half as high.">Half width (km) <input id="terrainA" type="number" min="1" max="100" step="1" value="10"></label>
+        <label title="Crest position, km east of the map centre.">Centre x (km) <input id="terrainX" type="number" step="5" value="0"></label>
+        <label title="Crest position, km north of the map centre.">Centre y (km) <input id="terrainY" type="number" step="5" value="0"></label>
+        <label id="terrainAngleLbl" title="The direction the ridge's crest runs, degrees from north (0: north-south).">Crest direction (°) <input id="terrainAngle" type="number" min="0" max="179" step="5" value="0"></label>
+        <label id="terrainLenLbl" title="Length of the ridge (0: endless).">Length (km) <input id="terrainLen" type="number" min="0" max="1000" step="10" value="0"></label>
+      </div>
+      <div class="row"><label title="The model grid travels with the storms (like CM1's umove/vmove), so they are not smeared by moving across it. Everything you see stays ground-relative.">Grid moves with <select id="gridMotion">
+        <option value="rm">Bunkers right mover (recommended)</option>
+        <option value="follow">Follows the storms (measured umove/vmove)</option><option value="mean">0–6 km mean wind</option>
+        <option value="lm">Bunkers left mover</option><option value="custom">Set umove / vmove</option>
+        <option value="none">Fixed to the ground</option></select></label></div>
+      <p id="gridLockHint" class="hint hidden">The physics package keeps the grid fixed to the ground (its surface layer needs the wind over the ground), so the domain moves across the map at the motion chosen here instead (<i>Follow the storms</i>: it keeps re-centring on them). Pick <b>Built-in core</b> in Physics to let the grid itself move.</p>
+      <div id="gridFollowRow" class="row hidden"><label title="The grid starts at the Bunkers right mover; then, this often, it measures how the storms' deep updrafts (3–7 km, over 15–30 min, stronger storms counting more) actually move and turns the grid toward that, by up to 2.4 m/s each time. The first check needs 15 min of a deep updraft.">Re-measure every <select id="gridFollowMin">
+        <option value="2">2 min</option><option value="5">5 min</option><option value="10" selected>10 min</option>
+        <option value="15">15 min</option><option value="30">30 min</option></select></label></div>
+      <div id="gridCustomRow" class="row grid2 hidden">
+        <label title="Grid motion toward the east (m/s), CM1's umove">umove (m/s) <input id="gridU" type="number" step="0.5" min="-60" max="60"></label>
+        <label title="Grid motion toward the north (m/s), CM1's vmove">vmove (m/s) <input id="gridV" type="number" step="0.5" min="-60" max="60"></label>
+      </div>
+      <div id="gridNowRow" class="row hidden"><div id="gridNow" class="hint"></div>
+        <button id="gridApply" title="Move this run's grid as chosen above from now on (a Galilean shift of the winds; the storms carry on)">Use for this run</button></div>
+      <p id="domainHint" class="hint">The domain is unlimited: storms live in patches that follow, grow and merge around them anywhere on the map.</p>
+    </section>
+
+    <section id="tab-physics" class="tab">
+      <h3>Physics</h3>
+      <div class="row"><label title="The built-in core is ArWen's idealized storm setup (the April 27 run's dynamics, 1.5-order TKE, free-slip ground). An ArWen physics suite adds its boundary layer, surface layer, land surface and radiation.">Physics package <select id="physSuite"></select></label></div>
+      <div class="row"><label>Microphysics <select id="physMp"></select></label></div>
+      <div id="suiteInfo" class="hint hidden"></div>
+      <div id="lesRow" class="row checks hidden"><label title="Large-eddy simulation: the suite's PBL scheme is switched off and the 3-D TKE turbulence closure mixes the air instead (WRF bl_pbl_physics=0, km_opt=2, diff_opt=2), fed by the suite's surface layer and land surface. Meant for 250 m grids or finer (the 200, 150 and 100 m grids); at 500 m and coarser the boundary layer's eddies are not resolved and a PBL scheme is better. The built-in core never uses a PBL scheme."><input id="optLes" type="checkbox"> LES: no PBL scheme (3-D turbulence, for 250 m or finer)</label></div>
+      <div id="landRow" class="row grid2 hidden">
+        <label title="Volumetric soil moisture of the uniform land surface">Soil moisture <input id="soilMoist" type="number" min="0.02" max="0.45" step="0.01" value="0.25"></label>
+        <label title="Green vegetation fraction">Vegetation (%) <input id="vegFrac" type="number" min="0" max="100" step="5" value="50"></label>
+      </div>
+      <div class="row checks">
+        <label><input id="optCor" type="checkbox" checked> Coriolis</label>
+        <label title="Real ground friction: drag on the lowest model level from the ground-relative wind, with each column's roughness from the land cover under it (forest and towns slow the wind most, crops and grass less, lakes hardly at all). It slows the near-ground inflow, turns it toward low pressure and adds the low-level shear and streamwise spin that feed tornadoes. Off: a frictionless (free-slip) ground"><input id="optDrag" type="checkbox" checked> Ground friction (land cover)</label>
+        <label title="Hold the air around the storms at the sounding as the run goes on (corrects the slow drift the model's mixing gives it). On by default. With the built-in core, on very unstable, weakly capped soundings it can keep re-feeding the overturned low levels and fill the domain with popcorn cells: untick it then. With a physics suite it holds the wind and cancels the sun's heating of each cell"><input id="optSteady" type="checkbox" checked> Steady environment</label>
+      </div>
+      <div class="row"><label>Storm staying power <input id="persist" type="range" min="0" max="1" step="0.05" value="0"><span id="persistVal">0.00</span></label></div>
+      <h3>Run speed &amp; frames</h3>
+      <div class="row"><label>Speed limit <select id="speed">
+        <option value="0">As fast as possible</option><option value="60">60× real time</option>
+        <option value="30">30×</option><option value="15">15×</option><option value="5">5×</option><option value="1">1× (real time)</option>
+      </select></label></div>
+      <div class="row"><label>Map frame every <select id="frameEvery"><option value="30">30 s</option><option value="60" selected>1 min</option><option value="120">2 min</option><option value="300">5 min</option></select></label></div>
+    </section>
+
+    <section id="tab-storms" class="tab">
+      <h3>Storm firing area</h3>
+      <div class="row buttons"><button id="toolFire" class="tool" title="Drag a rectangle on the map: fronts, drylines, outflow, the auto outbreak and initiation zones only fire new storms inside it, so the domain stays small. Storms keep going once they leave it">Drag out the firing area</button>
+        <button id="fireClear" title="Storms may fire anywhere again">Clear</button></div>
+      <p id="fireNote" class="hint">No firing area: storms can fire anywhere.</p>
+      <h3>Auto outbreak</h3>
+      <div class="row checks">
+        <label title="Storms start on their own across the warm sector, with the settings below"><input id="olOn" type="checkbox"> Auto outbreak on</label>
+        <label title="0–5 smaller pushes that go up at different times and merge into each storm. Only on grids coarser than 1.5 km: finer grids start every storm as a cluster of small ragged thermals that do this themselves"><input id="olTowers" type="checkbox"> Satellite towers</label>
+        <label title="0–3 separate cells sent into each storm 15–50 min into its life, on their own motion: most merge, some bridge or stay apart"><input id="olMergers" type="checkbox"> Updraft mergers</label>
+        <label title="Keep the last run's random seed: the same storms start at the same places and times, with the same mergers and warm-sector texture. Unticked, every run draws a new outbreak"><input id="keepSeed" type="checkbox"> Same outbreak as the last run</label>
+      </div>
+      <div class="row grid2">
+        <label title="Storm starts per 100,000 km² per hour in the open warm sector">Warm-sector rate <input id="olRate" type="number" step="0.1" min="0"></label>
+        <label title="Side of the square around the map centre where warm-sector storms can form">Area (km) <input id="olArea" type="number" step="50" min="50"></label>
+        <label>From (min) <input id="olStart" type="number" step="5" min="0"></label>
+        <label>Until (min) <input id="olEnd" type="number" step="10" min="0"></label>
+        <label title="Target updraft of each storm's main push">Updraft push (m/s) <input id="olPush" type="number" step="1" min="3" max="20"></label>
+        <label title="Radius of each storm's main push">Push radius (km) <input id="olRadius" type="number" step="1" min="4" max="20"></label>
+        <label title="Small drifting variations of the open warm sector's low levels (1: about ±0.5 K, ±5 % moisture, ±1 m/s wind; 0 = uniform). Warm-sector storms favour its warmer, moister spots">Warm-sector texture <input id="olTexture" type="number" step="0.25" min="0" max="3"></label>
+      </div>
+      <p class="hint">Storms pop up on their own inside the dashed square. Every run is a new outbreak unless you tick <i>Same outbreak</i>.</p>
+      <h3>Place a cell</h3>
+      <div class="row"><button id="toolStorm" class="tool">Place a cell on the map</button></div>
+      <div class="row grid2">
+        <label>Type <select id="stormKind"><option value="nudge">Updraft push</option><option value="bubble">Warm bubble</option></select></label>
+        <label>Motion <select id="stormMotion"><option value="rm">Bunkers right</option><option value="lm">Bunkers left</option><option value="mean">0–6 km mean</option><option value="none">Stationary</option></select></label>
+        <label title="How hard the start pushes (m/s). On grids of 1.5 km or finer a storm starts as a weak, ragged lift (a quarter of this) over the whole radius with 6–14 small thermals per 10 km on it (half to nine tenths of this each), going up one after another over ~25 min: the model picks the ones that grow. Coarser grids: one ragged push of this strength">Strength <input id="stormStrength" type="number" value="10" step="1"></label>
+        <label title="The area the start's thermals are scattered over (the lift's radius)">Radius (km) <input id="stormRadius" type="number" value="10" step="1"></label>
+      </div>
+      <h3>Initiation zones</h3>
+      <div class="row"><button id="toolZone" class="tool">Drag out an initiation zone</button></div>
+      <div class="row grid2">
+        <label>Storms / hour <input id="zoneRate" type="number" value="4" step="0.5"></label>
+        <label>Spacing (km) <input id="zoneSpacing" type="number" value="30" step="5"></label>
+        <label>From (min) <input id="zoneStart" type="number" value="0" step="10"></label>
+        <label>Until (min) <input id="zoneEnd" type="number" value="180" step="10"></label>
+      </div>
+      <h3>Merger cells</h3>
+      <div class="row grid2">
+        <label title="The storm the cell is sent at: the one with the strongest 3–7 km updraft, or the one you click on the map">Aim at <select id="ndTarget"><option value="strongest">The strongest storm</option><option value="click">A storm I click</option></select></label>
+        <label title="An ordinary cell moves with the 0–6 km mean wind and closes on a right-moving supercell from its inflow side">Cell moves with <select id="ndMotion"><option value="mean">0–6 km mean (ordinary cell)</option><option value="lm">Bunkers left</option><option value="rm">Bunkers right</option><option value="none">Stationary</option></select></label>
+        <label title="When the cell reaches the storm's updraft. A start inside the storm (on an updraft, in rain or cold air) adds up to 20 min">Meets it in (min) <input id="ndLead" type="number" value="20" min="10" max="60" step="1"></label>
+        <label title="How far from the storm's updraft the cell passes: 0 into it, + ahead of it (its forward flank), − behind it (its rear flank). Hastings & Richardson (2016): under 10 km a classic supercell, 10–20 km an updraft bridge, over 20 km on the forward flank two cells">Passes (km, + ahead) <input id="ndAim" type="number" value="0" step="1"></label>
+        <label title="Target updraft of the cell's push, which ends at least 5 min before it meets the storm">Push (m/s) <input id="ndStrength" type="number" value="8" min="3" max="20" step="1"></label>
+        <label>Push radius (km) <input id="ndRadius" type="number" value="6" min="3" max="15" step="1"></label>
+      </div>
+      <div class="row buttons"><button id="ndSend" class="tool">Send a merger cell now</button>
+        <button id="ndPlan" title="Send one at the strongest storm at this model time (in the setup, or in the running run)">Schedule at</button>
+        <label class="chk">+ <input id="ndAt" type="number" value="90" min="0" step="5" style="width:64px"> min</label></div>
+      <p class="hint">Fires a small cell into a storm so the two merge. Tick <i>Same outbreak as the last run</i> to compare a run with and without one.</p>
+      <div id="nudgerList" class="list"></div>
+      <div id="stormList" class="list"></div>
+    </section>
+
+    <section id="tab-tropics" class="tab">
+      <h3>Hurricane mode</h3>
+      <div class="row checks">
+        <label title="The run is over the sea: a procedural sea-surface temperature map under it, the sea's own drag (much lower than land's), evaporation and sensible heat from the water, and the cold wake a strong storm stirs up. Land stays land (the land cover), with its friction and no sea fluxes. The run takes one domain that stays centred on the cyclone, runs the built-in core and needs Coriolis on (Physics tab)."><input id="hurOn" type="checkbox"> Hurricane mode (the run is over the sea)</label>
+      </div>
+      <div class="row buttons"><button id="hurPreset" class="accent" title="Hurricane mode on, Coriolis on, a 3 km grid moving with the 0-6 km mean wind, the tropical sounding below, a map frame every 5 min and the IR satellite on the map">Set up a hurricane run</button></div>
+      <p class="hint">Then place a surface low over warm water and launch: convection organises around it and, with Coriolis spinning it up, it grows into a tropical storm and hurricane.</p>
+      <h3>Sea-surface temperature</h3>
+      <div class="row grid2">
+        <label title="The same seed is the same ocean every run: warm pools, cooler patches and eddies on top of the late-summer mean by latitude">SST map seed <input id="hurSeed" type="number" min="1" step="1" value="1"></label>
+        <label title="Shifts the whole map (°C)">Offset (°C) <input id="hurOffset" type="number" min="-4" max="3" step="0.25" value="0"></label>
+        <label title="The ocean's mixed layer: a shallow one cools more under a strong storm (a stronger brake on its intensity)">Mixed layer (m) <input id="hurMld" type="number" min="10" max="150" step="5" value="50"></label>
+      </div>
+      <div class="row checks"><label title="The storm's winds stir cold water up from below the mixed layer: the sea under and behind its core cools (up to ~5 K for a 50 m layer), which limits how strong it gets"><input id="hurWake" type="checkbox" checked> Cold wake</label></div>
+      <div class="row grid2"><label title="How much of the open sea's own heat and moisture stays in the air instead of being taken away to keep the environment steady: some lets the ocean around the storm build scattered convection and outer rainbands (a bigger, more realistic storm); 0 = only the storm's core convects">Open-ocean fuel <input id="hurAmbient" type="number" min="0" max="1" step="0.05" value="0.3"></label></div>
+      <div class="row buttons"><button id="hurNewSeed" title="A new random SST map">New SST map</button>
+        <button id="hurShowSst" class="tool" title="Show this SST map on the map (before a run; during one, pick Sea-surface temperature in the map's product menu)">Show SST map</button></div>
+      <h3>Domain</h3>
+      <div class="row grid2">
+        <label title="East-west size of the domain that follows the cyclone">Width (km) <input id="hurDomain" type="number" min="200" max="2400" step="50" value="900"></label>
+        <label title="North-south size">Height (km) <input id="hurDomainY" type="number" min="200" max="2400" step="50" value="900"></label>
+        <label title="Grid spacing (the same setting as the Domain tab's Grid). 3 km is fast and fine for whole storms; 2 km and finer resolve the eyewall better (sharper eyes, stronger peaks) but cost much more">Grid <select id="hurGrid"></select></label>
+        <label title="Shape presets">Shape <select id="hurShape"><option value="">Custom</option><option value="600x600">Small 600 km</option><option value="900x900">Standard 900 km</option><option value="1400x900">Wide 1400 x 900</option><option value="900x1400">Tall 900 x 1400</option><option value="1800x1200">Large 1800 x 1200</option></select></label>
+      </div>
+      <p id="hurDomainInfo" class="hint"></p>
+      <p class="hint">The dashed box on the map is where the domain starts, centred on the first surface low; it moves with the cyclone during the run.</p>
+      <h3>Tropical sounding</h3>
+      <div class="row grid2">
+        <label title="The sea under the sounding: its boundary layer is 1 K cooler, its free troposphere the observed hurricane-season mean (Jordan 1958) shifted by half the SST's departure from 28.5 °C">SST (°C) <input id="tsSst" type="number" min="24" max="32" step="0.1" value="29"></label>
+        <label title="Relative humidity from 700 to 500 hPa: dry mid levels slow genesis">Mid-level RH (%) <input id="tsRh" type="number" min="20" max="95" step="5" value="70"></label>
+        <label title="Steering flow speed">Steering (kt) <input id="tsSteer" type="number" min="0" max="40" step="1" value="10"></label>
+        <label title="Direction the steering flow carries the storm toward (270 = west)">Toward (°) <input id="tsSteerDir" type="number" min="0" max="359" step="5" value="280"></label>
+        <label title="Vertical wind shear from 1.5 to 12 km: under ~10 kt is favourable, over ~20 kt tears a storm apart">Shear (kt) <input id="tsShear" type="number" min="0" max="50" step="1" value="5"></label>
+        <label title="Direction the shear comes from">Shear from (°) <input id="tsShearFrom" type="number" min="0" max="359" step="5" value="270"></label>
+      </div>
+      <div class="row buttons"><button id="tsMake" class="accent" title="Use this tropical sounding for the run">Use this tropical sounding</button>
+        <button id="tsFromLow" title="Set the SST above to the SST map's value under the first surface low">SST under the first low</button></div>
+      <h3>Surface low</h3>
+      <div class="row"><button id="toolLow" class="tool" title="Click over warm water: a balanced warm-core low (its winds, warm core, lowered pressure and a moist envelope)">Place a surface low on the map</button></div>
+      <div class="row grid2">
+        <label title="How big a disturbance it grows from: a storm's final size follows the outer winds it starts with (a midget from a small vortex, a large one from a broad tropical wave or monsoon gyre). Large needs a domain of 1400 km or more">Size <select id="lowSize"><option value="midget">Midget</option><option value="average" selected>Average</option><option value="large">Large</option><option value="">Custom</option></select></label>
+        <label title="Its maximum wind at the start (a tropical depression: 25-33 kt)">Max wind (kt) <input id="lowVmax" type="number" min="10" max="120" step="5" value="30"></label>
+        <label title="Radius of maximum wind">RMW (km) <input id="lowRmw" type="number" min="15" max="250" step="5" value="90"></label>
+        <label title="How far out its circulation reaches (cut to fit the domain)">Circulation (km) <input id="lowR0" type="number" min="100" max="1400" step="25" value="500"></label>
+      </div>
+      <div class="row checks"><label title="Updraft pushes near the core every few minutes until it reaches the wind below: convection organises sooner, so genesis takes hours instead of a day"><input id="hurPush" type="checkbox" checked> Core updraft pushes (faster genesis)</label></div>
+      <div class="row grid2">
+        <label>Every (min) <input id="hurPushEvery" type="number" min="2" max="60" step="1" value="10"></label>
+        <label title="Pushes stop once the cyclone's 1-min wind reaches this">Until (kt) <input id="hurPushUntil" type="number" min="20" max="140" step="5" value="64"></label>
+      </div>
+      <div id="lowList" class="list"></div>
+      <p class="hint">Click the L on the map for the cyclone's category, maximum 1-min sustained wind and lowest pressure.</p>
+    </section>
+
+    <section id="tab-fronts" class="tab">
+      <h3>Fronts, drylines &amp; outflow</h3>
+      <div class="row grid2">
+        <label>Kind <select id="bKind"></select></label>
+        <label>&nbsp;<button id="toolFront" class="tool">Draw on the map</button></label>
+      </div>
+      <p class="hint">Click to add points, double-click or Enter to finish, Esc to cancel. Use <b>Flip</b> if the air mass is on the wrong side.</p>
+      <div class="row grid2">
+        <label title="Direction the boundary moves toward">Moves toward (°) <input id="bHeading" type="number" step="5"></label>
+        <label title="Empty: it moves on its own -- a cold front or outflow as a density current, faster the colder and deeper its air mass; a warm front at a third of that; a dryline slowly">Speed (m/s) <input id="bSpeed" type="number" step="1" min="0" placeholder="auto"></label>
+        <label title="Temperature of the air mass minus the sounding's, at the ground">Air-mass ΔT (K) <input id="bDT" type="number" step="0.5"></label>
+        <label title="Full depth of the air mass, reached away from the boundary">Depth (m) <input id="bDepth" type="number" step="100" min="200"></label>
+        <label title="Moisture deficit of the air mass">Drier by (%) <input id="bDq" type="number" step="5" min="0" max="90"></label>
+        <label title="Half width of the frontal zone">Zone width (km) <input id="bHw" type="number" step="1" min="1"></label>
+        <label title="Wind direction in the air mass (from). Leave empty for outflow blowing straight out of it.">Air-mass wind from (°) <input id="bWdir" type="number" step="10" placeholder="straight out"></label>
+        <label>Air-mass wind (m/s) <input id="bWspd" type="number" step="1" min="0"></label>
+        <label title="Storms started along the boundary, per hour per 100 km">Storms / h / 100 km <input id="bRate" type="number" step="0.25" min="0"></label>
+        <label title="0 = uniform along the boundary; 1 = strong hot spots that favour a few storms at a time">Variation <input id="bVar" type="number" min="0" max="1" step="0.1"></label>
+        <label title="Auto: a squall line when the deep-layer shear runs along the boundary or the boundary keeps up with its storms, separate cells when the shear crosses it (Dial et al. 2010)">Storm mode <select id="bMode"><option value="auto">Auto (from the shear)</option><option value="cells">Separate cells</option><option value="line">Squall line</option></select></label>
+        <label title="How far the low-level wind backs ahead of the boundary (turns the hodograph: more 0-1 km shear and SRH where storms ride it)">Backing ahead (°) <input id="bBack" type="number" step="5" min="0" max="90"></label>
+        <label title="How much stronger the low-level wind blows ahead of the boundary">Low-level jet ahead (m/s) <input id="bJet" type="number" step="1" min="0" max="25"></label>
+        <label title="Warm-side inflow converging on the boundary: more lift along it, and storms latch on and ride it">Convergence (m/s) <input id="bConv" type="number" step="0.5" min="0" max="15"></label>
+        <label>Storms from (min) <input id="bInitStart" type="number" step="10" min="0"></label>
+        <label>until (min) <input id="bInitEnd" type="number" step="10" min="0"></label>
+      </div>
+      <div class="row checks">
+        <label title="Hold the air mass behind the boundary to its set temperature, moisture and wind, so a front lasts for hours and moves as set"><input id="bKeep" type="checkbox"> Keep the air mass</label>
+        <label><input id="showAirmass" type="checkbox" checked> Shade air masses</label>
+      </div>
+      <div class="row buttons"><button id="bApply" class="primary hidden">Apply changes</button><button id="bCancel" class="hidden">Cancel</button></div>
+      <p class="hint">Times count from the start of the run.</p>
+      <div id="lowBox" class="lowbox hidden">
+        <div><b class="lowL">L</b> <b>Surface low</b> <span id="lowWhere" class="meta"></span></div>
+        <div class="row checks">
+          <label title="The low moves at the average motion of the boundaries that meet there"><input id="lowAuto" type="checkbox" checked> Moves with its fronts</label>
+          <span id="lowMotion" class="meta"></span>
+        </div>
+        <div id="lowSet" class="row grid2 hidden">
+          <label>Low moves at (m/s) <input id="lowSpeed" type="number" step="0.5" min="0"></label>
+          <label title="Direction of motion, 0 = north, 90 = east">toward (°) <input id="lowHeading" type="number" step="5"></label>
+        </div>
+        <div id="occlRow" class="row occl-row hidden" title="Occlude the low: its centre moves this far from where its fronts meet, and an occluded front joins them. The meeting point becomes the triple point, where storms like to fire; the L is the centre, and it moves with the low's motion (above)">
+          <label>Low <input id="occlKm" type="number" value="150" min="20" max="800" step="10" style="width:58px"> km toward</label>
+          <label><input id="occlDir" type="number" value="315" step="5" style="width:52px">°</label>
+          <button id="occlBtn">Displace low</button>
+        </div>
+        <p id="occlNote" class="hint"></p>
+        <p class="hint">Fronts that share a point stay joined at the low. Drag the <b>L</b> to move it.</p>
+      </div>
+      <div id="frontList" class="list"></div>
+    </section>
+
+    <section id="tab-radars" class="tab">
+      <h3>Sites</h3>
+      <div class="row"><button id="toolRadar" class="tool">Add a radar (click near a site)</button></div>
+      <div class="row grid2">
+        <label title="WSR-88D: S band, dual pol, VCPs. TDWR: the airports' C-band radars: sharper beam, Nyquist ~20 m/s (velocities fold), Doppler only to ~90 km with range folding beyond, attenuation shadows behind heavy cores, more ground clutter, no dual pol. International: 625 radars in Europe, Canada, China, Australia, Japan, Brazil, India and more; C-band ones attenuate behind heavy cores. GR2Analyst shows them once they are in its site list (Add world radars to GR2Analyst, below)">Radar <select id="radarKind"><option value="1">WSR-88D</option><option value="3">TDWR</option><option value="4">International</option></select></label>
+        <label>VCP <select id="radarVcp"><option value="212">212</option><option value="12">12</option><option value="215">215</option><option value="35">35</option></select></label>
+        <label>SAILS <select id="radarSails"><option value="0">Off</option><option value="1" selected>×1</option><option value="2">×2</option><option value="3">×3</option></select></label>
+        <label title="Every sweep of the VCP sped up alike. A WSR-88D takes 4-10 min per volume; faster is like a phased-array radar. 30 s volumes: in a 1 km test with one storm and one radar the run went within a few percent of its speed with 2.5 min volumes (the radar fields are rebuilt every 10 model seconds either way; each radar adds its own sweeps), and Level II comes to 2-8 MB a volume, up to about 1 GB per model hour per radar">Volume every
+          <select id="radarVolume"><option value="0">VCP timing (4–10 min)</option><option value="4">4 min</option><option value="3">3 min</option><option value="2.5" selected>2.5 min</option><option value="2">2 min</option><option value="1">1 min</option><option value="0.5">30 s</option></select></label>
+      </div>
+      <div id="radarList" class="list"></div>
+      <h3>Doppler on Wheels</h3>
+      <div class="row grid2">
+        <label title="Which truck. Each is a separate radar in the GR2Analyst feed (DOW6, DOW7, DOW8); deploying one again elsewhere moves it">Truck <select id="dowId"><option>DOW6</option><option selected>DOW7</option><option>DOW8</option></select></label>
+        <label title="The DOWs run 15-600 m gates; 75 m was VORTEX2's tornado setting. Shorter gates: finer detail, the same 60 km reach, bigger files">Gates <select id="dowGate"><option value="25">25 m</option><option value="50">50 m</option><option value="75" selected>75 m (VORTEX2)</option></select></label>
+      </div>
+      <div class="row"><button id="toolDow" class="tool" title="Park the DOW anywhere on the map: X band (3.2 cm), a 0.93-degree beam, dual pol, 0.5-degree radials, 12 tilts from 0.5 to 16 degrees every ~1.5 min out to 60 km, velocities unfolded by dual PRF (no attenuation). Pick it up with its button in the list above">Deploy the DOW (click the map)</button></div>
+      <div class="row checks"><label title="GR2Analyst places a radar from its own site list (radars.gis), not from the data, and reads that list when it starts: each deployment writes the DOW's spot there (one Windows permission prompt). Restart GR2Analyst afterwards to see the DOW at its new spot"><input id="dowGr2" type="checkbox" checked> Put each spot in GR2Analyst's site list</label></div>
+      <p class="hint">In GR2Analyst pick DOW6 / DOW7 / DOW8 from the polling feed's sites. After each deployment restart GR2Analyst (it reads the spot once, when it starts); the feed then lists only that deployment's volumes.</p>
+      <h3>Phone remote</h3>
+      <div class="row checks"><label title="Watch the run from a phone or tablet on this network (or over a VPN such as Tailscale when away): the radar picture, status, tornadoes, warnings and log; with the control PIN also pause, resume and stop. Other devices get nothing without a PIN"><input id="rmOn" type="checkbox"> Let phones and tablets connect</label></div>
+      <div class="row grid2">
+        <label title="To share: it only watches">Watch PIN <input id="rmWatch" type="text" inputmode="numeric" maxlength="12"></label>
+        <label title="Yours: watch, pause, resume and stop">Control PIN <input id="rmControl" type="text" inputmode="numeric" maxlength="12"></label>
+      </div>
+      <div class="row buttons"><button id="rmNew" title="New random PINs (everyone signed in signs in again)">New PINs</button></div>
+      <p class="hint">On the phone open <code id="rmUrl"></code> and enter a PIN; then Share → Add to Home Screen for an app icon. Away from home: install Tailscale on the PC and the phone and use the PC's Tailscale address.</p>
+      <h3>Signal &amp; processing</h3>
+      <div class="row grid2">
+        <label>Echo floor (dBZ) <input id="radarFloor" type="number" value="-5" step="1"></label>
+        <label title="RadarPainter's clutter / clear-air layer: patchy insect and clear-air returns out to ~70 km carrying the low-level wind (so the inflow and the whole circulation show outside the rain), a stationary ground-clutter core within ~12 km, on the lowest tilts only (gone by 2.2 deg), blended into storm echo over 15 dB; plus a light sprinkle of noise speckle farther out. 1 = RadarPainter's defaults, 2 = denser, 0 = none">Clear air / insects <input id="radarClearAir" type="number" value="1" min="0" max="3" step="0.25"></label>
+      </div>
+      <div class="row checks">
+        <label title="Off: Level II velocities fold at each cut's Nyquist (26-33 m/s), as a real radar sends them. The map always shows the true velocity"><input id="radarDealias" type="checkbox" checked> Dealias velocity</label>
+        <label title="Scatter each gate's values like a real radar's estimates from a few dozen pulses: the grain of reflectivity, speckled CC and ZDR, low CC and random velocities at weak echo edges, more of it with range and with faster volumes. Off: the model's clean values"><input id="radarNoise" type="checkbox" checked> Measurement noise</label>
+      </div>
+      <h3>GR2Analyst feed</h3>
+      <p class="hint">GR2Analyst: File → Configure Polling → Add <code id="pollUrl"></code>, move it to the top, pick a radar and Start Polling. <span id="pollLan"></span></p>
+      <div class="row buttons"><button id="gr2Sites" title="GR2Analyst only shows radars that are in its own site list (radars.gis). This adds the 625 international radars to it (Windows asks once for permission; the list is backed up first). Not needed for US radars.">Add world radars to GR2Analyst</button></div>
+      <p id="gr2SitesNote" class="hint"></p>
+      <p class="hint">Storm tracks: Placefile Manager → + → <code id="placeUh"></code> (UH tracks) or <code id="placeWind"></code> (wind swaths).</p>
+      <p class="hint">Warnings (SPS, severe, tornado, PDS, tornado emergency, issued automatically): Placefile Manager → + → <code id="placeWarn"></code>.</p>
+      <p class="hint">METARs (simulated, every 10 model minutes, at the real airports within 250 km of the run's radars; the METAR shows on hover): Placefile Manager → + → <code id="placeMetar"></code>.</p>
+    </section>
+
+    <section id="tab-files" class="tab">
+      <h3>Saved setups</h3>
+      <p class="hint">Save everything for a run under a name. Send the file to anyone; they open it with <b>Open a setup file…</b>.</p>
+      <div class="row buttons">
+        <button id="psSave" title="The setup for the next run, as Launch run would use it">Save the current setup…</button>
+        <button id="psSaveRun" class="hidden" title="The settings of the run on the map, with the radars and merger cells added while it ran">Save this run's settings…</button>
+      </div>
+      <div class="row buttons">
+        <label class="filebtn" title="A setup someone sent you, or a run's settings.json (output\runs\...)">Open a setup file…<input id="psOpen" type="file" accept=".json,application/json" multiple hidden></label>
+        <button id="psFolder" title="Open the setups folder">Show the folder</button>
+      </div>
+      <div id="psNote" class="hint"></div>
+      <div id="psList" class="list"></div>
+      <h3>Library folders</h3>
+      <p class="hint">Soundings and color tables (.pal) in these folders show up under Atmosphere and in the map's color menu.</p>
+      <div id="libStatus" class="title"></div>
+      <div class="row buttons">
+        <button id="libScan" title="Look through every drive of this computer (system and program-package folders are skipped)">Scan this computer</button>
+        <button id="libRefresh" title="Look through the folders below again">Look again</button>
+      </div>
+      <div class="row buttons">
+        <input id="libPath" type="text" placeholder="Add a folder, e.g. D:\Soundings" style="flex:1">
+        <button id="libBrowse">Browse…</button>
+        <button id="libAdd">Add</button>
+      </div>
+      <div class="row buttons">
+        <label class="filebtn" title="Copy sounding files into the library">Open sounding files…<input id="libOpenSnd" type="file" multiple hidden></label>
+        <label class="filebtn" title="Copy GR2Analyst / GRLevelX color tables into the library">Import color tables…<input id="libOpenPal" type="file" accept=".pal" multiple hidden></label>
+      </div>
+      <div id="libFolders" class="list"></div>
+    </section>
+
+    <section id="tab-log" class="tab">
+      <div id="log" class="log"></div>
+    </section>
+
+    <section id="tab-help" class="tab">
+      <div class="guide">
+      <h3>Quick start</h3>
+      <p class="hint">How to make a storm day and watch it in GR2Analyst, step by step.</p>
+
+      <h4>First time only</h4>
+      <ol>
+        <li>Right-click the zip and pick <b>Extract All...</b>. Put the folder somewhere with a short path, like <code>C:\Atmos-WRF</code>.</li>
+        <li>Double-click <b>Atmos-WRF.cmd</b>. The first time it installs everything by itself (10-25 minutes, a few GB). Let it finish.</li>
+        <li>If Windows asks whether Python may use the network, click <b>Allow</b> (private networks).</li>
+      </ol>
+      <p class="hint">NVIDIA graphics card: runs on the GPU (fast). AMD, Intel or no graphics card: runs on the processor (slower, use the 2-3 km grid).</p>
+
+      <h4>Every time</h4>
+      <ol>
+        <li>Double-click <b>Atmos-WRF.cmd</b>. The viewer opens in your browser.</li>
+        <li>Keep the black window open while you use it: closing it stops the model.</li>
+      </ol>
+
+      <h4>Let the weather make the storm day (synoptic mode)</h4>
+      <ol>
+        <li><b>Domain</b>: put the map centre where you want the action and pick the start time (late morning local time is good: the cap breaks in the afternoon).</li>
+        <li><b>Weather</b>: tick <b>Simulate the atmosphere</b>, pick a scenario (<i>Tornado outbreak</i>, <i>Squall line</i>, <i>Dryline day</i> or <i>Random weather</i>) and when its cyclone should peak, then <b>Preview the weather</b>. The first preview ever builds the model's climate (~3 minutes, once); after that a new day takes ~20 seconds.</li>
+        <li>Slide the <b>Forecast hour</b> and switch the map between fronts and isobars, temperature, dewpoint, CAPE, CIN, STP, helicity, shear, 500 hPa and <i>Where storms can form</i>. <b>Sounding at a point</b> shows the simulated sounding anywhere.</li>
+        <li><b>Launch run</b>: no sounding, fronts or storm starts needed. Storms form by themselves where the simulated air lets them (dryline, fronts, convergence, once the day's heating breaks the cap), each moving the way its own environment says, and the weather keeps evolving through the run: moisture return, the evening low-level jet, the trough coming out. <i>New weather</i> draws another day of the same kind; the run gets exactly the weather you previewed.</li>
+      </ol>
+      <p class="hint">How it works: a two-layer quasi-geostrophic model of the jet stream makes the troughs and cyclones; a 25 km surface model over the US carries the Gulf's moisture, the hot dry air of the West and the Mexican Plateau's elevated mixed layer (the cap), with the day's heating, friction and the low-level jet. It has moist physics of its own: mid-level moisture lifted by the troughs and dried by sinking air, clouds and stratiform rain where it saturates, convection where the air is unstable and the cap gives way, rain-cooled air and cold pools, and the latent heat of it all deepening the cyclones. Where a storm patch is running, the storms' real microphysics takes over: their cold pools and rain are fed back into the weather every 5 minutes. Storms can form anywhere the weather allows (<i>Max storms at once</i> keeps the GPU in check). The map can show it as a surface analysis with simulated radar, a simulated infrared satellite picture or any of the fields, and <i>Loop</i> plays the forecast hours.</p>
+
+      <h4>Make a storm day</h4>
+      <ol>
+        <li><b>Atmosphere</b>: pick a sounding from the list (or paste one, or open a file). The skew-T and numbers show what you picked. <i>Advanced</i> has more changes (moisture, cap, low-level jet, winds aloft); the hodograph brush paints stronger or backed winds onto parts of the map.</li>
+        <li><b>Domain</b>: set where on the map (or <i>Pick center on map</i>) and the start time.</li>
+        <li><b>Initiation</b>: choose how storms start:
+          <ul>
+            <li>tick <b>Auto outbreak on</b> for storms that pop up on their own, or</li>
+            <li><b>Place a cell on the map</b>, then click where you want a storm.</li>
+            <li>Optional: <b>Drag out the firing area</b> so new storms only fire inside it (keeps the run small).</li>
+          </ul></li>
+        <li><b>Fronts</b> (optional): draw a cold front, dryline or outflow; storms fire along it. Leave Speed empty and it moves on its own. Want a squall line? Set its <b>Storm mode</b> to Squall line (Auto picks a line when the shear runs along the front).</li>
+        <li><b>Radar</b>: pick WSR-88D, TDWR or International, click <b>Add a radar</b>, then click near a radar on the map. Add as many as you want.</li>
+        <li>Press <b>Launch run</b> at the bottom.</li>
+      </ol>
+
+      <h4>Watch it</h4>
+      <ul>
+        <li>The map shows the storms: change the product (reflectivity, velocity, CC...) at the top of the map.</li>
+        <li>The bar at the bottom plays the run back; <b>Live</b> follows the newest frame. Pause / Stop are at the bottom right.</li>
+        <li>Tornado tracks show with their estimated EF rating; warnings (SPS, severe, tornado, PDS, emergency) are issued on their own.</li>
+      </ul>
+
+      <h4>See it in GR2Analyst</h4>
+      <ol>
+        <li>In GR2Analyst: <b>File &rarr; Configure Polling &rarr; Add</b>.</li>
+        <li>Paste the address shown in the <b>Radar</b> tab (like <code>http://127.0.0.1:8830/poll/</code>).</li>
+        <li>Move it to the top of the list, pick one of your radars and press <b>Start Polling</b>.</li>
+        <li>Warnings and storm tracks: <b>Placefile Manager &rarr; +</b> and the addresses in the Radar tab.</li>
+        <li>International radars: press <b>Add world radars to GR2Analyst</b> once (Radar tab), then restart GR2Analyst.</li>
+        <li>Friends on the same network (or Tailscale) can poll the other address shown there.</li>
+      </ol>
+
+      <h4>Save and share</h4>
+      <ul>
+        <li><b>Save setup...</b> keeps everything for the run, to load again or send the file to someone.</li>
+        <li><b>Load setup...</b> opens a saved one, or one a friend sent you.</li>
+        <li>Radar files (Level II) are saved in the folder <code>output\runs</code>.</li>
+      </ul>
+
+      <h4>Tips</h4>
+      <ul>
+        <li>Storms die fast or look smeared? Lower <b>Scale winds</b> (Atmosphere tab) to 0.7-0.8.</li>
+        <li>Not enough storms? Turn on Auto outbreak, place more cells, or draw a front.</li>
+        <li>Only ever get supercells? Lines need forcing: draw a cold front with Storm mode Squall line, ideally on a day whose deep shear runs along the front.</li>
+        <li>Something broke? Check the <b>Console</b> tab, or close the black window and start again.</li>
+      </ul>
+      </div>
+    </section>
+
+    <section id="tab-credits" class="tab">
+      <div class="credits">
+        <div class="credits-mark"></div>
+        <h2>Atmos-WRF</h2>
+        <p class="credits-line">Made by <b>Wazap</b></p>
+        <p class="credits-line">Adapted by <b>Garammasala</b></p>
+      </div>
+    </section>
+
+    <div class="dock">
+      <div id="setupSummary" class="setup-summary" title="What the next run will be (click a part to go to its tab)"></div>
+      <button id="newRun" class="primary">Launch run</button>
+      <div class="dock-row">
+        <button id="saveSetup" title="Save everything for the next run (sounding and its adjustments, grid, domain, physics, storms, radars, initiation zones, merger cells) under a name, to load again or send to someone">Save setup…</button>
+        <button id="showPresets" title="Load a saved setup, open one someone sent you, or send one">Load setup…</button>
+        <button id="resetSetup" title="Every setting back to the defaults for the next run: sounding, place, grid, physics, storms, fronts, radars (a running run is not touched)">Reset setup</button>
+      </div>
+    </div>
+    </div>
+  </aside>
+
+  <div id="mapwrap">
+    <canvas id="map"></canvas>
+    <div id="mapbar">
+      <select id="product"></select>
+      <select id="radarSel" title="Radar for radar products"></select>
+      <select id="palette" title="Color table"></select>
+      <label class="filebtn" title="Import GR2Analyst / GRLevelX color tables (.pal)">+<input id="palOpen" type="file" accept=".pal" multiple hidden></label>
+      <label class="chk"><input id="smooth" type="checkbox"> Smooth</label>
+      <label class="chk"><input id="showPatches" type="checkbox" checked> Patches</label>
+      <label class="chk"><input id="showCounties" type="checkbox" checked> Counties</label>
+      <label class="chk" title="The automatic warnings on the run's storms: special weather statements, severe thunderstorm and tornado warnings, PDS and tornado emergencies (also a GR2Analyst placefile, Radar tab)"><input id="showWarnings" type="checkbox" checked> Warnings</label>
+      <label class="chk" title="Simulated METARs at the real ASOS / AWOS airports around the run, every 10 model minutes: wind barb, temperature (red), dewpoint (green), gust (orange), weather (blue). Click a station for its full observation, its peak gusts and its last hours (also a GR2Analyst placefile, Radar tab)"><input id="showMetars" type="checkbox" checked> METARs</label>
+      <label class="chk" title="Each tornado's path, colored by its estimated EF rating (from the model's peak wind, the radar's Vrot and the debris CC drop)"><input id="showTorTracks" type="checkbox" checked> Tornado tracks</label>
+      <label class="chk" title="The storm starts (updraft pushes, bubbles, core pushes) as crosshairs with their motion lines, and the nudger cells' paths"><input id="showStarts" type="checkbox" checked> Storm starts</label>
+      <button id="toolMove" class="tool" title="Move patches and nests by hand during a run: drag a patch (anywhere inside it) or a nest (white box) to a new place. A patch stays there 15 min, then follows its storms again (hold Shift while dropping: locked there until you click Follow in its list, Storms tab). A nest dropped on a storm follows that storm from then on. Click a storm without dragging: a nest is added on it (up to 3 by hand)">Move</button>
+      <button id="toolVolume" class="tool"title="3-D view: drag a box on the map around a storm and see it in 3-D from the run's latest step (reflectivity, updrafts or vorticity), like GR2Analyst's volume explorer">3-D view</button>
+      <button id="toolTornado" class="tool" title="Tornado zoom: during a run, drag a small box (2-10 km) around a tornado or a low-level mesocyclone. Nests down to about 100 m go on it and follow its vortex by themselves (no redrawing); the map shows the surface pressure minimum's track. Costs roughly half the run's speed again">Tornado zoom</button>
+      <select id="tornadoDetail" title="How fine the tornado zoom's grid is. Lite (~350 m, a ~20 km box) and Medium (~200 m, ~14 km) are for weaker cards: the mesocyclone and a broad tornadic circulation, on the run's own levels (on a grid of 350 m or finer Lite has nothing to add). Its finest grid gets its own levels too, from 8-25 m at the ground (like CM1 tornado runs). High: ~110 m, the box up to 10 km, costs about 0.5 s a model step. Ultra: ~55 m, up to 6 km, a few times more. Extreme: ~37 m, about 4 km: research-run detail, slower than real time on most cards. PC explosion (~10 m): suction-vortex scale, a 1-2 km box. PC explosion (~1 m): debris scale, a box of a few hundred metres, minutes of real time per model second. The box can be any size you drag (0.05-60 km): a level that will not fit in the GPU memory is not built, and the Log says so"><option value="lite">Lite (~350 m)</option><option value="medium">Medium (~200 m)</option><option value="high">High (~110 m)</option><option value="ultra" selected>Ultra (~55 m)</option><option value="extreme">Extreme (~37 m)</option><option value="pc10">PC explosion (~10 m)</option><option value="pc1">PC explosion (~1 m)</option></select>
+      <button id="tornadoView" class="tool hidden" title="The tornado zoom in 3-D, following it: the cloud (with the funnel when the model condenses one), the pressure drop, the spin and the updraft from the finest grid, with the pressure minimum's track and the air going into it">Tornado 3-D</button>
+      <button id="toolLoop" class="tool" title="Make an animated GIF loop of a radar product at a tilt over any range of volumes, framed on the map in view">Loop maker</button>
+      <button id="toolSurvey" class="tool" title="Every tornado of the run, rated and named, with its damage survey (Google Earth, GR2Analyst placefile)">Tornado list</button>
+      <button id="tornadoRemove" class="tool hidden" title="Remove the tornado zoom (its nests go, the run carries on)">✕ zoom</button>
+    </div>
+    <div id="readout" class="readout"></div>
+    <div id="legend" class="legend"><canvas id="legendBar" width="300" height="12"></canvas><div id="legendTicks"></div></div>
+    <div id="toolhint" class="toolhint hidden"></div>
+    <div id="cycCard" class="cyc-card hidden"></div>
+    <div id="metarCard" class="cyc-card metar-card hidden"></div>
+    <div id="volWin" class="vol-win hidden">
+      <div class="cyc-head"><span class="cyc-badge" style="background:#7cc8ff">3-D</span><span id="volStatus" class="vol-status"></span>
+        <button id="volReset" class="vol-btn" title="Everything back to how the 3-D view starts: the view, the mode, the field and every slider">Reset all</button>
+        <button id="volRefresh" class="vol-btn" title="Load the newest model step again">↻</button><button id="volX" class="cyc-x" title="Close">✕</button></div>
+      <div class="vol-view"><canvas id="volCanvas"></canvas><canvas id="volOverlay" title="Drag: turn · right-drag or Shift-drag: move · wheel: zoom"></canvas>
+        <div id="volLegend" class="vol-legend"></div></div>
+      <div class="vol-ctl">
+        <select id="volField" title="What to show"><option value="dbz">Reflectivity</option><option value="w">Vertical velocity</option><option value="zeta">Vertical vorticity</option><option value="pp" class="volTorOpt">Pressure drop</option></select>
+        <select id="volMode" title="Isosurface: a lit solid surface at the threshold (GR2Analyst's look). Volume: everything above it, see-through, in the color table's colors. Cloud: what the storm looks like to the eye -- its cloud and rain lit by the sun, with their shadows"><option value="iso">Isosurface</option><option value="vol">Volume</option><option value="cloud">Cloud (realistic)</option></select>
+        <label id="volThrLbl" title="The value the surface is drawn at (isosurface) or the weakest shown (volume)">Threshold <input id="volThr" type="range"> <span id="volThrV" class="vol-num"></span></label>
+        <label title="How see-through the volume is (volume mode), how thick the cloud and rain look (cloud mode)"><span id="volOpaName">Opacity</span> <input id="volOpa" type="range" min="0.05" max="1" step="0.05" value="0.5"></label>
+        <label id="volSunLbl" class="hidden" title="Where the sun is (compass direction)">Sun <input id="volSun" type="range" min="0" max="359" step="5" value="235"></label>
+        <label id="volSunHLbl" class="hidden" title="How high the sun is (degrees): low sun gives long shadows and golden light on the storm's side">Sun height <input id="volSunH" type="range" min="3" max="75" step="1" value="30"></label>
+        <label title="Stretches the heights (the storm is 15 km tall and 50 km across)">Height × <input id="volEx" type="range" min="1" max="6" step="0.5" value="3"></label>
+        <label class="chk" title="Vertical velocity / vorticity: the downdrafts or anticyclonic rotation too, at minus the threshold"><input id="volBoth" type="checkbox"> Negative too</label>
+        <label class="chk" title="Keep loading the newest model step while the run is live (every 8 s)"><input id="volLive" type="checkbox" checked> Live</label>
+        <label id="volReliefLbl" class="hidden" title="Cloud mode: light the cloud's own lumps and towers (its surface facing the sun bright, the far side dark), like a research volume rendering">Relief <input id="volRelief" type="range" min="0" max="1" step="0.05" value="0.6"></label>
+        <label class="volTor hidden" title="How high the tornado view goes (km above the ground)">Top <input id="volTop" type="range" min="1" max="15" step="0.5" value="5"> <span id="volTopV" class="vol-num">5 km</span></label>
+        <label class="chk volTor hidden" title="The surface pressure minimum's track (orange) under the view"><input id="volTrack" type="checkbox" checked> Track</label>
+        <label class="chk volTor hidden" title="Air parcels released around the vortex and carried by the finest grid's winds, colored by height (blue low, red high)"><input id="volPaths" type="checkbox" checked> Trajectories</label>
+      </div>
+    </div>
+    <div id="replay">
+      <button id="rpPlay" title="Play/pause (Space)">▶</button>
+      <button id="rpPrev" title="Step back (←)">◀</button>
+      <input id="rpSlider" type="range" min="0" max="0" value="0">
+      <button id="rpNext" title="Step forward (→)">▶|</button>
+      <button id="rpLive" class="on" title="Follow the newest frame">Live</button>
+      <span id="rpTime"></span>
+      <span class="sep"></span>
+      <button id="btnPause">Pause</button>
+      <button id="btnStop">Stop</button>
+    </div>
+  </div>
+</main>
+<div id="sndEditor" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="seHead">
+  <div class="modal-box">
+    <div class="modal-head">
+      <b id="seHead">Edit sounding</b>
+      <input id="seTitle" type="text" placeholder="Title" title="The sounding's title (shown in Setup and kept in the run's settings)">
+      <span class="grow"></span>
+      <button id="seUndo" title="Undo (Ctrl+Z)">Undo</button>
+      <button id="seRedo" title="Redo (Ctrl+Y)">Redo</button>
+      <button id="seReset" title="Back to the sounding as it was when the editor opened">Reset</button>
+      <button id="seClose" title="Close (Esc)">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="se-left">
+        <div class="se-tablewrap">
+          <table id="seTable">
+            <thead><tr><th>Level</th><th title="Pressure">P hPa</th><th title="Height above sea level (follows the temperatures)">Height m</th><th title="Height above the ground">AGL m</th>
+              <th title="Temperature">T °C</th><th title="Dewpoint">Td °C</th><th title="Relative humidity (sets the dewpoint)">RH %</th>
+              <th title="Direction the wind blows from">Wind °</th><th title="Wind speed">Speed kt</th><th></th></tr></thead>
+            <tbody id="seRows"></tbody>
+          </table>
+        </div>
+        <div class="se-tools">
+          <label class="chk">Add a level at <input id="seAddP" type="number" step="5" style="width:72px"> hPa</label>
+          <button id="seAdd">Add</button>
+          <button id="seThin" title="Remove every other level above the ground (soundings with hundreds of levels)">Thin out levels</button>
+          <button id="seBake" title="Start from the profile as the run would get it, with the Atmosphere tab's adjustments (Mix boundary layer, Scale winds, and the Advanced ones) applied, so you can edit the result. Using it then turns those changes off: they are in the profile.">Bake in the Setup changes</button>
+        </div>
+      </div>
+      <div class="se-right">
+        <div class="se-plots">
+          <div class="se-skewwrap"><canvas id="seSkew"></canvas></div>
+          <div class="se-side">
+            <canvas id="seHodo"></canvas>
+            <div id="seDiag" class="diag"></div>
+          </div>
+        </div>
+        <p class="hint">Type in the table or drag the points on the skew-T and hodograph. Shift-drag moves nearby levels too.</p>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <span id="seStatus" class="hint"></span>
+      <span id="seError"></span>
+      <span class="grow"></span>
+      <button id="seSave" title="Keep the edited sounding as a file in the library (data\imported\soundings) and use it">Save to library…</button>
+      <button id="seUse" class="primary" title="Use the edited sounding for the next run (it is kept in the run's settings)">Use this sounding</button>
+    </div>
+  </div>
+</div>
+<div id="stlOverlay" class="modal stl hidden" role="dialog" aria-modal="true" aria-labelledby="stlHead">
+  <div class="modal-box stl-box">
+    <div class="modal-head">
+      <b id="stlHead">Skew-T Lab</b>
+      <span id="stlTitle" class="meta"></span>
+      <span class="grow"></span>
+      <button id="stlReload" title="Load the setup's sounding into Skew-T Lab again">Reload sounding</button>
+      <button id="stlClose" class="icon" title="Close (Esc)" aria-label="Close">✕</button>
+    </div>
+    <div class="stl-body"><iframe id="stlFrame" title="Skew-T Lab"></iframe></div>
+    <div class="modal-foot">
+      <span id="stlMsg" class="hint"></span>
+      <span class="grow"></span>
+      <button id="stlCancel">Cancel</button>
+      <button id="stlUse" class="primary" title="Use the sounding as edited in Skew-T Lab for the next run (it is kept in the run's settings)">Use this sounding</button>
+    </div>
+  </div>
+</div>
+<script src="/static/js/irtable.js"></script>
+<script src="/static/js/colors.js"></script>
+<script src="/static/js/skewt.js"></script>
+<script src="/static/js/map.js"></script>
+<script src="/static/js/fronts.js"></script>
+<script src="/static/js/sndedit.js"></script>
+<script src="/static/js/skewtlab.js"></script>
+<script src="/static/js/presets.js"></script>
+<script src="/static/js/synoptic.js"></script>
+<script src="/static/js/tropics.js"></script>
+<script src="/static/js/metars.js"></script>
+<script src="/static/js/volume.js"></script>
+<script src="/static/js/survey.js"></script>
+<script src="/static/js/loopmaker.js"></script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

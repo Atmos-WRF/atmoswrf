@@ -1,0 +1,19 @@
+Atmos-WRF
+Copyright 2026 Atmos-WRF (https://github.com/Atmos-WRF)
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product runs on and includes work from:
+
+- ArWen / gpuwm (FahrenheitResearch), the GPU port of the WRF-ARW dynamical core and physics that does the
+  atmosphere. Apache License 2.0. Installed by Setup.cmd as the "gpuwm" package (not included in this source);
+  its own LICENSE and third-party notices ship with it.
+- The Weather Research and Forecasting model (WRF), NCAR / UCAR, which ArWen ports.
+
+Map and ground data in data/ (each folder's SOURCES.md has the details and download links):
+
+- US Census Bureau cartographic boundaries and incorporated places (public domain, 17 U.S.C. 105).
+- Natural Earth (public domain).
+- GMTED2010 terrain, USGS / NGA (public domain).
+- MODIS land use (WRF's WPS_GEOG modis_landuse_20class_30s, NCAR / UCAR; NASA MODIS data, free of restrictions).
+- Iowa Environmental Mesonet station list (Iowa State University).

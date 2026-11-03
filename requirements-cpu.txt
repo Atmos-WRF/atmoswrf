@@ -1,0 +1,8 @@
+# Atmos-WRF without an NVIDIA card (CPU backend, arhtmodelviewer\cpu), installed into runtime\venv by
+# Setup.cmd when it finds no NVIDIA GPU (or with "Setup.cmd cpu").  ArWen's model without the CUDA extra
+# (NumPy, SciPy, netCDF4 ...), plus clang from the ziglang wheel, which compiles ArWen's own CUDA kernels
+# for the processor: about 0.4 GB to download, 1.2 GB installed.
+gpuwm==2.9.2
+ziglang==0.16.0
+# Reads NOAA's HRRR model data (GRIB2) for the Weather tab's HRRR source; its decoder library is bundled.
+eccodes==2.50.0

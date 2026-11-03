@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skew-T Lab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand"><span class="logo">◭</span> Skew-T&nbsp;Lab</div>
+
+  <label class="ctl">Sounding
+    <select id="preset"></select>
+  </label>
+
+  <label class="ctl">Parcel
+    <select id="parcel">
+      <option value="sfc">Surface</option>
+      <option value="ml" selected>Mixed layer</option>
+      <option value="mu">Most unstable</option>
+      <option value="eff">Eff. inflow</option>
+      <option value="fcst">Forecast</option>
+    </select>
+  </label>
+
+  <label class="ctl">Storm
+    <select id="storm">
+      <option value="rm" selected>Bunkers RM</option>
+      <option value="lm">Bunkers LM</option>
+      <option value="mean">0–6 mean</option>
+    </select>
+  </label>
+
+  <label class="ctl brush">Brush
+    <input type="range" id="brush" min="0" max="4000" step="100" value="0">
+    <span class="val" id="brushVal">off</span>
+  </label>
+
+  <span class="ctl chks">Show
+    <label class="chk"><input type="checkbox" id="showWb"> T<sub>w</sub></label>
+    <label class="chk"><input type="checkbox" id="showTv"> T<sub>v</sub></label>
+  </span>
+
+  <div class="spacer"></div>
+
+  <button id="undo" class="btn" title="Ctrl+Z">Undo</button>
+  <button id="redo" class="btn" title="Ctrl+Shift+Z">Redo</button>
+  <button id="importBtn" class="btn">Import</button>
+  <button id="exportBtn" class="btn primary">Export SHARPpy</button>
+</header>
+
+<main>
+  <section class="pane skewt-pane">
+    <canvas id="skewt"></canvas>
+  </section>
+
+  <aside class="pane side">
+    <div class="hodo-wrap">
+      <canvas id="hodo"></canvas>
+      <div class="hodo-foot" id="hodoFoot"></div>
+    </div>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="params">Parameters</button>
+      <button class="tab" data-tab="levels">Levels</button>
+      <button class="tab" data-tab="help">Help</button>
+    </nav>
+
+    <div class="tabbody">
+      <div class="tabpage active" id="page-params"></div>
+
+      <div class="tabpage" id="page-levels">
+        <div class="lvl-actions">
+          <label class="ctl sm">Resolution
+            <select id="resolution">
+              <option value="raob">RAOB — mandatory + sig</option>
+              <option value="bufr25">BUFR — 25 hPa</option>
+              <option value="bufr10">BUFR — 10 hPa</option>
+              <option value="bufr5">BUFR — 5 hPa</option>
+              <option value="bufr2">BUFR — 2 hPa</option>
+              <option value="bufr1">BUFR — 1 hPa</option>
+            </select>
+          </label>
+          <span class="lvl-count" id="lvlCount"></span>
+        </div>
+        <div class="lvl-actions">
+          <button class="btn sm" id="smoothT" title="One 1-2-1 pass over temperature and dewpoint">Smooth T/Td</button>
+          <button class="btn sm" id="smoothW" title="One 1-2-1 pass over the wind profile">Smooth wind</button>
+          <button class="btn sm" id="addLvl">+ level</button>
+          <button class="btn sm" id="delLvl">– level</button>
+          <label class="ctl sm">Sfc elev
+            <input type="number" id="elev" step="10" class="num wide">
+          </label>
+        </div>
+        <div class="lvl-scroll">
+          <table class="lvl" id="lvlTable">
+            <thead><tr>
+              <th>hPa</th><th>m</th><th>T °C</th><th>Td °C</th><th>dir</th><th>kt</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="tabpage" id="page-help">
+        <h3>Editing</h3>
+        <ul>
+          <li><b>Drag</b> a red dot to change temperature, a green dot to change dewpoint. Points slide along their isobar.</li>
+          <li><b>Drag</b> a hodograph dot to change that level's wind. Hold <kbd>Shift</kbd> to keep the direction and change speed only.</li>
+          <li><b>Brush</b> spreads an edit into neighbouring levels with a cosine taper over the height you pick — good for reshaping a whole layer at once.</li>
+          <li><kbd>Shift</kbd>+click empty skew-T space inserts a level there; <kbd>Alt</kbd>+click a dot deletes that level.</li>
+          <li><b>Scroll</b> over the skew-T to zoom in around the cursor (up to ×24); finer isobars, isotherms and adiabats fill in as you go. <b>Drag</b> empty space (or right/middle-drag anywhere) to pan, <b>double-click</b> to reset.</li>
+          <li><kbd>Ctrl</kbd>+<kbd>Z</kbd> /<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> undo and redo.</li>
+          <li>Dewpoint is clamped at or below temperature automatically.</li>
+          <li><b>Resolution</b> (Levels tab) reshapes the sounding onto more editable points — RAOB gives the ~21 levels a radiosonde reports, BUFR gives a model-style profile every 25/10/5/2/1 hPa (up to ~950 points — zoom in to work with them). The curve is preserved; only the number of handles changes. At high resolution the dots thin out for legibility, but you can still grab any level.</li>
+          <li><b>Smooth</b> runs one 1-2-1 pass to take the kinks out after editing. Press it repeatedly for more.</li>
+        </ul>
+        <h3>What is drawn</h3>
+        <ul>
+          <li>Red / green lines: environmental temperature and dewpoint. Dashed white: the selected parcel's trace.</li>
+          <li>Red fill is CAPE above the LFC, blue fill is CIN below it — both computed with virtual temperature.</li>
+          <li>The blue bracket on the left edge is the effective inflow layer (parcel CAPE ≥ 100 J/kg and CIN ≥ −250 J/kg).</li>
+          <li>Hodograph colours: 0–1 km red, 1–3 orange, 3–6 green, 6–9 blue, 9–12 purple. RM / LM are the Bunkers motions, MW the 0–6 km mean wind, the yellow ring is the storm motion the parameters use.</li>
+        </ul>
+        <h3>Export</h3>
+        <ul>
+          <li><b>Export SHARPpy</b> writes the SPC plain-text format (<code>%TITLE% / %RAW% / %END%</code>) that SHARPpy, its <code>sharppy.io.spc_decoder</code>, and most SPC tools read directly.</li>
+          <li>Optionally the derived parameters are appended as <code>#</code> comment lines, which decoders ignore.</li>
+        </ul>
+        <p class="note">Parcel theory here follows Bolton (1980) for LCL, θ<sub>e</sub> and the moist adiabat; buoyancy is integrated in log-pressure with virtual temperature. Numbers will land close to SHARPpy but not bit-identical.</p>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2 id="modalTitle">Export</h2>
+      <button class="btn sm" id="modalClose">Close</button>
+    </div>
+    <div class="modal-tools" id="modalTools"></div>
+    <textarea id="modalText" spellcheck="false"></textarea>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+</div>
+
+<script src="js/thermo.js"></script>
+<script src="js/profile.js"></script>
+<script src="js/params.js"></script>
+<script src="js/samples.js"></script>
+<script src="js/sharppy.js"></script>
+<script src="js/bufkit.js"></script>
+<script src="js/skewt.js"></script>
+<script src="js/hodo.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

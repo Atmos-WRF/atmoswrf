@@ -19,9 +19,9 @@ const Survey = (() => {
         <div class="sv-tablewrap"><table id="svTable"><thead><tr><th>#</th><th class="l">Tornado</th><th>EF</th>
           <th>Wind</th><th>Vrot</th><th>Min CC</th><th class="l">Where</th><th>Start</th><th>Min</th><th>Miles</th></tr></thead>
           <tbody></tbody></table></div>
-        <p class="hint">The same rating as the tracks on the map: along each track the model's peak wind and the radar's
-          0.5° Vrot give an EF, and a debris signature (CC under 0.80) makes it at least EF1 (under 0.60: EF2); a tornado
-          is rated its highest. Wind: the model's peak, within that EF's range. Named after the biggest town on the track
+        <p class="hint">The same rating as the tracks on the map, as an NWS office rates a tornado off the radar: along
+          each track the 0.5° Vrot gives the EF (33 kt EF1, 42 EF2, 52 EF3, 63 EF4, 74+ EF5), a debris signature (CC under
+          0.80) makes it at least EF1 (under 0.60: EF2), and without one it is held to EF3; a tornado is rated its highest. Wind: the model's peak, within that EF's range. Named after the biggest town on the track
           (else the nearest). The damage survey is the track itself, each stretch in its EF's colour, as on the map.
           Click a tornado to see its track.</p></div>
       <div class="modal-foot"><span class="hint">GR2Analyst live placefile: <code id="svPlace"></code></span>

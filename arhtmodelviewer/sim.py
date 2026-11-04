@@ -2335,10 +2335,11 @@ class Simulation:
                 xy = np.mean([pad[i:i + len(xy)] for i in range(2 * k + 1)], axis=0)
                 xy[0], xy[-1] = [pts[0][1], pts[0][2]], [pts[-1][1], pts[-1][2]]
             out.append({"id": tid, "active": tid in live,
-                        # t, x, y, EF, the model's peak wind (m/s: the damage survey's swath widths, survey.py)
-                        "pts": [[round(p[0]), round(float(a), 1), round(float(b), 1), p[7], round(float(p[3]), 1)]
+                        # t, x, y, EF, the model's peak wind (m/s), the Vrot rated on (m/s), CC (None: no fresh sweep)
+                        "pts": [[round(p[0]), round(float(a), 1), round(float(b), 1), max(p[7], 0), round(float(p[3]), 1),
+                                 round(float(p[5] if p[5] is not None else p[4]), 1), p[6]]
                                 for p, (a, b) in zip(pts, xy)],
-                        "ef": max(p[7] for p in pts), "wind": max(p[3] for p in pts),
+                        "ef": max(max(p[7] for p in pts), 0), "wind": max(p[3] for p in pts),
                         "vrot": max((p[5] or p[4]) for p in pts),
                         "cc": min((p[6] for p in pts if p[6] is not None), default=None),
                         "t0": pts[0][0], "t1": pts[-1][0]})

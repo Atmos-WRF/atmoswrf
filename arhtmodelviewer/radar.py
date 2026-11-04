@@ -1290,23 +1290,29 @@ TORNADO_MIN_AGE = 1500.0      # s
 TORNADO_CONFIRM = 120.0       # s
 
 
-# Estimated strength along a tornado's track (Simulation.tornado_tracks), the way a warning forecaster reads
-# it off the radar: the 0.5 deg rotational velocity (Smith et al. 2015, Thompson et al. 2017: the most likely
-# EF rating rises by about one per 15 kt of Vrot) and the tornadic debris signature (a CC drop under ~0.8 means
-# debris is being lofted: at least EF1; under ~0.6, at least EF2), with the model's own peak wind beside them.
+# Estimated strength along a tornado's track (Simulation.tornado_tracks: the map's colours, the tornado list and the
+# damage survey all use it), the way an NWS office rates a tornado off the radar before a survey: the 0.5 deg
+# rotational velocity sets it (WSR-88D tornado-intensity studies, Smith et al. 2015, 2020: 33 kt EF1, 42 EF2,
+# 52 EF3, 63 EF4, 74 EF5), a tornadic debris signature (CC under 0.8: debris lofted) makes it at least EF1 (under
+# 0.6: EF2), and without one it is held to EF3.  The model's own peak wind only stands in when there is no Vrot.
+# (Until 2026-11-03 the Vrot rating, on gentler steps, was averaged with the model wind's, which ran a step low.)
 EF_WIND = (29.0, 38.0, 49.0, 60.0, 74.0, 89.0)      # m/s: EF0 .. EF5 lower bounds (3 s gusts)
-EF_VROT_KT = (20.0, 35.0, 47.5, 60.0, 75.0, 90.0)   # kt of 0.5 deg Vrot: EF0 .. EF5, most likely
+EF_VROT_KT = (20.0, 33.0, 42.0, 52.0, 63.0, 74.0)   # kt of 0.5 deg Vrot: EF0 .. EF5
+TDS_CC = 0.80                                       # CC this low in the tornado's echo: a debris signature
+TDS_STRONG_CC = 0.60
 
 
 def ef_estimate(wind: float | None, vrot: float | None, cc: float | None) -> int:
-    """EF rating (0-5, -1 = not a tornado) from the model's peak wind and the radar's Vrot (m/s) and CC."""
+    """EF rating (0-5, -1 = not a tornado) from the radar's Vrot (m/s) and CC; the model's peak wind (m/s) when
+    there is no Vrot."""
     def band(v, edges):
         return -1 if v is None else max([k for k, e in enumerate(edges) if v >= e], default=-1)
-    ew = band(wind, EF_WIND)
-    ev = band(None if vrot is None else vrot * 1.944, EF_VROT_KT)
-    est = max(ew, ev) if (ew < 0 or ev < 0) else int(0.5 * (ew + ev) + 0.5)
-    if cc is not None and cc < 0.8:
-        est = max(est, 1 if cc >= 0.6 else 2)
+    est = band(vrot * 1.943844 + 1e-6, EF_VROT_KT) if vrot is not None else band(wind, EF_WIND)
+    tds = cc is not None and cc < TDS_CC
+    if tds:
+        est = max(est, 1 if cc >= TDS_STRONG_CC else 2)
+    else:
+        est = min(est, 3)
     return min(est, 5)
 
 

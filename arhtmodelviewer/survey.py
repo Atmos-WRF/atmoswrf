@@ -1,7 +1,7 @@
 """A run's tornado list and damage survey, from its state (state.json / Simulation.info()).
 
 One rating everywhere: the map's.  Every point of a tornado's track carries the viewer's EF estimate
-(radar.ef_estimate: the model's peak wind, the radar's 0.5-degree Vrot and the debris signature's CC drop, as
+(radar.ef_estimate: the radar's 0.5-degree Vrot, with the debris signature's CC drop as a floor, as
 Simulation._record_tornadoes makes it), the map colours the track by it, and here the tornado's rating is its
 highest and the survey is that same track in the same colours.  The list: every tornado named after the biggest
 town it went through (else the town nearest its path; a second one for a town is #2), with its estimated peak

@@ -352,6 +352,46 @@ class Zone:
 
 
 @dataclass
+class HandOverLock:
+    """The run's lock (re-entrant) that the run loop hands over: Python's locks are not fair, and the loop holds
+    this one for a whole step (seconds with a tornado zoom's nests) then takes it back at once, so a page request
+    waiting on it (the 3-D view, the state, the phone remote) could wait through step after step.  Threads that
+    have to wait are counted, and the loop lets them in first (hand_over) before its next step."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._count = threading.Lock()
+        self.waiting = 0
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if self._lock.acquire(blocking=False):
+            return True
+        if not blocking:
+            return False
+        with self._count:
+            self.waiting += 1
+        try:
+            return self._lock.acquire(True, timeout)
+        finally:
+            with self._count:
+                self.waiting -= 1
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def hand_over(self, limit: float = 3.0) -> None:
+        """Wait (without the lock) until every thread waiting for it has had it, at most ``limit`` s."""
+        t0 = time.perf_counter()
+        while self.waiting > 0 and time.perf_counter() - t0 < limit:
+            time.sleep(0.001)
+
+
 class Frame:
     t: float
     epoch_ms: int
@@ -372,7 +412,7 @@ class Simulation:
         self.status = "building"
         self.error = None
         self.cmds: queue.Queue = queue.Queue()
-        self.lock = threading.RLock()
+        self.lock = HandOverLock()
         self.frames: list[Frame] = []
         self.frame_bytes = 0
         self.max_frame_bytes = int(s.get("max_frame_mb", 1500)) * 1024 * 1024
@@ -1419,6 +1459,7 @@ class Simulation:
                 if not eng.patches:
                     time.sleep(0.01)      # nothing to compute yet: do not spin the GPU / CPU
                 self._synoptic_prepare()  # the weather's own work, outside the lock the page reads under
+                self.lock.hand_over()     # the page's requests first (the 3-D view, the state), then the next step
                 with self.lock:
                     stepping = True
                     timing = _DEBUG_TIMING and getattr(self, "_time_left", 0) > 0

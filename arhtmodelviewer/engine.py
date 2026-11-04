@@ -127,7 +127,10 @@ VRAM_SHARE = 0.72       # of the card's own memory this run may hold in all (its
                         # 0.80 an 8 GB 4060 held 6.35 GB with 1.57 GB spilled (desktop, browser ~1 GB) at 2.2x
 CONTEXT_BYTES = 0.9 * 2**30   # GPU memory outside CuPy's pool: CUDA's context, cuFFT / cuBLAS, the kernels
                               # (7.9 GB held by the process for 7.0 GB pooled, 2026-10-31)
-MEASURE_CELLS = 3_000_000     # cells in patches before their measured bytes per cell replace CELL_BYTES: below
+MIN_CELL_BYTES = 250.0        # no run's patch arrays take less a cell (the dynamics' own fields): below it, a stale base
+MAX_CELL_BYTES = 6000.0       # nor more (10x CELL_BYTES; aerosol Thompson + suite + radars measure ~760)
+MAX_SCRATCH = 3.0             # the step's scratch over the arrays in use (measured 1.1-1.4)
+MEASURE_CELLS = 3_000_000    # cells in patches before their measured bytes per cell replace CELL_BYTES: below
                               # it the run's other arrays (radar fields, nests, swaths) weigh too much per cell,
                               # and a run that small is far from filling any card
 
@@ -145,6 +148,15 @@ def _pool_bytes() -> int:
     try:
         import cupy as cp
         return int(cp.get_default_memory_pool().total_bytes())
+    except Exception:
+        return 0
+
+
+def _pool_used_bytes() -> int:
+    """What CuPy's pool has in use (arrays alive), without its free blocks."""
+    try:
+        import cupy as cp
+        return int(cp.get_default_memory_pool().used_bytes())
     except Exception:
         return 0
 
@@ -300,7 +312,10 @@ class Engine:
             self.opt.max_cells = int(0.75 * _gpu_free_bytes() / CELL_BYTES)
         self._cell_bytes = CELL_BYTES          # measured once the patches are big enough (_measure_memory)
         self._nest_mem = 1.3                   # x _cell_bytes a nest cell is counted at (edge tables, LES); up after an OOM
-        self._pool_base = _pool_bytes()        # arrays that are not patches' (a previous run's are freed by now)
+        # arrays that are not patches': those in use only.  The pool's free blocks (a previous run's patches, kept by
+        # CuPy for reuse) are not; counted in, a second run in the same viewer saw its patches' arrays as ~0 bytes,
+        # the bytes per cell went astronomical, the budget to 0 and the domain never moved again (2026-11-03)
+        self._pool_base = _pool_used_bytes()
         self._vram_cells = _vram_cells(self._cell_bytes, self._pool_base)
         self.opt.max_cells = min(self.opt.max_cells, self._vram_cells)
         self._max_cells0 = self.opt.max_cells
@@ -1417,9 +1432,13 @@ class Engine:
         except Exception:
             return
         base = self._pool_base
+        if used - base < MIN_CELL_BYTES * cells:
+            # the base was too big (arrays counted in it have gone since): the patches' arrays cannot be
+            # smaller than the model's own fields, so the base comes down to what that leaves
+            base = self._pool_base = max(0, int(used - CELL_BYTES / 1.15 * cells))
         layout = sorted((p.rect.nx, p.rect.ny) for p in self.patches)
         if layout == getattr(self, "_measured_layout", None):
-            self._scratch = max(1.0, (held - base) / max(1, used - base))
+            self._scratch = min(MAX_SCRATCH, max(1.0, (held - base) / max(1, used - base)))
         else:
             self._measured_layout = layout
             if held > 1.1 * used * getattr(self, "_scratch", 1.15):
@@ -1427,8 +1446,10 @@ class Engine:
         now = (used - base) / cells * getattr(self, "_scratch", 1.15)
         if now <= 0:
             return
+        now = min(now, MAX_CELL_BYTES)
         old = self._cell_bytes
-        self._cell_bytes = max(CELL_BYTES, now if now > old else 0.9 * old + 0.1 * now)
+        # up at once, down slowly -- but straight down from a reading far too high (a stale base, above)
+        self._cell_bytes = max(CELL_BYTES, now if now > old or now < 0.25 * old else 0.9 * old + 0.1 * now)
         self._vram_cells = _vram_cells(self._cell_bytes, base)
         if self.opt.max_cells > self._vram_cells:
             lowered = self.opt.max_cells > 1.05 * self._vram_cells

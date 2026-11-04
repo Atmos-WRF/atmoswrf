@@ -351,7 +351,6 @@ class Zone:
         return dict(self.__dict__)
 
 
-@dataclass
 class HandOverLock:
     """The run's lock (re-entrant) that the run loop hands over: Python's locks are not fair, and the loop holds
     this one for a whole step (seconds with a tornado zoom's nests) then takes it back at once, so a page request
@@ -392,6 +391,7 @@ class HandOverLock:
             time.sleep(0.001)
 
 
+@dataclass
 class Frame:
     t: float
     epoch_ms: int

@@ -797,7 +797,7 @@ class Handler(BaseHTTPRequestHandler):
             body = net.placefile(icon) if net is not None else metars.empty_placefile(icon)
             return self._send(200, body.encode(), "text/plain")
         if parts[0].lower() == "survey.txt" and len(parts) == 1:
-            # the damage survey (survey.py) of the run on the map, or the newest one: EF swaths, tracks, labels
+            # the damage survey (survey.py) of the run on the map, or the newest one: EF-coloured tracks, labels
             try:
                 body = self._survey_of(None).placefile(refresh=60)
             except Exception:

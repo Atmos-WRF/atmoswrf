@@ -1,10 +1,10 @@
 // The tornado list and damage survey (arhtmodelviewer/survey.py): a window with every tornado of the run,
-// strongest first, rated as an NWS office does before a survey; downloads (Google Earth KML with the EF damage
-// swaths, CSV, Markdown, GR2Analyst placefile) and the live placefile's address.  Opens by itself when a run with
+// strongest first, with the map's EF rating; downloads (Google Earth KML with the tracks coloured by EF
+// as on the map, CSV, Markdown, GR2Analyst placefile) and the live placefile's address.  Opens by itself when a run with
 // tornadoes ends.  Click a tornado: the map goes to its track.
 const Survey = (() => {
   const $ = id => document.getElementById(id);
-  const EF_RGB = ['rgb(0,180,230)', 'rgb(0,200,0)', 'rgb(230,215,0)', 'rgb(255,128,0)', 'rgb(255,0,0)', 'rgb(255,0,255)'];
+  const EF_RGB = ['#7fdcff', '#3ccf7a', '#f5d33a', '#f2913a', '#e8413c', '#c13ae8'];     // the map's (app.js EF_COLORS)
   let lastStatus = null, lastRun = null, shownFor = null, current = null;
 
   function build() {
@@ -19,14 +19,15 @@ const Survey = (() => {
         <div class="sv-tablewrap"><table id="svTable"><thead><tr><th>#</th><th class="l">Tornado</th><th>EF</th>
           <th>Wind</th><th>Vrot</th><th>Min CC</th><th class="l">Where</th><th>Start</th><th>Min</th><th>Miles</th></tr></thead>
           <tbody></tbody></table></div>
-        <p class="hint">Rated the way an NWS office does before a survey: peak 0.5° Vrot sets the EF (33 kt EF1, 42 EF2,
-          52 EF3, 63 EF4, 74+ EF5), a debris signature (CC ≤ 0.80) makes it at least EF1 (≤ 0.60: EF2), and without one it
-          is held to EF3. Named after the biggest town on the track (else the nearest). The damage survey's EF contours
-          come from the model's own winds along the track, capped at the rating. Click a tornado to see its track.</p></div>
+        <p class="hint">The same rating as the tracks on the map: along each track the model's peak wind and the radar's
+          0.5° Vrot give an EF, and a debris signature (CC under 0.80) makes it at least EF1 (under 0.60: EF2); a tornado
+          is rated its highest. Wind: the model's peak, within that EF's range. Named after the biggest town on the track
+          (else the nearest). The damage survey is the track itself, each stretch in its EF's colour, as on the map.
+          Click a tornado to see its track.</p></div>
       <div class="modal-foot"><span class="hint">GR2Analyst live placefile: <code id="svPlace"></code></span>
         <span class="grow"></span>
-        <button data-sv="kml" title="Google Earth: every track with its facts and its EF damage swath">Google Earth (KML)</button>
-        <button data-sv="placefile" title="A GR2Analyst placefile of the damage survey (EF swaths, tracks, labels) to keep">Placefile</button>
+        <button data-sv="kml" title="Google Earth: every track with its facts, coloured by EF along it">Google Earth (KML)</button>
+        <button data-sv="placefile" title="A GR2Analyst placefile of the damage survey (tracks coloured by EF, labels) to keep">Placefile</button>
         <button data-sv="csv">CSV</button><button data-sv="md">Markdown</button></div></div>`;
     document.body.appendChild(d);
     $('svClose').onclick = close;

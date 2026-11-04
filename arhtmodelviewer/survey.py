@@ -1,17 +1,16 @@
 """A run's tornado list and damage survey, from its state (state.json / Simulation.info()).
 
-The list: every tornado, named after the biggest town it went through (else the town nearest its path; a second
-one for a town is #2), rated as an NWS office does before a survey -- peak 0.5-degree Vrot for the rating, a
-debris signature (low CC) as a floor, no EF4-5 without one -- with its estimated peak wind, path length, start and
-end.  Listed strongest first.  (output/loop_tools/tor_list.py of 2026-10-28, folded into the viewer.)
+One rating everywhere: the map's.  Every point of a tornado's track carries the viewer's EF estimate
+(radar.ef_estimate: the model's peak wind, the radar's 0.5-degree Vrot and the debris signature's CC drop, as
+Simulation._record_tornadoes makes it), the map colours the track by it, and here the tornado's rating is its
+highest and the survey is that same track in the same colours.  The list: every tornado named after the biggest
+town it went through (else the town nearest its path; a second one for a town is #2), with its estimated peak
+wind (the model's, held within its rating's EF range), peak Vrot, lowest CC, path length, start and end;
+strongest first.
 
-The survey: each tornado's damage swath as nested EF contours, from the model's own winds along the track: a core
-of radius 150-400 m (the radar's sub-grid tornado, radar.tornado_winds) with the wind falling as r^-0.8 outside it
-(the same profile), so the EF-k contour's half width is where that wind drops to EF-k's threshold (radar.EF_WIND).
-The rating caps the contours (the survey's rating is the list's).  No damage indicators.
-
-Exports: KML (Google Earth: tracks with their facts, swath polygons by EF) and a GRLevelX placefile (polygons and
-outlines in the NWS survey colours, labels)."""
+The survey: each track as a line, each stretch coloured and widened by its EF (as on the map), no polygons and no
+damage indicators.  Exports: KML (Google Earth: the tracks with their facts) and a GRLevelX placefile (the
+tracks, labels).  CSV and Markdown of the list."""
 from __future__ import annotations
 
 import csv
@@ -23,40 +22,46 @@ from xml.sax.saxutils import escape
 import numpy as np
 
 from . import geo
-from .radar import EF_WIND
 
 KT = 1.943844
-# peak 0.5 deg Vrot (kt) -> EF (WSR-88D tornado-intensity studies: Smith et al. 2015, 2020)
-VROT_EF = [(74.0, 5), (63.0, 4), (52.0, 3), (42.0, 2), (33.0, 1)]
-TDS_CC = 0.80                 # a tornadic debris signature: CC this low in the tornado's echo
-TDS_STRONG = 0.60             # a strong one
+TDS_CC = 0.80                 # a tornadic debris signature: CC this low in the tornado's echo (shown; rated in ef_estimate)
 EF_MPH = {0: (65, 85), 1: (86, 110), 2: (111, 135), 3: (136, 165), 4: (166, 200), 5: (201, 250)}
-VROT_BAND = {0: (20.0, 33.0), 1: (33.0, 42.0), 2: (42.0, 52.0), 3: (52.0, 63.0), 4: (63.0, 74.0), 5: (74.0, 110.0)}
-# the NWS damage survey colours (r, g, b)
-EF_RGB = {0: (0, 180, 230), 1: (0, 200, 0), 2: (255, 255, 0), 3: (255, 128, 0), 4: (255, 0, 0), 5: (255, 0, 255)}
-CORE_R = (150.0, 400.0)       # m: the core radius, weakest .. strongest tornado (35 .. 80 m/s)
-DECAY = 0.8                   # the wind outside the core falls as r^-DECAY
-SWATH_MAX = 2500.0            # m: no half width wider
+# the map's EF colours (web/js/app.js EF_COLORS), (r, g, b)
+EF_RGB = {0: (127, 220, 255), 1: (60, 207, 122), 2: (245, 211, 58), 3: (242, 145, 58), 4: (232, 65, 60), 5: (193, 58, 232)}
+SMOOTH = 3                    # Chaikin passes over the track (the map's too)
 
 
-def ef_radar(vrot_ms, cc):
-    kt = (vrot_ms or 0.0) * KT
-    ef = next((e for v, e in VROT_EF if kt >= v), 0)
-    tds = cc is not None and cc <= TDS_CC
-    if tds:
-        ef = max(ef, 1)
-    if cc is not None and cc <= TDS_STRONG:
-        ef = max(ef, 2)
-    if not tds:
-        ef = min(ef, 3)
-    return ef, kt, tds
+def track_ef(tor) -> int:
+    """The tornado's rating: the highest EF along its track, as the map labels it."""
+    return max([max(int(p[3]), 0) for p in tor.get("pts") or []] or [max(int(tor.get("ef") or 0), 0)])
 
 
-def ef_wind_mph(ef, kt):
+def wind_mph(ef, model_ms) -> int:
+    """Estimated peak wind: the model's peak, held within the rating's EF range, to 5 mph."""
     lo, hi = EF_MPH[ef]
-    a, b = VROT_BAND[ef]
-    f = min(max((kt - a) / (b - a), 0.0), 1.0)
-    return int(5 * round((lo + f * (hi - lo)) / 5.0))
+    v = 5 * round((model_ms or 0.0) * 2.23694 / 5.0)
+    return int(min(max(v, 5 * math.ceil(lo / 5.0)), 5 * math.floor(hi / 5.0)))     # to 5 mph, inside the range
+
+
+def _chaikin(P, E, n=SMOOTH):
+    """The map's smoothing (app.js chaikin): each new point keeps the EF of the original point it came from."""
+    for _ in range(n):
+        if len(P) < 3:
+            break
+        a, b = P[:-1], P[1:]
+        Q = np.empty((2 * len(a) + 2, 2))
+        Q[0], Q[-1] = P[0], P[-1]
+        Q[1:-1:2] = 0.75 * a + 0.25 * b
+        Q[2:-1:2] = 0.25 * a + 0.75 * b
+        F = np.empty(len(Q), int)
+        F[0], F[-1] = E[0], E[-1]
+        F[1:-1:2], F[2:-1:2] = E[:-1], E[1:]
+        P, E = Q, F
+    return P, E
+
+
+def _coords(pts):
+    return " ".join(f"{lo:.5f},{la:.5f},0" for la, lo in pts)
 
 
 def _compass(dx, dy):
@@ -72,7 +77,7 @@ def _seg_dist(px, py, ax, ay, bx, by):
 
 
 class Survey:
-    """The list and the swaths of one run's state."""
+    """The list and the survey lines of one run's state."""
 
     def __init__(self, state: dict):
         self.state = state
@@ -112,7 +117,9 @@ class Survey:
             big, near, dist = self._towns_on(P)
             k = big if big is not None else near
             town = f"{self._cs[k]['name']}, {self._cs[k]['state']}" if k is not None else "open country"
-            ef, kt, tds = ef_radar(tor.get("vrot"), tor.get("cc"))
+            ef, kt = track_ef(tor), (tor.get("vrot") or 0.0) * KT
+            tds = tor.get("cc") is not None and tor["cc"] <= TDS_CC
+            peak = max([float(p[4]) for p in tor["pts"] if len(p) > 4] or [float(tor.get("wind") or 0.0)])
             length = float(np.hypot(*np.diff(P, axis=0).T).sum()) / 1609.344 if len(P) > 1 else 0.0
             la, lo = self.proj.inv(P[:, 0], P[:, 1])
             la, lo = np.ravel(la).astype(float), np.ravel(lo).astype(float)
@@ -120,9 +127,9 @@ class Survey:
                      f"{dist / 1609.344:.0f} mi {_compass(P.mean(0)[0] - self._cx[k], P.mean(0)[1] - self._cy[k])} of town"
                      if k is not None else "")
             rows.append({
-                "id": tor["id"], "town": town, "where": where, "ef": ef, "wind_mph": ef_wind_mph(ef, kt),
+                "id": tor["id"], "town": town, "where": where, "ef": ef, "wind_mph": wind_mph(ef, peak),
                 "vrot_kt": round(kt), "cc": tor.get("cc"), "tds": tds, "model_ef": tor.get("ef"),
-                "model_wind_mph": round(float(tor.get("wind") or 0.0) * 2.23694),
+                "model_wind_mph": round(peak * 2.23694),
                 "start_utc": (self.start + dt.timedelta(seconds=tor["t0"])).strftime("%Y-%m-%d %H:%MZ"),
                 "end_utc": (self.start + dt.timedelta(seconds=tor["t1"])).strftime("%H:%MZ"),
                 "minutes": round((tor["t1"] - tor["t0"]) / 60.0, 1), "miles": round(length, 1),
@@ -142,57 +149,26 @@ class Survey:
             r["rank"] = i
         return rows
 
-    # ---------------------------------------------------------------- the swaths
-    def swaths(self, r) -> dict:
-        """{EF: [rings]}: each ring a closed list of (lat, lon) around the stretch of track where the wind reaches
-        that rating, EF0 outermost."""
+    # ---------------------------------------------------------------- the survey line
+    def segments(self, r) -> list:
+        """The track smoothed as the map draws it, cut where its EF changes: [(EF, [(lat, lon), ...]), ...] in
+        order along the track, each piece starting where the one before ended."""
         pts = r["_tor"]["pts"]
         P = np.array([(p[1], p[2]) for p in pts], np.float64)
-        wind = np.array([p[4] if len(p) > 4 else EF_WIND[max(int(p[3]), 0)] + 5.0 for p in pts], np.float64)
+        E = np.array([max(int(p[3]), 0) for p in pts], int)
         if len(P) < 2:
-            return {}
-        top = int(r["ef"])
-        d = np.gradient(P, axis=0)
-        n = np.stack([-d[:, 1], d[:, 0]], axis=1)
-        n /= np.maximum(np.hypot(n[:, 0], n[:, 1]), 1e-6)[:, None]
-        s = np.clip((wind - 35.0) / 45.0, 0.0, 1.0)
-        rc = CORE_R[0] + (CORE_R[1] - CORE_R[0]) * s
-        out = {}
-        for k in range(0, top + 1):
-            vk = EF_WIND[k]
-            hw = np.where(wind >= vk, np.minimum(rc * (np.maximum(wind, vk) / vk) ** (1.0 / DECAY), SWATH_MAX), 0.0)
-            if k == top:                              # the rating's own contour: at least where the track is that strong
-                hw = np.where(hw > 0, hw, 0.0)
-            rings = []
-            on = hw > 0
-            i = 0
-            while i < len(P):
-                if not on[i]:
-                    i += 1
-                    continue
-                j = i
-                while j + 1 < len(P) and on[j + 1]:
-                    j += 1
-                rings.append(self._ring(P[i:j + 1], n[i:j + 1], hw[i:j + 1]))
-                i = j + 1
-            if rings:
-                out[k] = rings
+            return []
+        P, E = _chaikin(P, E)
+        la, lo = self.proj.inv(P[:, 0], P[:, 1])
+        L = [(round(float(a), 5), round(float(b), 5)) for a, b in zip(np.ravel(la), np.ravel(lo))]
+        out, i = [], 0
+        while i < len(L) - 1:
+            j = i
+            while j + 1 < len(L) - 1 and E[j + 1] == E[i]:
+                j += 1
+            out.append((int(E[i]), L[i:j + 2]))
+            i = j + 1
         return out
-
-    def _ring(self, P, n, hw):
-        left = P + n * hw[:, None]
-        right = P - n * hw[:, None]
-        # round ends: half circles at the stretch's first and last points
-        def cap(c, nn, w, sign):
-            a0 = math.atan2(nn[1], nn[0])
-            return [(c[0] + w * math.cos(a0 + sign * t), c[1] + w * math.sin(a0 + sign * t))
-                    for t in np.linspace(0, math.pi, 9)[1:-1]]
-        ring = list(map(tuple, left)) + cap(P[-1], n[-1], hw[-1], -1.0) + list(map(tuple, right[::-1])) + \
-            cap(P[0], -n[0], hw[0], -1.0)
-        ring.append(ring[0])
-        xy = np.array(ring)
-        la, lo = self.proj.inv(xy[:, 0], xy[:, 1])
-        return [(round(float(a), 5), round(float(b), 5)) for a, b in zip(np.ravel(la), np.ravel(lo))]
 
     # ---------------------------------------------------------------- exports
     def summary(self) -> str:
@@ -202,11 +178,11 @@ class Survey:
                 + (f". Longest track {max(r['miles'] for r in self.rows):.1f} mi." if self.rows else "."))
 
     def table(self) -> list:
-        """The rows for the page (no internals), with each one's swaths."""
+        """The rows for the page (no internals), with each one's survey line."""
         out = []
         for r in self.rows:
             d = {k: v for k, v in r.items() if not k.startswith("_")}
-            d["swaths"] = {str(k): v for k, v in self.swaths(r).items()}
+            d["segments"] = self.segments(r)
             out.append(d)
         return out
 
@@ -224,10 +200,11 @@ class Survey:
             r_, g, b = EF_RGB[ef]
             return f"{a}{b:02x}{g:02x}{r_:02x}"
         styles = "".join(
-            f'<Style id="ef{e}"><LineStyle><color>{colour(e)}</color><width>{2 + e * 0.6:.1f}</width></LineStyle>'
-            f'<PolyStyle><color>{colour(e, "66")}</color></PolyStyle>'
+            f'<Style id="ef{e}"><LineStyle><color>{colour(e)}</color><width>{2 + 1.2 * e:.1f}</width></LineStyle>'
             f'<IconStyle><color>{colour(e)}</color><scale>{0.8 + 0.1 * e:.1f}</scale><Icon><href>'
             'http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle></Style>'
+            for e in range(6)) + "".join(
+            f'<Style id="case{e}"><LineStyle><color>8c000000</color><width>{4 + 1.2 * e:.1f}</width></LineStyle></Style>'
             for e in range(6))
 
         def desc(r):
@@ -242,48 +219,45 @@ class Survey:
         body = []
         for r in self.rows:
             label = f"{r['name']} (EF{r['ef']}, {r['wind_mph']} mph)"
-            coords = " ".join(f"{lo:.5f},{la:.5f},0" for la, lo in r["path"])
-            sw = self.swaths(r)
-            polys = "".join(
-                f"<Placemark><name>EF{k} damage</name><styleUrl>#ef{k}</styleUrl><Polygon><tessellate>1</tessellate>"
-                f"<outerBoundaryIs><LinearRing><coordinates>{' '.join(f'{lo:.5f},{la:.5f},0' for la, lo in ring)}"
-                "</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>"
-                for k in sorted(sw) for ring in sw[k])
+            segs = self.segments(r)
+            whole = [q for k, (_, s) in enumerate(segs) for q in (s if k == 0 else s[1:])] or r["path"]
+            pieces = "".join(
+                f"<Placemark><name>EF{k}</name><styleUrl>#ef{k}</styleUrl><LineString><tessellate>1</tessellate>"
+                f"<coordinates>{_coords(s)}</coordinates></LineString></Placemark>" for k, s in segs)
             la0, lo0 = r["path"][0]
             body.append(f"<Folder><name>{escape(label)}</name>"
                         f"<Placemark><name>{escape(label)}</name><description>{desc(r)}</description>"
                         f"<styleUrl>#ef{r['ef']}</styleUrl><Point><coordinates>{lo0:.5f},{la0:.5f},0</coordinates></Point></Placemark>"
-                        f"<Placemark><name>{escape(label)} track</name><styleUrl>#ef{r['ef']}</styleUrl><LineString>"
-                        f"<tessellate>1</tessellate><coordinates>{coords}</coordinates></LineString></Placemark>"
-                        f"<Folder><name>Damage swath</name>{polys}</Folder></Folder>")
+                        f"<Folder><name>Track by EF</name>"
+                        f"<Placemark><name>casing</name><styleUrl>#case{r['ef']}</styleUrl><LineString>"
+                        f"<tessellate>1</tessellate><coordinates>{_coords(whole)}</coordinates></LineString></Placemark>"
+                        f"{pieces}</Folder></Folder>")
         return ('<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
                 f"<name>{escape('Damage survey, run ' + self.run_id)}</name><description>{escape(self.summary())}</description>"
                 f"{styles}{''.join(body)}</Document></kml>\n")
 
     def placefile(self, refresh: int = 60) -> str:
-        """GRLevelX placefile: each swath's EF contours filled (outermost first, so the stronger lie on top) and
-        outlined, the track, and a label at its start."""
+        """GRLevelX placefile: each track as on the map -- a dark casing, then each stretch in its EF's colour and
+        width -- and a label at its start."""
         lines = [f"Title: Atmos-WRF damage survey ({self.run_id})", f"RefreshSeconds: {refresh}",
                  "Threshold: 999", ""]
         for r in self.rows:
-            sw = self.swaths(r)
-            for k in sorted(sw):
-                cr, cg, cb = EF_RGB[k]
-                for ring in sw[k]:
-                    lines.append("Polygon:")
-                    lines.append(f" {ring[0][0]:.5f}, {ring[0][1]:.5f}, {cr}, {cg}, {cb}, 70")
-                    lines += [f" {la:.5f}, {lo:.5f}" for la, lo in ring[1:]]
-                    lines.append("End:")
-                    lines.append(f"Color: {cr} {cg} {cb} 255")
-                    lines.append(f'Line: 2, 0, "EF{k} damage, {r["name"]}"')
-                    lines += [f" {la:.5f}, {lo:.5f}" for la, lo in ring]
-                    lines.append("End:")
-            cr, cg, cb = EF_RGB[r["ef"]]
-            lines.append("Color: 255 255 255 255")
-            lines.append(f'Line: 1, 0, "{r["name"]} EF{r["ef"]} track"')
-            lines += [f" {la:.5f}, {lo:.5f}" for la, lo in r["path"]]
+            segs = self.segments(r)
+            if not segs:
+                continue
+            whole = [q for k, (_, s) in enumerate(segs) for q in (s if k == 0 else s[1:])]
+            lines.append("Color: 0 0 0 140")
+            lines.append(f'Line: {4 + round(1.2 * r["ef"])}, 0, "{r["name"]} EF{r["ef"]}"')
+            lines += [f" {la:.5f}, {lo:.5f}" for la, lo in whole]
             lines.append("End:")
+            for k, s in segs:
+                cr, cg, cb = EF_RGB[k]
+                lines.append(f"Color: {cr} {cg} {cb} 255")
+                lines.append(f'Line: {2 + round(1.2 * k)}, 0, "{r["name"]}: EF{k} here, EF{r["ef"]} overall"')
+                lines += [f" {la:.5f}, {lo:.5f}" for la, lo in s]
+                lines.append("End:")
             la0, lo0 = r["path"][0]
+            cr, cg, cb = EF_RGB[r["ef"]]
             lines.append(f"Color: {cr} {cg} {cb} 255")
             lines.append(f'Text: {la0:.5f}, {lo0:.5f}, 1, "EF{r["ef"]}", "{r["name"]}: EF{r["ef"]}, {r["wind_mph"]} mph, '
                          f'{r["miles"]:g} mi, {r["start_utc"]}"')

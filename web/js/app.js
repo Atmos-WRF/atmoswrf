@@ -805,6 +805,7 @@ async function drawFrame() {
   const i = S.frameIdx < 0 ? S.frames.length - 1 : Math.min(S.frameIdx, S.frames.length - 1);
   const fr = S.frames[i], product = S.product, radar = isRadarProduct(product);
   $('rpTime').textContent = `${new Date(fr.ms).toISOString().slice(11, 19)}Z  (+${fmtDur(fr.t)})  ${i + 1}/${S.frames.length}`;
+  if (window.Vol) Vol.followTime(S.live ? null : fr.t);      // the 3-D view's replay goes with the map's
   try {
     const pal = await paletteFor(product);
     if (radar) {

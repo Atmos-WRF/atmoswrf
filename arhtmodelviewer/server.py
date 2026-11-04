@@ -420,6 +420,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._ppi(q)
             if path == "/api/volume":
                 return self._volume(q)
+            if path == "/api/volume/times":
+                # the 3-D replay's snapshots (volume.snapshot): model times (s), and the radar frames' clock
+                from . import volume
+                sim = APP.sim
+                times = volume.history_times(sim.run_dir / "vol3d") if sim is not None else []
+                t0 = sim.frames[0].epoch_ms - 1000.0 * sim.frames[0].t if sim is not None and sim.frames else None
+                return self._json({"times": times, "ms0": t0, "every": volume.HISTORY_EVERY})
             if path == "/api/tornado/paths":
                 return self._tornado_paths()
             if path == "/api/runs":
@@ -721,6 +728,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc))
             if blob is None:
                 return self._error(404, "no storm patch in that box")
+            return self._send(200, zlib.compress(blob, 1), "application/octet-stream", encoding="deflate")
+        if q.get("t") not in (None, ""):
+            # the replay: the snapshot nearest model time t (s)
+            if sim is None:
+                return self._error(404, "no run")
+            try:
+                box = [1000.0 * float(q[k]) for k in ("x0", "y0", "x1", "y1")]
+                blob, tt = volume.extract_past(sim.run_dir / "vol3d", float(q["t"]), box, q.get("field", "dbz"))
+            except (KeyError, ValueError) as exc:
+                return self._error(400, str(exc))
+            if blob is None:
+                return self._error(404, "no 3-D snapshot of that box then" if tt is not None
+                                   else "no 3-D snapshots yet: they are saved with the radar frames")
             return self._send(200, zlib.compress(blob, 1), "application/octet-stream", encoding="deflate")
         vf = getattr(sim, "vol_fields", None) if sim is not None else None
         if not vf:

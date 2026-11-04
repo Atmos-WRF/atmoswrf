@@ -265,3 +265,154 @@ def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None) -
     if gnd is not None:          # then the ground under each point, uint16 m above the model's zero
         out += cp.asnumpy(cp.clip(cp.rint(cp.nan_to_num(gnd, nan=0.0)), 0, 65535).astype(cp.uint16)).tobytes()
     return out
+
+
+# ---------------------------------------------------------------- the history (the page's 3-D replay)
+# Every radar frame (at most every HISTORY_EVERY s of model time) the run keeps each patch's volume on an even grid
+# (HISTORY_SIDE points a side at most, the NZ levels to ZTOP), coded as the page gets it, in run_dir/vol3d/
+# t<seconds>.npz; extract_past cuts a box out of the one nearest a time like extract does from the live fields.
+HISTORY_EVERY = 60.0             # s of model time
+HISTORY_SIDE = 256               # points along a patch's longer side
+HISTORY_MAX_MB = 1500            # a run's snapshots past this: kept half as often (sim._vol_history)
+HISTORY_CHANNELS = ("dbz", "w", "zeta", "cloud", "precip")
+_PAST: dict = {}                 # path -> the loaded snapshot (a few, newest used last)
+
+
+def _code(name, b):
+    import cupy as cp
+    if name in ("cloud", "precip"):
+        scale = FIELDS["cloud"][0]
+        return cp.where(cp.isnan(b) | (b < 1e-3), 0,
+                        cp.clip(cp.rint((cp.log10(cp.maximum(b, 1e-3)) + 3.0) * scale + 1.0), 1, 255)).astype(cp.uint8)
+    scale, offset, _ = FIELDS[name]
+    return cp.where(cp.isnan(b), 0, cp.clip(cp.rint(b * scale + offset), 1, 255)).astype(cp.uint8)
+
+
+def snapshot(fields: dict, patches: dict | None = None) -> dict:
+    """The volumes of every patch's radar fields (and, for the cloud, ``patches``' state) now, as numpy arrays
+    ready for save_snapshot: per patch "<k>_meta" (first point x, y m, spacing m, nx, ny) and "<k>_<channel>"
+    (NZ, ny, nx) uint8 codes, "<k>_ground" uint16 m over terrain."""
+    import cupy as cp
+    out = {}
+    zv = (np.arange(NZ) + 0.5) * ZTOP / NZ
+    for k, f in enumerate(fields.values()):
+        s = max(1, int(math.ceil(max(f.nx, f.ny) / HISTORY_SIDE)))
+        nx, ny = (f.nx + s - 1) // s, (f.ny + s - 1) // s
+        xs = f.x0 + (np.arange(nx) * s + 0.5) * f.dx
+        ys = f.y0 + (np.arange(ny) * s + 0.5) * f.dx
+        X, Y = np.meshgrid(xs, ys)
+        p = (patches or {}).get(f.patch_id)
+        out[f"{k}_meta"] = np.array([xs[0], ys[0], s * f.dx, nx, ny], np.float64)
+        for ch in HISTORY_CHANNELS:
+            v = _sample(f, ch, X, Y, zv, p)
+            out[f"{k}_{ch}"] = (cp.asnumpy(_code(ch, v)) if v is not None else np.zeros((NZ, ny, nx), np.uint8))
+        g = ground(f, X, Y)
+        if g is not None:
+            out[f"{k}_ground"] = cp.asnumpy(cp.clip(cp.rint(cp.nan_to_num(g, nan=0.0)), 0, 65535).astype(cp.uint16))
+    return out
+
+
+def save_snapshot(folder, t: float, snap: dict) -> int:
+    """Write a snapshot (snapshot()) of model time t s to folder/t<s>.npz (written aside, then renamed); its bytes."""
+    import os
+    from pathlib import Path
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"t{int(round(t)):07d}.npz"
+    tmp = folder / (".part_" + name)
+    with open(tmp, "wb") as fh:
+        np.savez_compressed(fh, **snap)
+    os.replace(tmp, folder / name)
+    return (folder / name).stat().st_size
+
+
+def history_times(folder) -> list:
+    """Model times (s) of the snapshots in folder, oldest first."""
+    from pathlib import Path
+    folder = Path(folder)
+    if not folder.is_dir():
+        return []
+    return sorted(int(p.stem[1:]) for p in folder.glob("t*.npz") if p.stem[1:].isdigit())
+
+
+def _load(path):
+    if path in _PAST:
+        d = _PAST.pop(path)
+    else:
+        with np.load(path) as z:
+            d = {k: z[k] for k in z.files}
+        while len(_PAST) >= 4:
+            _PAST.pop(next(iter(_PAST)))
+    _PAST[path] = d
+    return d
+
+
+def extract_past(folder, t: float, box, name: str = "dbz"):
+    """Like extract, from the snapshot in folder nearest model time t (s): (the volume's bytes or None, its time)."""
+    from pathlib import Path
+    try:
+        import cupy as xp
+        from cupyx.scipy import ndimage as nd
+    except ImportError:                 # no GPU here: the same on the CPU
+        xp = np
+        from scipy import ndimage as nd
+    if name not in FIELDS or name == "pp":
+        raise ValueError(f"the 3-D replay has no field {name!r}")
+    times = history_times(folder)
+    if not times:
+        return None, None
+    tt = min(times, key=lambda s: abs(s - t))
+    snap = _load(str(Path(folder) / f"t{tt:07d}.npz"))
+    x0, y0, x1, y1 = (float(v) for v in box)
+    x0, x1 = min(x0, x1), max(x0, x1)
+    y0, y1 = min(y0, y1), max(y0, y1)
+    keys = sorted({k.split("_")[0] for k in snap})
+    metas = {k: snap[f"{k}_meta"] for k in keys}
+    over = [k for k in keys if metas[k][0] - metas[k][2] < x1 and metas[k][0] + metas[k][3] * metas[k][2] > x0
+            and metas[k][1] - metas[k][2] < y1 and metas[k][1] + metas[k][4] * metas[k][2] > y0]
+    if not over:
+        return None, tt
+    res = max(min(metas[k][2] for k in over), max(x1 - x0, y1 - y0) / MAX_SIDE)
+    nx = max(2, int(math.ceil((x1 - x0) / res)))
+    ny = max(2, int(math.ceil((y1 - y0) / res)))
+    xs = x0 + (np.arange(nx) + 0.5) * (x1 - x0) / nx
+    ys = y0 + (np.arange(ny) + 0.5) * (y1 - y0) / ny
+    X, Y = np.meshgrid(xs, ys)
+    channels = ("cloud", "precip") if name == "cloud" else (name,)
+    best = [None] * len(channels)
+    gnd = None
+    for k in over:
+        sx, sy, d, mx, my = metas[k]
+        gi, gj = (X - sx) / d, (Y - sy) / d
+        inside = (gi >= -0.5) & (gi <= mx - 0.5) & (gj >= -0.5) & (gj <= my - 0.5)
+        if not inside.any():
+            continue
+        J = np.broadcast_to(np.clip(gj, 0, my - 1)[None], (NZ, ny, nx))
+        I = np.broadcast_to(np.clip(gi, 0, mx - 1)[None], (NZ, ny, nx))
+        Kz = np.broadcast_to(np.arange(NZ, dtype=np.float64)[:, None, None], (NZ, ny, nx))
+        coords = xp.asarray(np.stack([Kz, J, I]), dtype=xp.float32)
+        ok = xp.asarray(np.broadcast_to(inside[None], (NZ, ny, nx)))
+        for c, ch in enumerate(channels):
+            a = xp.asarray(snap[f"{k}_{ch}"], dtype=xp.float32)
+            v = nd.map_coordinates(a, coords, order=1, mode="nearest")
+            v = xp.where(ok, v, xp.nan)
+            best[c] = v if best[c] is None else xp.fmax(best[c], v)
+        if f"{k}_ground" in snap:
+            g = nd.map_coordinates(xp.asarray(snap[f"{k}_ground"], dtype=xp.float32), coords[1:, 0], order=1,
+                                   mode="nearest")
+            g = xp.where(xp.asarray(inside), g, xp.nan)
+            gnd = g if gnd is None else xp.fmax(gnd, g)
+    if best[0] is None:
+        return None, tt
+    scale, offset, units = FIELDS[name]
+    data = xp.stack([xp.where(xp.isnan(b), 0, xp.clip(xp.rint(b), 0, 255)).astype(xp.uint8) for b in best], axis=-1)
+    if len(best) == 1:
+        data = data[..., 0]
+    head = json.dumps({"field": name, "units": units, "nx": nx, "ny": ny, "nz": NZ, "box": [x0, y0, x1, y1],
+                       "ztop": ZTOP, "scale": scale, "offset": offset, "channels": len(best),
+                       "ground": gnd is not None, "t": tt}).encode()
+    host = (lambda a: a.get()) if xp is not np else (lambda a: a)
+    out = struct.pack("<I", len(head)) + head + host(data).tobytes()
+    if gnd is not None:
+        out += host(xp.clip(xp.rint(xp.nan_to_num(gnd, nan=0.0)), 0, 65535).astype(xp.uint16)).tobytes()
+    return out, tt

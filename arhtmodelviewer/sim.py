@@ -1494,6 +1494,7 @@ class Simulation:
                                 tw1 = time.perf_counter()
                             self._make_frame(fields_cache)
                             self._frame_cost = time.perf_counter() - tf0      # with the radar fields it rebuilt
+                            self._vol_history(fields_cache, eng.t)
                             if timing:
                                 log.warning("timing: frame %.2f s (since the step: %.2f s)",
                                             time.perf_counter() - tw1, time.perf_counter() - tw0)
@@ -2404,6 +2405,37 @@ class Simulation:
                 self._l2_pending -= 1
 
     # ------------------------------------------------------------ frames
+    def _vol_history(self, fields_cache, t):
+        """The 3-D view's replay (volume.snapshot): the patches' volumes now, every volume.HISTORY_EVERY s of model
+        time, written to run_dir/vol3d by a thread of its own (skipped while the last one is still being written)."""
+        from . import volume
+        if not self.settings.get("vol_history", True) or not fields_cache:
+            return
+        # past volume.HISTORY_MAX_MB on disk the snapshots thin out (twice the spacing, then four times, ...)
+        every = volume.HISTORY_EVERY * 2 ** int(getattr(self, "_vol_hist_bytes", 0) / (volume.HISTORY_MAX_MB * 1e6))
+        if t - getattr(self, "_vol_hist_t", -1.0e9) < every - 1.0:
+            return
+        th = getattr(self, "_vol_hist_thread", None)
+        if th is not None and th.is_alive():
+            return
+        try:
+            snap = volume.snapshot(fields_cache, {p.id: p for p in self.engine.patches})
+        except Exception as exc:              # the replay must never stop the run (out of memory included)
+            if not getattr(self, "_vol_hist_failed", False):
+                self._vol_hist_failed = True
+                log.warning("3-D replay snapshot failed: %s", exc)
+            return
+        self._vol_hist_t = t
+        folder = self.run_dir / "vol3d"
+
+        def write():
+            try:
+                self._vol_hist_bytes = getattr(self, "_vol_hist_bytes", 0) + volume.save_snapshot(folder, t, snap)
+            except Exception as exc:
+                log.warning("3-D replay snapshot not written: %s", exc)
+        self._vol_hist_thread = threading.Thread(target=write, name="vol3d", daemon=True)
+        self._vol_hist_thread.start()
+
     def _make_frame(self, fields_cache):
         eng = self.engine
         self._frame_now, self._frame_wall = False, time.time()

@@ -458,6 +458,10 @@ aside#panel { width: 434px; min-width: 434px; flex-direction: row; }
 .vol-ctl label { display: flex; align-items: center; gap: 6px; }
 .vol-ctl input[type=range] { width: 110px; }
 .vol-num { min-width: 64px; font-variant-numeric: tabular-nums; }
+.vol-time { display: flex; align-items: center; gap: 8px; }
+.vol-time input[type=range] { flex: 1 1 auto; min-width: 120px; }
+.vol-time .vol-num { white-space: nowrap; color: var(--muted); }
+#volOverlay:focus { outline: none; }
 /* the rail's groups: the steps of a setup, the special modes, then the tools at the bottom */
 .rail-group { flex: 0 0 auto; margin: var(--s2) 0 0; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
   color: var(--dim); text-align: center; }

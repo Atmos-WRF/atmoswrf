@@ -1,8 +1,9 @@
 'use strict';
 // The 3-D view (arhtmodelviewer/volume.py), like GR2Analyst's volume explorer: drag a box on the map, and the run's
-// latest reflectivity (or vertical velocity, or vertical vorticity) in it is ray-marched on the GPU (WebGL2) as an
-// isosurface or a translucent volume.  Drag to turn it, wheel to zoom, right-drag to move it; Live keeps it on the
-// newest model step.
+// latest reflectivity (or vertical velocity, or vertical vorticity, or the cloud as the eye sees it) in it is
+// ray-marched on the GPU (WebGL2) as an isosurface, a translucent volume or a sunlit cloud.  Orbit (drag to turn,
+// wheel to zoom, right-drag to move), a free camera or one on the ground (W A S D, drag to look); Live keeps it on
+// the newest model step, the time slider goes back through the volumes the run saved with its radar frames.
 const Vol = (() => {
   const FIELDS = {
     dbz: { name: 'Reflectivity', fam: 'dbz', min: 0, max: 75, step: 1, iso: 40, vol: 15, fmt: v => `${v} dBZ`, signed: false },
@@ -26,10 +27,24 @@ const Vol = (() => {
   ];
   let gl = null, prog = null, cloudProg = null, volTex = null, lutTex = null, gndTex = null, vao = null;
   let mapTex = null, mapKey = '', mapOn = false;            // the map picture on the ground (tiles.py ground())
-  let head = null, box = null, busy = false, again = false, timer = null, lastKey = '';
+  let head = null, box = null, busy = false, again = false, timer = null, lastKey = '', loadSeq = 0;
   let tor = false, paths = null;               // the tornado view (tornado.py): its box, followed; its parcels' paths
-  const CAM0 = { yaw: -0.75, pitch: 0.38, dist: 3.6, px: 0, py: 0 };
-  const cam = { ...CAM0 };
+  // the camera: "orbit" (turn around the box), "free" (fly: WASD, Q/E, drag to look) or "ground" (a chaser's eye,
+  // EYE_KM above the ground, walking or driving with WASD); fp: the free and ground cameras' place (km from the
+  // box's middle, km up) and where they look
+  const CAM0 = { mode: 'orbit', yaw: -0.75, pitch: 0.38, dist: 3.6, px: 0, py: 0 };
+  const cam = { ...CAM0, fp: null, speed: 1 };
+  const EYE_KM = 0.002;
+  let noiseTex = null, gMap = null;
+  let lightProg = null, lightTex = null, lightFbo = null, lightKey = '';   // the cloud view's light volume                 // the cloud's detail noise; the ground under the box (km)
+  // the cloud view's frames, jittered and averaged while the view is still (half size, no smoothing while it moves)
+  const ACC_MAX = 16;
+  let acc = 0, raf = 0, lastMove = 0, drawQ = 1, lastTick = 0;
+  const keys = new Set();
+  // the replay (volume.py history): the saved volumes' model times, the one on screen (null: the newest step)
+  let times = [], ms0 = null, replayT = null, followMap = false, playTok = 0;
+  const cache = new Map(); let cacheBytes = 0;
+  const CACHE_MAX = 400e6;
 
   // ---------------------------------------------------------------- matrices (column-major, like GL)
   const mul = (a, b) => {
@@ -216,18 +231,24 @@ const Vol = (() => {
     frag = vec4(rgb, 1.0);
   }`;
 
-  // Cloud mode: what the storm looks like to the eye.  The cloud (cloud water, ice, snow) and the precipitation
-  // (rain, graupel, hail) in g/kg (two channels, log-coded) absorb and scatter sunlight: extinction per km
-  // ~25 x the cloud's g/kg and ~1.2 x the precipitation's, each sample lit by the sun through a shadow ray (the dark
-  // base, the lit anvil top, the storm's shadow on the ground), a forward-scattering phase (bright silver edges
-  // toward the sun) and the sky's light from above.
+  // Cloud mode: what the storm looks like to the eye (after the Godot tornado sim's volume renderer).  The cloud
+  // (cloud water, ice, snow) and the precipitation (rain, graupel, hail) in g/kg (two channels, log-coded) absorb
+  // and scatter sunlight: extinction per km ~25 x the cloud's g/kg and ~1.2 x the precipitation's.  Read smooth
+  // (tricubic), the cloud's thin edges eroded into wisps and billows by a 3-D noise and the rain drawn as curtains,
+  // each sample lit by the sun through a shadow ray with a few multiple-scattering octaves, a powder term (dark
+  // rims, glowing insides), a two-lobe phase (silver edges toward the sun) and the sky's light, which the cloud
+  // above blocks (dark bases, the gloom under the anvil).  Haze grows with distance; the frames are jittered and
+  // averaged while the view is still.
   const FS_CLOUD = `#version 300 es
   precision highp float; precision highp sampler3D;
   in vec2 ndc; out vec4 frag;
-  uniform sampler3D vol;
+  uniform sampler3D vol; uniform sampler3D noiseTex;
   uniform mat4 invVP; uniform vec3 eye; uniform vec3 size; uniform vec3 toKm; uniform vec3 sunDir; uniform float density;
   uniform sampler2D gnd; uniform int hasG; uniform float relief; uniform vec3 texel;
   uniform sampler2D mapTex; uniform int hasMap, mapDark;
+  uniform float detail, detailKm, frameSeed; uniform vec3 kmOrigin; uniform int quality;
+  uniform sampler3D lightTex; uniform int useLight;           // the light volume (FS_LIGHT): sun and sky depth
+  uniform float hazeKm;                                       // the visibility: the air's haze grows over it
   vec3 mapAt(vec2 xy, vec3 fallback) {      // the map picture (OSM / satellite) on the ground under xy
     if (hasMap == 0) return fallback;
     vec2 uv = vec2(xy.x / size.x + 0.5, xy.y / size.y + 0.5);
@@ -247,102 +268,177 @@ const Vol = (() => {
     return normalize(vec3(gz(xy - vec2(h.x, 0)) - gz(xy + vec2(h.x, 0)), gz(xy - vec2(0, h.y)) - gz(xy + vec2(0, h.y)),
                           2.0 * h.x));
   }
-  // marching from ta (above the ground) to tb (below it): the crossing
   float gcross(vec3 ro, vec3 rd, float ta, float tb) {
     for (int k = 0; k < 8; k++) { float tm = 0.5 * (ta + tb); vec3 p = ro + rd * tm; if (p.z < gz(p.xy)) tb = tm; else ta = tm; }
     return tb;
   }
   vec3 SUN;                                                   // the sunlight: warmer and dimmer as the sun gets low
-  vec2 q(vec3 p) {
-    vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
-    if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) return vec2(0.0);
-    vec2 c = texture(vol, uvw).rg * 255.0;
+  // smooth (C2) tricubic B-spline read from 8 trilinear ones (Sigg & Hadwiger 2005): no grid facets in the light
+  vec2 cubic(vec3 uvw) {
+    vec3 sz = vec3(textureSize(vol, 0));
+    vec3 c = uvw * sz - 0.5, i = floor(c), f = c - i, f2 = f * f, f3 = f2 * f;
+    vec3 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0, w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    vec3 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0, w3 = f3 / 6.0;
+    vec3 g0 = w0 + w1, g1 = w2 + w3;
+    vec3 t0 = (i - 0.5 + w1 / g0) / sz, t1 = (i + 1.5 + w3 / g1) / sz;
+    vec2 r = vec2(0.0);
+    for (int k = 0; k < 8; k++) {
+      vec3 hi = vec3(float(k & 1), float((k >> 1) & 1), float((k >> 2) & 1));
+      vec3 g = mix(g0, g1, hi);
+      r += g.x * g.y * g.z * textureLod(vol, mix(t0, t1, hi), 0.0).rg;
+    }
+    return r;
+  }
+  vec2 gkg(vec2 c) {                                          // codes (0..255) -> g/kg
+    c *= 255.0;
     return vec2(c.x < 0.5 ? 0.0 : pow(10.0, (c.x - 1.0) / 40.0 - 3.0), c.y < 0.5 ? 0.0 : pow(10.0, (c.y - 1.0) / 40.0 - 3.0));
   }
-  float sigma(vec2 m) { return (25.0 * m.x + 1.2 * m.y) * density; }          // per km
-  float hg(float c, float g) { return (1.0 - g * g) / (12.566 * pow(1.0 + g * g - 2.0 * g * c, 1.5)); }
+  // extinction per km (cloud, precipitation) at p.  mode 0: plain trilinear (shadow and sky rays); 1: with the
+  // sub-grid detail; 2: that from the smooth (tricubic) read (the view's own march)
+  vec2 media(vec3 p, int mode) {
+    vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
+    if (any(lessThan(uvw, vec3(-0.01))) || any(greaterThan(uvw, vec3(1.01)))) return vec2(0.0);
+    vec3 k = p * toKm + kmOrigin;                              // km on the ground: the detail stays put as the box moves
+    if (mode > 0 && detail > 0.0) {
+      // domain warp: the surface pushed in and out by about a grid cell -- towers, billows, cauliflower
+      vec3 wq = k / (detailKm * 5.0);
+      vec3 wv = vec3(texture(noiseTex, wq).rg, texture(noiseTex, wq.zxy + 0.41).r) - 0.5;
+      uvw += wv * texel * 2.2 * detail;
+    }
+    vec2 m = gkg(mode == 2 && quality > 0 ? cubic(uvw) : texture(vol, uvw).rg);
+    vec2 s = vec2(25.0 * m.x, 1.2 * m.y) * density;
+    vec2 e = min(uvw.xy, 1.0 - uvw.xy) / 0.03;                 // the box's sides fade: no walls of cloud
+    s *= clamp(min(e.x, e.y), 0.0, 1.0);
+    if (mode > 0 && detail > 0.0 && s.x + s.y > 1e-3) {
+      float n = texture(noiseTex, k / (detailKm * 20.0)).r * 0.55 + texture(noiseTex, k / (detailKm * 7.0) + 0.37).r * 0.45;
+      // erosion: thin cloud breaks into wisps and billows, the solid core keeps its shape
+      float cov = clamp(s.x / 30.0, 0.0, 1.0);
+      float thr = 0.8 * detail * smoothstep(0.3, 0.7, n) * (1.0 - cov);
+      float kept = clamp((cov - thr) / max(1.0 - thr, 0.05), 0.0, 1.0);
+      s.x *= cov > 1e-4 ? kept / cov : 0.0;
+      s.x *= max(mix(1.0, 2.6 * n - 0.3, 0.55 * detail), 0.0);   // lumps inside, the mean kept
+      // rain curtains: streaks that hang down, thicker and thinner side by side
+      float r = texture(noiseTex, vec3(k.xy / (detailKm * 9.0), k.z / (detailKm * 90.0)) + 0.61).g;
+      s.y *= max(mix(1.0, 2.4 * r - 0.2, 0.8 * detail), 0.0);
+    }
+    return s;
+  }
+  float sig(vec2 s) { return s.x + s.y; }
+  float hg(float c, float g) { return (1.0 - g * g) / (12.566 * pow(max(1.0 + g * g - 2.0 * g * c, 1e-4), 1.5)); }
   float sunTau(vec3 p, vec3 wd, float kmPer) {
-    float tau = 0.0, t = 0.0, ds = 0.012 * length(size);
-    for (int j = 0; j < 7; j++) {
-      t += ds;
-      tau += sigma(q(p + wd * t)) * ds * kmPer;
-      ds *= 1.55;
+    float tau = 0.0, t = 0.0, ds = 0.01 * length(size);
+    for (int j = 0; j < 7; j++) { t += ds; tau += sig(media(p + wd * t, 0)) * ds * kmPer; ds *= 1.6; }
+    return tau;
+  }
+  float upTau(vec3 p) {                                       // the cloud straight above: how much sky gets through
+    float tau = 0.0, z = 0.0;
+    for (int j = 0; j < 4; j++) {
+      float dk = 0.6 * pow(2.0, float(j));                     // km: 0.6, 1.2, 2.4, 4.8
+      z += dk / toKm.z;
+      tau += sig(media(p + vec3(0.0, 0.0, z), 0)) * dk;
     }
     return tau;
   }
-  vec3 sky(vec3 rd) {
-    float h = clamp(rd.z, 0.0, 1.0);
-    vec3 c = mix(vec3(0.70, 0.79, 0.90), vec3(0.16, 0.34, 0.72), pow(h, 0.45));
-    float s = max(dot(rd, sunDir), 0.0);
-    return c + SUN * (pow(s, 900.0) * 3.0 + pow(s, 12.0) * 0.06);
+  vec2 lightAt(vec3 p, vec3 wd, float kmPer) {             // optical depth to the sun, and to the sky above
+    vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
+    if (useLight == 1 && all(greaterThanEqual(uvw, vec3(0.0))) && all(lessThanEqual(uvw, vec3(1.0))))
+      return texture(lightTex, uvw).rg;
+    return vec2(sunTau(p, wd, kmPer), upTau(p));
   }
+  vec3 sky(vec3 rd) {
+    float h = max(rd.z, 0.0), s = max(dot(rd, sunDir), 0.0);
+    vec3 c = mix(vec3(0.66, 0.76, 0.88), vec3(0.11, 0.28, 0.64), pow(h, 0.5));
+    float low = 1.0 - smoothstep(0.02, 0.4, sunDir.z);
+    c = mix(c, vec3(1.0, 0.60, 0.34), low * pow(s, 5.0) * (1.0 - h) * 0.85);
+    c *= mix(0.45, 1.0, smoothstep(-0.02, 0.3, sunDir.z));
+    return c + SUN * (smoothstep(0.99955, 0.9998, s) * 8.0 + pow(s, 80.0) * 0.10);
+  }
+  vec3 aces(vec3 x) { return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
   void main() {
     float low = smoothstep(0.02, 0.45, sunDir.z);
-    SUN = mix(vec3(1.0, 0.55, 0.28) * 2.2, vec3(1.0, 0.95, 0.86) * 3.2, low);
+    SUN = mix(vec3(1.0, 0.55, 0.28) * 2.4, vec3(1.0, 0.95, 0.88) * 3.4, low);
     vec4 a = invVP * vec4(ndc, -1.0, 1.0), b = invVP * vec4(ndc, 1.0, 1.0);
     vec3 ro = eye, rd = normalize(b.xyz / b.w - a.xyz / a.w);
     vec3 wd = normalize(sunDir / toKm);                      // the sun's direction in the (stretched) box
     float kmPerW = length(wd * toKm);
-    vec3 amb = vec3(0.42, 0.52, 0.70);
-    // what is behind the storm: the ground (lit, shadowed by the storm, hazy with distance) or the sky
+    vec3 amb = vec3(0.40, 0.50, 0.68);
+    vec3 haze = mix(vec3(0.70, 0.62, 0.55), vec3(0.64, 0.71, 0.80), low);
+    float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy + 5.588238 * frameSeed, vec2(0.06711056, 0.00583715))));
     vec3 bg = sky(rd);
     float tg = rd.z < 0.0 ? -ro.z / rd.z : 1e9;
     vec3 lo = vec3(-size.x * 0.5, -size.y * 0.5, 0.0), hi = vec3(size.x * 0.5, size.y * 0.5, size.z);
     vec3 t0 = (lo - ro) / rd, t1 = (hi - ro) / rd;
     vec3 tmn = min(t0, t1), tmx = max(t0, t1);
     float tn = max(max(tmn.x, tmn.y), max(tmn.z, 0.0));
-    if (hasG == 1) {                                         // raised ground in the box: where the ray first meets it
-      float te = min(min(min(tmx.x, tmx.y), tmx.z), tg), ds = length(size) / 500.0;
+    float tx = min(min(tmx.x, tmx.y), tmx.z);
+    if (hasG == 1 && tx > tn) {                               // raised ground in the box: where the ray first meets it
+      float te = min(tx, tg), ds = length(size) / 500.0;
       for (int i = 0; i < 1000; i++) {
-        float t = tn + float(i) * ds;
+        float t = tn + (float(i) + jit) * ds;
         if (t >= te) break;
         vec3 p = ro + rd * t;
-        if (p.z < gz(p.xy)) { tg = gcross(ro, rd, max(t - ds, tn), t); break; }
+        if (p.z < gz(p.xy)) { tg = gcross(ro, rd, max(t - ds, 0.0), t); break; }
       }
     }
     if (tg < 1e8) {
       vec3 g = ro + rd * tg;
-      float lit = exp(-sunTau(g + vec3(0, 0, 1e-4), wd, kmPerW));
+      vec2 lt = lightAt(g + vec3(0, 0, 1e-4), wd, kmPerW);
+      float lit = exp(-lt.x), skyv = exp(-0.5 * lt.y);
       vec3 n = hasG == 1 ? gnormal(g.xy) : vec3(0, 0, 1);
       float sl = max(dot(n, sunDir), 0.0);
-      vec3 alb = mix(vec3(0.17, 0.24, 0.10), vec3(0.26, 0.24, 0.17), clamp(g.z / (0.12 * size.z), 0.0, 1.0));
+      vec3 k = g * toKm + kmOrigin;
+      // fields and woods, down to a few metres (the noise's mipmaps keep the distance from shimmering)
+      float v = texture(noiseTex, k / 6.0).g * 0.4 + texture(noiseTex, k / 1.3).r * 0.25 + texture(noiseTex, k / 0.25).g * 0.15
+              + texture(noiseTex, k / 0.03).r * 0.12 + texture(noiseTex, k / 0.004).g * 0.08;
+      vec3 alb = mix(vec3(0.15, 0.21, 0.08), vec3(0.28, 0.27, 0.16), smoothstep(0.15, 0.85, v));
+      alb *= 0.9 + 0.2 * texture(noiseTex, k / 0.6 + 0.29).r;
       if (hasMap == 1) { alb = pow(mapAt(g.xy, pow(alb, vec3(1.0 / 2.2))), vec3(2.2)) * 0.9; }
-      vec3 grd = alb *
-                 (SUN * sl * lit * 0.35 + amb * (0.25 + 0.15 * n.z));
+      vec3 grd = alb * (SUN * sl * lit * 0.35 + amb * (0.10 + 0.30 * skyv) * (0.6 + 0.4 * n.z));
       float dist = length((g - ro) * toKm);
-      bg = mix(grd, vec3(0.62, 0.70, 0.80), 1.0 - exp(-dist / 260.0));
+      bg = mix(grd, haze * mix(0.5, 1.0, skyv), 1.0 - exp(-dist / hazeKm));
     }
-    float tf = min(min(min(tmx.x, tmx.y), tmx.z), tg);
+    float tf = min(tx, tg);
     vec3 col = vec3(0.0); float T = 1.0;
     if (tf > tn) {
-      float dt = length(size) / 340.0, kmPer = length(rd * toKm);
+      float dt = length(size) / (quality > 0 ? 420.0 : 260.0), kmPer = length(rd * toKm);
       float cth = dot(rd, sunDir);
-      float ph = mix(hg(cth, 0.65), hg(cth, -0.25), 0.3);
-      float t = tn + dt * fract(sin(dot(ndc, vec2(12.9898, 78.233))) * 43758.5453);     // jittered start: no banding
-      for (int i = 0; i < 700; i++) {
+      float t = tn + dt * jit;                                // jittered start: no banding, averaged away
+      for (int i = 0; i < 900; i++) {
         if (t > tf || T < 0.01) break;
         vec3 p = ro + rd * t;
-        vec2 m = q(p);
-        float sg = sigma(m);
-        if (sg > 1e-3) {
+        vec2 s = media(p, 2);
+        float sg = sig(s);
+        if (sg <= 1e-3) { t += dt * 1.8; continue; }            // empty air: longer steps
+        {
           float ds = dt * kmPer;
-          float ts = sunTau(p, wd, kmPerW);
-          float sunT = exp(-ts) + 0.25 * exp(-0.25 * ts);       // multiple scattering lets some light deeper in
+          vec2 lt = lightAt(p, wd, kmPerW);
+          float ts = lt.x;
+          // multiple scattering octaves (Wrenninge 2015): each one dimmer, less shadowed, less forward
+          float L = 0.0, aa = 1.0, bb = 1.0, cc = 1.0;
+          for (int o = 0; o < 3; o++) {
+            L += aa * exp(-bb * ts) * mix(hg(cth, 0.7 * cc), hg(cth, -0.25 * cc), 0.3);
+            aa *= 0.5; bb *= 0.4; cc *= 0.5;
+          }
+          float pw = 1.0 - exp(-2.0 * sg * 0.35);              // powder: thin edges send less back
+          L *= mix(1.0, pw, 0.55 * (0.6 - 0.4 * cth));
+          float skyv = exp(-0.45 * lt.y);
           float hgt = clamp(p.z / size.z * 2.0, 0.0, 1.0);
-          float albedo = mix(0.98, 0.80, m.y / (m.x + m.y + 1e-6));   // rain shafts grey
-          vec3 S = albedo * (SUN * sunT * ph * 4.0 + amb * (0.30 + 0.55 * hgt) * (0.4 + 0.6 * exp(-0.1 * ts)));
+          float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));     // rain shafts grey
+          vec3 S = albedo * (SUN * L * 4.5 + amb * (0.18 + 0.42 * skyv) * (0.55 + 0.45 * hgt) * (0.45 + 0.55 * exp(-0.12 * ts)));
           if (relief > 0.0) {
             // relief: the cloud's own lumps lit as a surface (its outward normal from the density's gradient)
             vec3 h = texel * size;
-            vec3 gr = vec3(sigma(q(p + vec3(h.x, 0, 0))) - sigma(q(p - vec3(h.x, 0, 0))),
-                           sigma(q(p + vec3(0, h.y, 0))) - sigma(q(p - vec3(0, h.y, 0))),
-                           sigma(q(p + vec3(0, 0, h.z))) - sigma(q(p - vec3(0, 0, h.z)))) / h;
+            float c0 = sig(media(p, 1));
+            vec3 gr = vec3(sig(media(p + vec3(h.x, 0, 0), 1)) - c0, sig(media(p + vec3(0, h.y, 0), 1)) - c0,
+                           sig(media(p + vec3(0, 0, h.z), 1)) - c0) / h;
             if (length(gr) > 1e-4) {
               vec3 n = -normalize(gr);
               float lam = max(dot(n, wd), 0.0);
-              S *= mix(1.0, 0.22 + 1.25 * lam + 0.2 * max(n.z, 0.0), relief);
+              S *= mix(1.0, 0.35 + 1.1 * lam + 0.15 * max(n.z, 0.0), 0.6 * relief);
             }
           }
+          float fog = 1.0 - exp(-t * kmPer / hazeKm);           // the air between: hazier with distance
+          S = mix(S, haze * mix(0.5, 1.0, skyv), fog);
           float al = 1.0 - exp(-sg * ds);
           col += T * al * S;
           T *= 1.0 - al;
@@ -351,8 +447,36 @@ const Vol = (() => {
       }
     }
     vec3 c = col + T * bg;
-    c = vec3(1.0) - exp(-c * 0.95);                             // exposure
+    c = aces(c * 0.85);
     frag = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
+  }`;
+
+  // The cloud view's light volume: at every point of the box, the optical depth toward the sun (a long march) and
+  // straight up to the sky, rendered layer by layer into a half-float 3-D texture whenever the data, the sun, the
+  // density or the heights change; the view's march then reads it instead of marching its own shadow rays.
+  const FS_LIGHT = `#version 300 es
+  precision highp float; precision highp sampler3D;
+  in vec2 ndc; out vec4 frag;
+  uniform sampler3D vol; uniform vec3 size, toKm, sunDir, lres; uniform float density, layer;
+  float sig0(vec3 p) {
+    vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
+    if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) return 0.0;
+    vec2 c = texture(vol, uvw).rg * 255.0;
+    vec2 m = vec2(c.x < 0.5 ? 0.0 : pow(10.0, (c.x - 1.0) / 40.0 - 3.0), c.y < 0.5 ? 0.0 : pow(10.0, (c.y - 1.0) / 40.0 - 3.0));
+    vec2 e = min(uvw.xy, 1.0 - uvw.xy) / 0.03;
+    return (25.0 * m.x + 1.2 * m.y) * density * clamp(min(e.x, e.y), 0.0, 1.0);
+  }
+  void main() {
+    vec3 uvw = vec3(gl_FragCoord.xy / lres.xy, (layer + 0.5) / lres.z);
+    vec3 p = vec3((uvw.x - 0.5) * size.x, (uvw.y - 0.5) * size.y, uvw.z * size.z);
+    vec3 wd = normalize(sunDir / toKm);
+    float kmPer = length(wd * toKm);
+    // from a voxel out toward the sun: the coarse grid's cloud edge would otherwise shadow its own lit skin
+    float t = length(wd * size / lres), ts = 0.0, ds = 0.003 * length(size);
+    for (int j = 0; j < 22; j++) { t += ds; ts += sig0(p + wd * (t - 0.5 * ds)) * ds * kmPer; ds *= 1.22; }
+    float tu = 0.0, z = size.z / lres.z, dk = 0.25;
+    for (int j = 0; j < 9; j++) { z += dk / toKm.z; tu += sig0(p + vec3(0.0, 0.0, z - 0.5 * dk / toKm.z)) * dk; dk *= 1.45; }
+    frag = vec4(ts, tu, 0.0, 1.0);
   }`;
 
   function compile(type, src) {
@@ -375,9 +499,55 @@ const Vol = (() => {
     if (!gl) return false;
     prog = link(FS);
     cloudProg = link(FS_CLOUD);
+    if (gl.getExtension('EXT_color_buffer_float')) { lightProg = link(FS_LIGHT); lightFbo = gl.createFramebuffer(); lightTex = gl.createTexture(); }
     vao = gl.createVertexArray();
     volTex = gl.createTexture(); lutTex = gl.createTexture(); gndTex = gl.createTexture(); mapTex = gl.createTexture();
+    noiseTex = makeNoise();
     return true;
+  }
+
+  // a tileable 3-D noise, 64^3, two channels: r billowy (inverted Worley fBm over value noise), g value-noise fBm
+  function makeNoise() {
+    const N = 64, out = new Uint8Array(N * N * N * 2);
+    let seed = 1234567;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+    const lattice = C => { const a = new Float32Array(C * C * C * 3); for (let i = 0; i < a.length; i++) a[i] = rnd(); return a; };
+    const W = [4, 8, 16].map(C => ({ C, p: lattice(C) })), V = [4, 8, 16, 32].map(C => ({ C, p: lattice(C) }));
+    const worley = (x, y, z, { C, p }) => {
+      const fx = x * C, fy = y * C, fz = z * C, ix = Math.floor(fx), iy = Math.floor(fy), iz = Math.floor(fz);
+      let best = 9;
+      for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const cx = ix + dx, cy = iy + dy, cz = iz + dz;
+        const k = 3 * ((((cz % C) + C) % C) * C * C + (((cy % C) + C) % C) * C + (((cx % C) + C) % C));
+        const ddx = cx + p[k] - fx, ddy = cy + p[k + 1] - fy, ddz = cz + p[k + 2] - fz;
+        best = Math.min(best, ddx * ddx + ddy * ddy + ddz * ddz);
+      }
+      return Math.min(1, Math.sqrt(best));
+    };
+    const value = (x, y, z, { C, p }) => {
+      const fx = x * C, fy = y * C, fz = z * C, ix = Math.floor(fx), iy = Math.floor(fy), iz = Math.floor(fz);
+      const s = t => t * t * (3 - 2 * t), u = s(fx - ix), v = s(fy - iy), w = s(fz - iz);
+      const at = (a, b, c) => p[3 * (((c % C) * C + (b % C)) * C + (a % C))];
+      const l = (a, b, t) => a + (b - a) * t;
+      return l(l(l(at(ix, iy, iz), at(ix + 1, iy, iz), u), l(at(ix, iy + 1, iz), at(ix + 1, iy + 1, iz), u), v),
+               l(l(at(ix, iy, iz + 1), at(ix + 1, iy, iz + 1), u), l(at(ix, iy + 1, iz + 1), at(ix + 1, iy + 1, iz + 1), u), v), w);
+    };
+    for (let k = 0, o = 0; k < N; k++) for (let j = 0; j < N; j++) for (let i = 0; i < N; i++, o += 2) {
+      const x = (i + 0.5) / N, y = (j + 0.5) / N, z = (k + 0.5) / N;
+      const vn = 0.5 * value(x, y, z, V[0]) + 0.27 * value(x, y, z, V[1]) + 0.15 * value(x, y, z, V[2]) + 0.08 * value(x, y, z, V[3]);
+      const wn = 1 - (0.6 * worley(x, y, z, W[0]) + 0.27 * worley(x, y, z, W[1]) + 0.13 * worley(x, y, z, W[2]));
+      out[o] = Math.round(255 * Math.min(1, Math.max(0, 0.65 * wn + 0.35 * vn)));
+      out[o + 1] = Math.round(255 * Math.min(1, Math.max(0, (vn - 0.2) / 0.6)));
+    }
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_3D, t);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RG8, N, N, N, 0, gl.RG, gl.UNSIGNED_BYTE, out);
+    gl.generateMipmap(gl.TEXTURE_3D);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                          [gl.TEXTURE_WRAP_S, gl.REPEAT], [gl.TEXTURE_WRAP_T, gl.REPEAT], [gl.TEXTURE_WRAP_R, gl.REPEAT]])
+      gl.texParameteri(gl.TEXTURE_3D, k, v);
+    return t;
   }
 
   // ---------------------------------------------------------------- data
@@ -394,7 +564,8 @@ const Vol = (() => {
     const c = cloudMode();
     $('volBoth').parentElement.classList.toggle('hidden', !F.signed || c);
     for (const id of ['volField', 'volThrLbl']) $(id).classList.toggle('hidden', c);
-    for (const id of ['volSunLbl', 'volSunHLbl', 'volReliefLbl']) $(id).classList.toggle('hidden', !c);
+    for (const id of ['volSunLbl', 'volSunHLbl', 'volReliefLbl', 'volDetailLbl']) $(id).classList.toggle('hidden', !c);
+    showTime();
     $('volOpaName').textContent = c ? 'Density' : 'Opacity';
     // the tornado view reads the model's state (no radar reflectivity there), and has its pressure drop
     document.querySelectorAll('.volTor').forEach(e => e.classList.toggle('hidden', !tor));
@@ -434,18 +605,28 @@ const Vol = (() => {
     }
     if (!box) return;
     if (busy) { again = true; return; }           // a change during a load: loaded again right after it
-    const key = `${box.join(',')}/${want()}`;
+    const past = replayT !== null && !tor;
+    const key = `${box.join(',')}/${want()}/${past ? replayT : 'now'}`;
     busy = true;
-    $('volStatus').textContent = 'Loading…';
+    if (!cache.has(key)) $('volStatus').textContent = 'Loading…';
     try {
       let q = `x0=${box[0]}&y0=${box[1]}&x1=${box[2]}&y1=${box[3]}&field=${want()}`;
       if (tor) q += `&live=1&ztop=${$('volTop').value}`;
-      const r = await api('/api/volume?' + q);
+      if (past) q += `&t=${replayT}`;
+      let buf = past ? cache.get(key) : null;
+      if (!buf) {
+        buf = await (await api('/api/volume?' + q)).arrayBuffer();
+        if (past) {                                 // the replay's volumes kept for looping (the oldest out first)
+          cache.set(key, buf); cacheBytes += buf.byteLength;
+          for (const [k, v] of cache) { if (cacheBytes <= CACHE_MAX) break; cache.delete(k); cacheBytes -= v.byteLength; }
+        }
+      }
       if (tor && ($('volPaths').checked || $('volTrack').checked)) {
         try { paths = await (await api('/api/tornado/paths')).json(); } catch (e) { paths = null; }
       }
-      const { header, data } = unpack(await r.arrayBuffer());
+      const { header, data } = unpack(buf);
       head = header;
+      gMap = null; loadSeq++;
       const two = header.channels === 2;
       gl.bindTexture(gl.TEXTURE_3D, volTex);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -458,6 +639,7 @@ const Vol = (() => {
         const n = header.nx * header.ny, off = data.byteOffset + n * header.nz * header.channels;
         const g16 = new Uint16Array(data.buffer.slice(off, off + 2 * n)), gf = new Float32Array(n);
         for (let i = 0; i < n; i++) gf[i] = g16[i] / header.ztop;
+        gMap = { nx: header.nx, ny: header.ny, g16 };
         gl.bindTexture(gl.TEXTURE_2D, gndTex);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, header.nx, header.ny, 0, gl.RED, gl.FLOAT, gf);
         for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
@@ -466,7 +648,7 @@ const Vol = (() => {
       }
       if (!two) await uploadLUT();
       await loadMap();
-      const run = S.run && S.run.t !== undefined ? `  ·  model +${fmtDur(S.run.t)}` : '';
+      const run = past ? `  ·  replay ${clock(header.t)}` : S.run && S.run.t !== undefined ? `  ·  model +${fmtDur(S.run.t)}` : '';
       $('volStatus').textContent = (tor ? `Tornado zoom (${Math.round(header.dx)} m grid) · ` : '') +
         `${(box[2] - box[0]).toFixed(tor ? 1 : 0)} × ${(box[3] - box[1]).toFixed(tor ? 1 : 0)} km, ` +
         `${header.nx}×${header.ny}×${header.nz} points${run}`;
@@ -488,14 +670,79 @@ const Vol = (() => {
     return { sx: sx * k, sy: sy * k, sz: (head ? head.ztop / 1000 : 18) * k * ex, k, ex };
   }
 
-  function matrices(W, H) {
-    const G = geometry();
+  function orbitEye(G) {
     const target = [cam.px, cam.py, G.sz * 0.3];
     const cp = Math.cos(cam.pitch);
-    const eye = [target[0] + cam.dist * cp * Math.cos(cam.yaw), target[1] + cam.dist * cp * Math.sin(cam.yaw),
-                 target[2] + cam.dist * Math.sin(cam.pitch)];
-    const VP = mul(perspective(0.7, W / H, 0.01, 50), lookAt(eye, target, [0, 0, 1]));
+    return { target, eye: [target[0] + cam.dist * cp * Math.cos(cam.yaw), target[1] + cam.dist * cp * Math.sin(cam.yaw),
+                           target[2] + cam.dist * Math.sin(cam.pitch)] };
+  }
+
+  // the ground's height (km above the model's zero) at x, y km from the box's middle: 0 on flat runs / outside
+  function groundKm(x, y) {
+    if (!gMap || !box) return 0;
+    const i = Math.floor((x / (box[2] - box[0]) + 0.5) * gMap.nx), j = Math.floor((y / (box[3] - box[1]) + 0.5) * gMap.ny);
+    if (i < 0 || j < 0 || i >= gMap.nx || j >= gMap.ny) return 0;
+    return gMap.g16[j * gMap.nx + i] / 1000;
+  }
+
+  function matrices(W, H) {
+    const G = geometry();
+    let eye, target, fov = 0.7;
+    if (cam.mode === 'orbit' || !cam.fp) ({ eye, target } = orbitEye(G));
+    else {
+      const f = cam.fp;
+      if (cam.mode === 'ground') f.z = groundKm(f.x, f.y) + EYE_KM;
+      else f.z = Math.max(f.z, groundKm(f.x, f.y) + EYE_KM);
+      eye = [f.x * G.k, f.y * G.k, f.z * G.k * G.ex];
+      const cp = Math.cos(f.pitch);
+      target = [eye[0] + cp * Math.cos(f.yaw), eye[1] + cp * Math.sin(f.yaw), eye[2] + Math.sin(f.pitch)];
+      fov = cam.mode === 'ground' ? 1.15 : 1.0;
+    }
+    const VP = mul(perspective(fov, W / H, 0.001, 50), lookAt(eye, target, [0, 0, 1]));
     return { G, eye, VP };
+  }
+
+  // the free and ground cameras: from the orbit's eye (free), or out at the box's side looking in (ground)
+  function setCamMode(m) {
+    if (m === cam.mode) return;
+    const side = Math.max(box[2] - box[0], box[3] - box[1]);
+    if (m !== 'orbit') {
+      const was = cam.mode;
+      if (m === 'ground' && +$('volEx').value !== 1) { $('volEx').value = 1; }
+      const G1 = geometry();
+      if (was === 'orbit' || !cam.fp) {
+        const { eye, target } = orbitEye(G1);
+        const km = v => [v[0] / G1.k, v[1] / G1.k, v[2] / (G1.k * G1.ex)];
+        const e = km(eye), t = km(target);
+        if (m === 'free') {
+          cam.fp = { x: e[0], y: e[1], z: e[2], yaw: Math.atan2(t[1] - e[1], t[0] - e[0]),
+                     pitch: Math.atan2(t[2] - e[2], Math.hypot(t[0] - e[0], t[1] - e[1])) };
+        } else {
+          const d = Math.hypot(e[0] - t[0], e[1] - t[1]) || 1, ux = (e[0] - t[0]) / d, uy = (e[1] - t[1]) / d;
+          const x = t[0] + ux * 0.42 * side, y = t[1] + uy * 0.42 * side;
+          cam.fp = { x, y, z: 0, yaw: Math.atan2(t[1] - y, t[0] - x), pitch: 0.12 };
+        }
+      } else if (m === 'ground') cam.fp.pitch = Math.min(cam.fp.pitch, 0.6);
+      cam.speed = m === 'ground' ? 0.4 : Math.max(0.5, 0.08 * side);
+    }
+    cam.mode = m; $('volCam').value = m;
+    $('volOverlay').title = m === 'orbit' ? 'Drag: turn · right-drag or Shift-drag: move · wheel: zoom'
+      : 'Drag: look around · W A S D: move · ' + (m === 'free' ? 'Q / E: down / up · ' : '') + 'Shift: faster · wheel: speed';
+    if (m !== 'orbit') $('volOverlay').focus();
+    draw();
+  }
+
+  function moveKeys(dt) {
+    if (cam.mode === 'orbit' || !cam.fp || !keys.size) return false;
+    const f = cam.fp, v = cam.speed * dt * (keys.has('ShiftLeft') || keys.has('ShiftRight') ? 5 : 1);
+    const fw = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0), rt = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+    const up = cam.mode === 'free' ? (keys.has('KeyE') ? 1 : 0) - (keys.has('KeyQ') ? 1 : 0) : 0;
+    if (!fw && !rt && !up) return false;
+    const cy = Math.cos(f.yaw), sy = Math.sin(f.yaw), cp = cam.mode === 'free' ? Math.cos(f.pitch) : 1;
+    f.x += v * (fw * cy * cp + rt * sy);
+    f.y += v * (fw * sy * cp - rt * cy);
+    if (cam.mode === 'free') f.z = Math.max(0, f.z + v * (fw * Math.sin(f.pitch) + up));
+    return true;
   }
 
   const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
@@ -532,8 +779,48 @@ const Vol = (() => {
   }
   window.volBaseChanged = () => { if (gl && box) loadMap().then(() => { if (head) draw(); }); };
 
+  // the light volume for the current data, sun, density and heights (FS_LIGHT), rebuilt only when one changes
+  function buildLight(G, sun, dens) {
+    if (!lightProg) return false;
+    const key = [head.nx, head.ny, head.nz, loadSeq, ...sun.map(v => v.toFixed(4)), dens, G.sx, G.sy, G.sz].join('/');
+    if (key === lightKey) return true;
+    const nx = head.nx, ny = head.ny, nz = head.nz;
+    gl.bindTexture(gl.TEXTURE_3D, lightTex);
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RG16F, nx, ny, nz, 0, gl.RG, gl.HALF_FLOAT, null);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                          [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_3D, k, v);
+    gl.useProgram(lightProg); gl.bindVertexArray(vao);
+    const u = n => gl.getUniformLocation(lightProg, n);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, volTex); gl.uniform1i(u('vol'), 0);
+    gl.uniform3f(u('size'), G.sx, G.sy, G.sz);
+    gl.uniform3f(u('toKm'), 1 / G.k, 1 / G.k, 1 / (G.k * G.ex));
+    gl.uniform3f(u('sunDir'), ...sun);
+    gl.uniform3f(u('lres'), nx, ny, nz);
+    gl.uniform1f(u('density'), dens);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, lightFbo);
+    gl.viewport(0, 0, nx, ny);
+    let ok = true;
+    for (let k = 0; k < nz; k++) {
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, lightTex, 0, k);
+      if (k === 0 && gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) { ok = false; break; }
+      gl.uniform1f(u('layer'), k);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const cv = $('volCanvas'); gl.viewport(0, 0, cv.width, cv.height);
+    lightKey = ok ? key : '';
+    if (!ok) lightProg = null;                       // no float targets after all: the march's own shadow rays
+    return ok;
+  }
+
   function drawCloud(G, eye, VP) {
     const az = +$('volSun').value * Math.PI / 180, el = +$('volSunH').value * Math.PI / 180;
+    const sun = [Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el)], dens = 2 * +$('volOpa').value;
+    const blend = gl.isEnabled(gl.BLEND);
+    if (blend) gl.disable(gl.BLEND);
+    const lit = buildLight(G, sun, dens);
+    if (blend) gl.enable(gl.BLEND);
     gl.useProgram(cloudProg); gl.bindVertexArray(vao);
     const u = n => gl.getUniformLocation(cloudProg, n);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, volTex); gl.uniform1i(u('vol'), 0);
@@ -546,9 +833,26 @@ const Vol = (() => {
     gl.uniform1f(u('density'), 2 * +$('volOpa').value);
     gl.uniform1f(u('relief'), +$('volRelief').value);
     gl.uniform3f(u('texel'), 1 / head.nx, 1 / head.ny, 1 / head.nz);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_3D, noiseTex); gl.uniform1i(u('noiseTex'), 4);
+    gl.uniform1f(u('detail'), +$('volDetail').value);
+    gl.uniform1f(u('detailKm'), Math.max(0.05, (box[2] - box[0]) / head.nx));
+    gl.uniform1f(u('frameSeed'), acc);
+    gl.uniform3f(u('kmOrigin'), (box[0] + box[2]) / 2, (box[1] + box[3]) / 2, 0);
+    gl.uniform1i(u('quality'), drawQ < 1 ? 0 : 1);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_3D, lit ? lightTex : null); gl.uniform1i(u('lightTex'), 5);
+    gl.uniform1i(u('useLight'), lit ? 1 : 0);
+    gl.uniform1f(u('hazeKm'), cam.mode === 'orbit' ? 900 : 180);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     $('volLegend').textContent = `Cloud view · sun in the ${COMPASS[Math.round(+$('volSun').value / 45) % 8]}, ` +
-      `${$('volSunH').value}° up · height ×${G.ex}`;
+      `${$('volSunH').value}° up · height ×${G.ex}` + camNote();
+  }
+
+  function camNote() {
+    if (cam.mode === 'orbit' || !cam.fp) return '';
+    const f = cam.fp, h = cam.mode === 'ground' ? '' : ` · ${(f.z - groundKm(f.x, f.y)).toFixed(2)} km up`;
+    const sp = cam.speed >= 1 ? `${cam.speed.toFixed(1)} km/s` : `${Math.round(cam.speed * 1000)} m/s`;
+    return `  ·  ${cam.mode === 'ground' ? 'ground camera' : 'free camera'}${h} · ${sp} (wheel) · ` +
+      `facing ${COMPASS[Math.round(((90 - f.yaw * 180 / Math.PI) % 360 + 360) % 360 / 45) % 8]}`;
   }
 
   // a point of the view (ground x, y m; z m up) on the overlay, or null behind the camera
@@ -594,21 +898,53 @@ const Vol = (() => {
     }
   }
 
+  // a change to the view: drawn on the next animation frame (the cloud view then keeps refining while still)
   function draw() {
+    acc = 0; lastMove = performance.now();
+    if (!raf) raf = requestAnimationFrame(frame);
+  }
+  function frame(now) {
+    raf = 0;
+    if (!gl || !box) return;
+    const dt = lastTick ? Math.min(0.1, (now - lastTick) / 1000) : 0;
+    lastTick = now;
+    if (moveKeys(dt)) { acc = 0; lastMove = now; }
+    const cloud = cloudMode() && head;
+    const q = cloud && now - lastMove < 160 ? 0.5 : 1;       // half size while the view moves
+    if (q !== drawQ) { drawQ = q; acc = 0; }
+    if (acc < (cloud ? ACC_MAX : 1)) render();
+    if (keys.size || (cloud && (acc < ACC_MAX || drawQ < 1))) raf = requestAnimationFrame(frame);
+    else lastTick = 0;
+  }
+
+  function render() {
     const cv = $('volCanvas'), dpr = Math.min(window.devicePixelRatio || 1, 2);
     const W = cv.clientWidth, H = cv.clientHeight;
-    if (!W || !H) return;
-    if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
-      cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    if (!W || !H) { acc = ACC_MAX; drawQ = 1; return; }
+    const q = cloudMode() ? drawQ : 1;
+    if (cv.width !== Math.round(W * dpr * q) || cv.height !== Math.round(H * dpr * q)) {
+      cv.width = Math.round(W * dpr * q); cv.height = Math.round(H * dpr * q); acc = 0;
     }
     gl.viewport(0, 0, cv.width, cv.height);
-    gl.clearColor(0.043, 0.055, 0.075, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.BLEND);
+    if (acc === 0) { gl.clearColor(0.043, 0.055, 0.075, 1); gl.clear(gl.COLOR_BUFFER_BIT); }
     const ov = $('volOverlay'), g = ov.getContext('2d');
-    if (ov.width !== cv.width || ov.height !== cv.height) { ov.width = cv.width; ov.height = cv.height; }
-    g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
-    if (!head || !box || head.field !== want()) return;
+    if (ov.width !== Math.round(W * dpr) || ov.height !== Math.round(H * dpr)) { ov.width = Math.round(W * dpr); ov.height = Math.round(H * dpr); }
+    if (acc === 0) { g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H); }
+    if (!head || !box || head.field !== want()) { acc = ACC_MAX; return; }
     const { G, eye, VP } = matrices(W, H);
-    if (cloudMode()) { drawCloud(G, eye, VP); drawPaths(g, G, VP, W, H); return; }
+    if (cloudMode()) {
+      if (acc > 0) {                                  // the running mean of the jittered frames
+        gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, 1 / (acc + 1));
+        gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA);
+      }
+      drawCloud(G, eye, VP);
+      gl.disable(gl.BLEND);
+      if (acc === 0) drawPaths(g, G, VP, W, H);
+      acc++;
+      return;
+    }
+    acc = ACC_MAX;
     const F = FIELDS[field()], thr = +$('volThr').value;
     gl.useProgram(prog); gl.bindVertexArray(vao);
     const u = n => gl.getUniformLocation(prog, n);
@@ -646,7 +982,7 @@ const Vol = (() => {
     }
     const w = $('volLegend');
     w.textContent = `${F.name} ${isoMode() ? 'isosurface at' : 'from'} ${F.fmt(thr)}` +
-      (F.signed && $('volBoth').checked ? ` (and ${F.fmt(-thr)})` : '') + `  ·  vertical ×${G.ex}`;
+      (F.signed && $('volBoth').checked ? ` (and ${F.fmt(-thr)})` : '') + `  ·  vertical ×${G.ex}` + camNote();
     drawPaths(g, G, VP, W, H);
   }
 
@@ -679,16 +1015,93 @@ const Vol = (() => {
       if (!initGL()) { $('volStatus').textContent = 'This browser has no WebGL2: the 3-D view needs it.'; return; }
     } catch (e) { $('volStatus').textContent = 'WebGL error: ' + e.message; return; }
     cam.px = 0; cam.py = 0;
+    if (cam.mode !== 'orbit') { cam.mode = 'orbit'; $('volCam').value = 'orbit'; cam.fp = null; }
     head = null; setSlider(false); draw();
-    load(true);
+    if (!tor && replayT === null && !S.live && S.frames.length && S.frameIdx >= 0 && S.frames[S.frameIdx])
+      replayT = S.frames[S.frameIdx].t;            // opened on a replayed radar frame: that time
+    if (replayT !== null) $('volLive').checked = false;
+    refreshTimes().then(() => load(true));
     map.redraw();
     clearInterval(timer);
-    timer = setInterval(() => { if ($('volLive').checked && S.run && S.live && !document.hidden) load(false); }, 8000);
+    timer = setInterval(() => {
+      if (document.hidden) return;
+      refreshTimes();
+      if ($('volLive').checked && S.run && S.live) load(false);
+    }, 8000);
   }
   function close() {
     $('volWin').classList.add('hidden');
     clearInterval(timer); timer = null; box = null; tor = false; paths = null;
+    stopPlay(); keys.clear(); replayT = null; followMap = false; $('volLive').checked = true;
+    cache.clear(); cacheBytes = 0;
     map.redraw();
+  }
+
+  // ---------------------------------------------------------------- the replay
+  const clock = t => {
+    if (t === null || t === undefined) return '';
+    const z = ms0 !== null ? `${new Date(ms0 + 1000 * t).toISOString().slice(11, 16)}Z ` : '';
+    return `${z}(+${fmtDur(t)})`;
+  };
+  async function refreshTimes() {
+    try {
+      const d = await (await api('/api/volume/times')).json();
+      times = d.times || []; ms0 = d.ms0;
+    } catch (e) { times = []; }
+    const s = $('volT');
+    s.max = Math.max(0, times.length - 1);
+    if (replayT === null) s.value = s.max; else s.value = nearest(replayT);
+    showTime();
+  }
+  const nearest = t => {
+    let b = 0;
+    for (let i = 1; i < times.length; i++) if (Math.abs(times[i] - t) < Math.abs(times[b] - t)) b = i;
+    return b;
+  };
+  function showTime() {
+    $('volTimeRow').classList.toggle('hidden', tor);
+    $('volTV').textContent = !times.length ? 'no saved volumes yet' : replayT === null ? `newest · ${times.length} saved`
+      : `${clock(times[nearest(replayT)])} · ${nearest(replayT) + 1}/${times.length}`;
+  }
+  function goTime(i, fromMap) {
+    if (!times.length) return;
+    i = Math.max(0, Math.min(times.length - 1, i));
+    const t = times[i];
+    followMap = !!fromMap;
+    $('volLive').checked = false;
+    $('volT').value = i;
+    if (t === replayT) { showTime(); return; }
+    replayT = t; showTime();
+    return load(true);
+  }
+  function goLive() {
+    stopPlay(); replayT = null; followMap = false; $('volLive').checked = true;
+    $('volT').value = $('volT').max; showTime(); load(true);
+  }
+  function stopPlay() { playTok++; $('volPlay').textContent = '▶'; }
+  async function play() {
+    if ($('volPlay').textContent !== '▶') { stopPlay(); return; }
+    await refreshTimes();
+    if (times.length < 2) return;
+    const tok = ++playTok;
+    $('volPlay').textContent = '❚❚';
+    let i = replayT === null ? 0 : nearest(replayT);
+    while (tok === playTok && box) {
+      i = i >= times.length - 1 ? 0 : i + 1;
+      const t0 = performance.now();
+      await goTime(i, false);
+      while (busy && tok === playTok) await new Promise(r => setTimeout(r, 30));
+      const wait = (i === times.length - 1 ? 1200 : 350) - (performance.now() - t0);
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  // the map's replay bar: the 3-D view follows it to the saved volume nearest its frame (t: null = live again)
+  function followTime(t) {
+    if (!box || tor || $('volPlay').textContent !== '▶') return;
+    if (t === null) { if (followMap) goLive(); return; }
+    if (!times.length) { refreshTimes().then(() => { if (times.length) goTime(nearest(t), true); }); return; }
+    if (t > times[times.length - 1] + 30) refreshTimes().then(() => goTime(nearest(t), true));
+    else goTime(nearest(t), true);
   }
 
   // the box on the map while the window is open
@@ -717,7 +1130,11 @@ const Vol = (() => {
       if (c !== was) load(true); else draw();
     };
     $('volThr').oninput = () => { setSlider(true); draw(); };
-    for (const id of ['volOpa', 'volEx', 'volBoth', 'volSun', 'volSunH', 'volRelief', 'volTrack', 'volPaths']) $(id).oninput = draw;
+    for (const id of ['volOpa', 'volEx', 'volBoth', 'volSun', 'volSunH', 'volRelief', 'volTrack', 'volPaths', 'volDetail']) $(id).oninput = draw;
+    $('volCam').onchange = () => setCamMode($('volCam').value);
+    $('volT').oninput = () => { stopPlay(); goTime(+$('volT').value, false); };
+    $('volPlay').onclick = play;
+    $('volLive').onchange = () => { if ($('volLive').checked) goLive(); };
     $('volTop').oninput = () => { $('volTopV').textContent = `${$('volTop').value} km`; };
     $('volTop').onchange = () => load(true);
     $('volRefresh').onclick = () => load(true);
@@ -726,19 +1143,29 @@ const Vol = (() => {
       $('volField').value = first; $('volMode').value = 'iso'; lastMode = 'iso';
       $('volRelief').value = 0.6;
       $('volOpa').value = 0.5; $('volEx').value = 3; $('volSun').value = 235; $('volSunH').value = 30;
-      $('volBoth').checked = false; $('volLive').checked = true;
-      Object.assign(cam, CAM0);
+      $('volBoth').checked = false; $('volDetail').value = 0.7;
+      Object.assign(cam, CAM0); cam.fp = null; $('volCam').value = 'orbit';
+      if (replayT !== null) { stopPlay(); replayT = null; followMap = false; $('volLive').checked = true; refreshTimes(); return load(true); }
+      $('volLive').checked = true;
       setSlider(false);
       if (reload) load(true); else draw();
     };
     const cv = $('volOverlay');
     let drag = null;
     cv.addEventListener('contextmenu', e => e.preventDefault());
-    cv.addEventListener('mousedown', e => { drag = { x: e.clientX, y: e.clientY, b: e.button, yaw: cam.yaw, pitch: cam.pitch, px: cam.px, py: cam.py }; e.preventDefault(); });
+    cv.tabIndex = 0;
+    cv.addEventListener('mousedown', e => {
+      drag = { x: e.clientX, y: e.clientY, b: e.button, yaw: cam.yaw, pitch: cam.pitch, px: cam.px, py: cam.py,
+               fy: cam.fp ? cam.fp.yaw : 0, fp: cam.fp ? cam.fp.pitch : 0 };
+      cv.focus(); e.preventDefault();
+    });
     window.addEventListener('mousemove', e => {
       if (!drag) return;
       const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-      if (drag.b === 2 || e.shiftKey) {                    // move the view across the ground
+      if (cam.mode !== 'orbit' && cam.fp) {            // free / ground: look around
+        cam.fp.yaw = drag.fy - dx * 0.004;
+        cam.fp.pitch = Math.min(1.45, Math.max(-1.45, drag.fp - dy * 0.004));
+      } else if (drag.b === 2 || e.shiftKey) {                    // move the view across the ground
         const s = 0.0025 * cam.dist, c = Math.cos(cam.yaw), sn = Math.sin(cam.yaw);
         cam.px = drag.px + (dx * sn - dy * c) * s;
         cam.py = drag.py + (-dx * c - dy * sn) * s;
@@ -751,12 +1178,23 @@ const Vol = (() => {
     window.addEventListener('mouseup', () => { drag = null; });
     cv.addEventListener('wheel', e => {
       e.preventDefault();
-      cam.dist = Math.min(12, Math.max(0.4, cam.dist * Math.exp(e.deltaY * 0.0012)));
+      if (cam.mode !== 'orbit') cam.speed = Math.min(50, Math.max(0.01, cam.speed * Math.exp(-e.deltaY * 0.0015)));
+      else cam.dist = Math.min(12, Math.max(0.4, cam.dist * Math.exp(e.deltaY * 0.0012)));
       draw();
     }, { passive: false });
+    // the free and ground cameras' keys (W A S D, Q / E, Shift) while the 3-D window is open and no field has focus
+    const MOVE = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'ShiftLeft', 'ShiftRight']);
+    window.addEventListener('keydown', e => {
+      if (!box || cam.mode === 'orbit' || !MOVE.has(e.code) || e.ctrlKey || e.altKey || e.metaKey) return;
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) && e.target.type !== 'range') return;
+      e.preventDefault();
+      if (!keys.has(e.code)) { keys.add(e.code); if (!raf) raf = requestAnimationFrame(frame); }
+    });
+    window.addEventListener('keyup', e => keys.delete(e.code));
+    window.addEventListener('blur', () => keys.clear());
     new ResizeObserver(() => { if (box) draw(); }).observe($('volCanvas'));
   }
 
-  return { init, open, close, drawBox, openTornado, closeTornado };
+  return { init, open, close, drawBox, openTornado, closeTornado, followTime };
 })();
 window.Vol = Vol;

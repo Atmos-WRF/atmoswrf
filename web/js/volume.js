@@ -249,12 +249,24 @@ const Vol = (() => {
   uniform float detail, detailKm, frameSeed; uniform vec3 kmOrigin; uniform int quality;
   uniform sampler3D lightTex; uniform int useLight;           // the light volume (FS_LIGHT): sun and sky depth
   uniform float hazeKm;                                       // the visibility: the air's haze grows over it
-  vec3 mapAt(vec2 xy, vec3 fallback) {      // the map picture (OSM / satellite) on the ground under xy
-    if (hasMap == 0) return fallback;
+  uniform sampler2D mapTex2; uniform int hasMap2; uniform vec4 map2Box;   // the sharp ground around the camera
+  uniform sampler2D geoA, geoT; uniform int hasGeo;           // the trees (landscape.js): colour, distance
+  vec3 mapAt(vec2 xy, vec3 fallback) {      // the ground's picture under xy: the box's map, the sharp one close up
+    vec3 c = fallback;
     vec2 uv = vec2(xy.x / size.x + 0.5, xy.y / size.y + 0.5);
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return fallback;
-    vec3 c = texture(mapTex, uv).rgb;
-    if (mapDark == 1) { float L = dot(c, vec3(0.333)); c = clamp(1.0 - 2.0 * L + c, 0.0, 1.0) * 0.8; }
+    if (hasMap == 1 && all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)))) {
+      c = texture(mapTex, uv).rgb;
+      if (mapDark == 1) { float L = dot(c, vec3(0.333)); c = clamp(1.0 - 2.0 * L + c, 0.0, 1.0) * 0.8; }
+    }
+    if (hasMap2 == 1) {
+      vec2 u2 = (xy - map2Box.xy) / (map2Box.zw - map2Box.xy);
+      if (all(greaterThanEqual(u2, vec2(0.0))) && all(lessThanEqual(u2, vec2(1.0)))) {
+        vec2 e = min(u2, 1.0 - u2) / 0.06;                    // faded into the box's map at its edges
+        vec3 d = texture(mapTex2, u2).rgb;
+        if (mapDark == 1) { float L = dot(d, vec3(0.333)); d = clamp(1.0 - 2.0 * L + d, 0.0, 1.0) * 0.8; }
+        c = mix(c, d, clamp(min(e.x, e.y), 0.0, 1.0));
+      }
+    }
     return c;
   }
   float gz(vec2 xy) {                       // the ground's height (box units) under xy; 0 outside the box / flat runs
@@ -380,6 +392,12 @@ const Vol = (() => {
         if (p.z < gz(p.xy)) { tg = gcross(ro, rd, max(t - ds, 0.0), t); break; }
       }
     }
+    bool tree = false; vec4 ga = vec4(0.0);
+    if (hasGeo == 1) {                                        // a tree in front of the ground
+      vec2 su = gl_FragCoord.xy / vec2(textureSize(geoT, 0));
+      float tt = texture(geoT, su).r;
+      if (tt > 0.0 && tt < tg) { tg = tt; tree = true; ga = texture(geoA, su); }
+    }
     if (tg < 1e8) {
       vec3 g = ro + rd * tg;
       vec2 lt = lightAt(g + vec3(0, 0, 1e-4), wd, kmPerW);
@@ -392,7 +410,8 @@ const Vol = (() => {
               + texture(noiseTex, k / 0.03).r * 0.12 + texture(noiseTex, k / 0.004).g * 0.08;
       vec3 alb = mix(vec3(0.15, 0.21, 0.08), vec3(0.28, 0.27, 0.16), smoothstep(0.15, 0.85, v));
       alb *= 0.9 + 0.2 * texture(noiseTex, k / 0.6 + 0.29).r;
-      if (hasMap == 1) { alb = pow(mapAt(g.xy, pow(alb, vec3(1.0 / 2.2))), vec3(2.2)) * 0.9; }
+      if (hasMap == 1 || hasMap2 == 1) { alb = pow(mapAt(g.xy, pow(alb, vec3(1.0 / 2.2))), vec3(2.2)) * 0.9; }
+      if (tree) { alb = pow(ga.rgb, vec3(2.2)); sl = ga.a * smoothstep(0.0, 0.15, sunDir.z); n = vec3(0, 0, 1); }
       vec3 grd = alb * (SUN * sl * lit * 0.35 + amb * (0.10 + 0.30 * skyv) * (0.6 + 0.4 * n.z));
       float dist = length((g - ro) * toKm);
       bg = mix(grd, haze * mix(0.5, 1.0, skyv), 1.0 - exp(-dist / hazeKm));
@@ -503,6 +522,7 @@ const Vol = (() => {
     vao = gl.createVertexArray();
     volTex = gl.createTexture(); lutTex = gl.createTexture(); gndTex = gl.createTexture(); mapTex = gl.createTexture();
     noiseTex = makeNoise();
+    try { Land.init(gl, () => { if (head) draw(); }); } catch (e) { console.warn('3-D landscape:', e); }
     return true;
   }
 
@@ -564,7 +584,7 @@ const Vol = (() => {
     const c = cloudMode();
     $('volBoth').parentElement.classList.toggle('hidden', !F.signed || c);
     for (const id of ['volField', 'volThrLbl']) $(id).classList.toggle('hidden', c);
-    for (const id of ['volSunLbl', 'volSunHLbl', 'volReliefLbl', 'volDetailLbl', 'volRainLbl']) $(id).classList.toggle('hidden', !c);
+    for (const id of ['volSunLbl', 'volSunHLbl', 'volReliefLbl', 'volDetailLbl', 'volRainLbl', 'volTreesLbl']) $(id).classList.toggle('hidden', !c);
     showTime();
     $('volOpaName').textContent = c ? 'Density' : 'Opacity';
     // the tornado view reads the model's state (no radar reflectivity there), and has its pressure drop
@@ -698,8 +718,9 @@ const Vol = (() => {
       target = [eye[0] + cp * Math.cos(f.yaw), eye[1] + cp * Math.sin(f.yaw), eye[2] + Math.sin(f.pitch)];
       fov = cam.mode === 'ground' ? 1.15 : 1.0;
     }
-    const VP = mul(perspective(fov, W / H, 0.001, 50), lookAt(eye, target, [0, 0, 1]));
-    return { G, eye, VP };
+    const V = lookAt(eye, target, [0, 0, 1]);
+    const VP = mul(perspective(fov, W / H, 0.001, 50), V);
+    return { G, eye, VP, V, fov };
   }
 
   // the free and ground cameras: from the orbit's eye (free), or out at the box's side looking in (ground)
@@ -725,7 +746,7 @@ const Vol = (() => {
       } else if (m === 'ground') cam.fp.pitch = Math.min(cam.fp.pitch, 0.6);
       cam.speed = m === 'ground' ? 0.4 : Math.max(0.5, 0.08 * side);
     }
-    cam.mode = m; $('volCam').value = m;
+    cam.mode = m; $('volCam').value = m; cam.placed = false;
     $('volOverlay').title = m === 'orbit' ? 'Drag: turn · right-drag or Shift-drag: move · wheel: zoom'
       : 'Drag: look around · W A S D: move · ' + (m === 'free' ? 'Q / E: down / up · ' : '') + 'Shift: faster · wheel: speed';
     if (m !== 'orbit') $('volOverlay').focus();
@@ -750,9 +771,17 @@ const Vol = (() => {
   function bindGround(u) {
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, gndTex); gl.uniform1i(u('gnd'), 2);
     gl.uniform1i(u('hasG'), head && head.ground ? 1 : 0);
-    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, mapTex); gl.uniform1i(u('mapTex'), 3);
-    gl.uniform1i(u('hasMap'), mapOn ? 1 : 0);
+    const land = cloudMode() && baseName() === 'plain' ? Land.coarse() : null;
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, land || mapTex); gl.uniform1i(u('mapTex'), 3);
+    gl.uniform1i(u('hasMap'), mapOn || land ? 1 : 0);
     gl.uniform1i(u('mapDark'), baseName() === 'osmdark' ? 1 : 0);
+    const d = cloudMode() && cam.mode !== 'orbit' ? Land.detail() : null;
+    gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_2D, d ? d.tex : null); gl.uniform1i(u('mapTex2'), 8);
+    gl.uniform1i(u('hasMap2'), d ? 1 : 0);
+    if (d) {
+      const k = 2 / Math.max(box[2] - box[0], box[3] - box[1]), cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
+      gl.uniform4f(u('map2Box'), (d.box[0] - cx) * k, (d.box[1] - cy) * k, (d.box[2] - cx) * k, (d.box[3] - cy) * k);
+    }
   }
 
   // the map picked on the map bar (app.js), drawn on the ground: one picture of the box from the server
@@ -777,7 +806,7 @@ const Vol = (() => {
       mapKey = key; mapOn = true;
     } catch (e) { mapOn = false; }
   }
-  window.volBaseChanged = () => { if (gl && box) loadMap().then(() => { if (head) draw(); }); };
+  window.volBaseChanged = () => { if (gl && box) { Land.reset(); loadMap().then(() => { if (head) draw(); }); } };
 
   // the light volume for the current data, sun, density and heights (FS_LIGHT), rebuilt only when one changes
   function buildLight(G, sun, dens, rain) {
@@ -815,13 +844,24 @@ const Vol = (() => {
     return ok;
   }
 
-  function drawCloud(G, eye, VP) {
+  function drawCloud(G, eye, VP, V, fov) {
     const az = +$('volSun').value * Math.PI / 180, el = +$('volSunH').value * Math.PI / 180;
     const sun = [Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el)], dens = 2 * +$('volOpa').value;
     const rain = +$('volRain').value;
     const blend = gl.isEnabled(gl.BLEND);
     if (blend) gl.disable(gl.BLEND);
     const lit = buildLight(G, sun, dens, rain);
+    // close up: the real landscape around the camera (landscape.js) and its trees into the geometry buffer
+    const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2, close = cam.mode !== 'orbit' && cam.fp && !tor;
+    Land.want(tor ? null : box, baseName(), close ? { x: cam.fp.x + cx, y: cam.fp.y + cy } : null,
+              (x, y) => groundKm(x - cx, y - cy));
+    if (close && cam.mode === 'ground' && !cam.placed) {       // off the road or out of the woods: onto a road
+      const s = Land.standNear(cam.fp.x + cx, cam.fp.y + cy);
+      if (s) { cam.fp.x = s[0] - cx; cam.fp.y = s[1] - cy; cam.placed = true; acc = 0; }
+    }
+    const cvs = $('volCanvas');
+    const geo = close && $('volTrees').checked && Land.drawTrees(cvs.width, cvs.height, V, fov, eye, G, sun, [cx, cy]);
+    gl.viewport(0, 0, cvs.width, cvs.height);
     if (blend) gl.enable(gl.BLEND);
     gl.useProgram(cloudProg); gl.bindVertexArray(vao);
     const u = n => gl.getUniformLocation(cloudProg, n);
@@ -845,6 +885,10 @@ const Vol = (() => {
     gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_3D, lit ? lightTex : null); gl.uniform1i(u('lightTex'), 5);
     gl.uniform1i(u('useLight'), lit ? 1 : 0);
     gl.uniform1f(u('hazeKm'), cam.mode === 'orbit' ? 900 : 180);
+    const tr = Land.trees();
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, geo ? tr.colTex : null); gl.uniform1i(u('geoA'), 6);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, geo ? tr.tTex : null); gl.uniform1i(u('geoT'), 7);
+    gl.uniform1i(u('hasGeo'), geo ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     $('volLegend').textContent = `Cloud view · sun in the ${COMPASS[Math.round(+$('volSun').value / 45) % 8]}, ` +
       `${$('volSunH').value}° up · height ×${G.ex}` + camNote();
@@ -935,13 +979,13 @@ const Vol = (() => {
     if (ov.width !== Math.round(W * dpr) || ov.height !== Math.round(H * dpr)) { ov.width = Math.round(W * dpr); ov.height = Math.round(H * dpr); }
     if (acc === 0) { g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H); }
     if (!head || !box || head.field !== want()) { acc = ACC_MAX; return; }
-    const { G, eye, VP } = matrices(W, H);
+    const { G, eye, VP, V, fov } = matrices(W, H);
     if (cloudMode()) {
       if (acc > 0) {                                  // the running mean of the jittered frames
         gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, 1 / (acc + 1));
         gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA);
       }
-      drawCloud(G, eye, VP);
+      drawCloud(G, eye, VP, V, fov);
       gl.disable(gl.BLEND);
       if (acc === 0) drawPaths(g, G, VP, W, H);
       acc++;
@@ -1035,6 +1079,7 @@ const Vol = (() => {
   function close() {
     $('volWin').classList.add('hidden');
     clearInterval(timer); timer = null; box = null; tor = false; paths = null;
+    Land.reset();
     stopPlay(); keys.clear(); replayT = null; followMap = false; $('volLive').checked = true;
     cache.clear(); cacheBytes = 0;
     map.redraw();
@@ -1133,7 +1178,7 @@ const Vol = (() => {
       if (c !== was) load(true); else draw();
     };
     $('volThr').oninput = () => { setSlider(true); draw(); };
-    for (const id of ['volOpa', 'volEx', 'volBoth', 'volSun', 'volSunH', 'volRelief', 'volTrack', 'volPaths', 'volDetail', 'volRain']) $(id).oninput = draw;
+    for (const id of ['volOpa', 'volEx', 'volBoth', 'volSun', 'volSunH', 'volRelief', 'volTrack', 'volPaths', 'volDetail', 'volRain', 'volTrees']) $(id).oninput = draw;
     $('volCam').onchange = () => setCamMode($('volCam').value);
     $('volT').oninput = () => { stopPlay(); goTime(+$('volT').value, false); };
     $('volPlay').onclick = play;

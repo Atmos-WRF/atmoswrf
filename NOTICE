@@ -22,3 +22,8 @@ Map tiles fetched while running (not included; attribution is drawn on the map):
 
 - OpenStreetMap tiles, (c) OpenStreetMap contributors (ODbL), tile.openstreetmap.org under its tile usage policy.
 - Esri World Imagery and World Reference layers, (c) Esri, Maxar, Earthstar Geographics, and the GIS User Community.
+
+The 3-D view's landscape, fetched while running (not included):
+- ESA WorldCover 10 m 2021 v200, (c) ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data
+  (2021) processed by ESA WorldCover consortium (CC BY 4.0).
+- Roads from OpenStreetMap, (c) OpenStreetMap contributors (ODbL), through the Overpass API.

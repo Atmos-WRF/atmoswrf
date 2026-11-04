@@ -109,9 +109,19 @@ def ground(proj, box_km, srcs=("sat",), px: int = 1024) -> bytes:
         if len(need) > 400:
             raise ValueError("the box is too big for the map tiles")
         layer = np.zeros((H, W, 4), np.float32)
+
+        def get(ab, src=src, z=z):
+            try:
+                return tile(src, z, *ab)
+            except Exception:
+                return None
+        # several at once (a sharp close-up needs ~100 tiles); OpenStreetMap's tile policy: two at most
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(2 if src == "osm" else 8) as pool:
+            got = dict(zip(need, pool.map(get, need)))
         for (a, b) in need:
             try:
-                im = Image.open(io.BytesIO(tile(src, z, a, b))).convert("RGBA")
+                im = Image.open(io.BytesIO(got[(a, b)])).convert("RGBA")
             except Exception:
                 continue
             arr = np.asarray(im, np.float32)

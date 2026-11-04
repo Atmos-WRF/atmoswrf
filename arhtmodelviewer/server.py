@@ -20,6 +20,7 @@ import socket
 import threading
 import time
 import urllib.parse
+import struct
 import zlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -326,6 +327,23 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     return self._error(404, str(e))
                 return self._send(200, png, "image/png")
+            if path in ("/api/volume/landcover", "/api/volume/roads"):
+                # the 3-D view's landscape from real data (landscape.py): WorldCover's land cover of a box, one
+                # byte a pixel (row 0 north), or OpenStreetMap's roads in it (fetched in the background)
+                from . import landscape
+                sim = APP.sim
+                if sim is None:
+                    return self._error(404, "no run")
+                try:
+                    box = [float(q[k]) for k in ("x0", "y0", "x1", "y1")]
+                    if path.endswith("roads"):
+                        return self._json(landscape.roads(sim.proj, box, q.get("major") == "1"))
+                    W, H, a = landscape.landcover(sim.proj, box, max(64, min(int(q.get("px", 1024)), 2048)))
+                except Exception as e:
+                    return self._error(404, str(e))
+                head = json.dumps({"W": W, "H": H, "classes": landscape.CLASSES}).encode()
+                return self._send(200, zlib.compress(struct.pack("<I", len(head)) + head + a.tobytes(), 1),
+                                  "application/octet-stream", encoding="deflate")
             if path == "/remote":
                 return self._send(200, (WEB / "remote.html").read_bytes(), "text/html; charset=utf-8")
             if path.startswith("/api/r/"):

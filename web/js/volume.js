@@ -243,7 +243,7 @@ const Vol = (() => {
   precision highp float; precision highp sampler3D;
   in vec2 ndc; out vec4 frag;
   uniform sampler3D vol; uniform sampler3D noiseTex;
-  uniform mat4 invVP; uniform vec3 eye; uniform vec3 size; uniform vec3 toKm; uniform vec3 sunDir; uniform float density;
+  uniform mat4 invVP; uniform vec3 eye; uniform vec3 size; uniform vec3 toKm; uniform vec3 sunDir; uniform float density, rain;
   uniform sampler2D gnd; uniform int hasG; uniform float relief; uniform vec3 texel;
   uniform sampler2D mapTex; uniform int hasMap, mapDark;
   uniform float detail, detailKm, frameSeed; uniform vec3 kmOrigin; uniform int quality;
@@ -306,7 +306,7 @@ const Vol = (() => {
       uvw += wv * texel * 2.2 * detail;
     }
     vec2 m = gkg(mode == 2 && quality > 0 ? cubic(uvw) : texture(vol, uvw).rg);
-    vec2 s = vec2(25.0 * m.x, 1.2 * m.y) * density;
+    vec2 s = vec2(25.0 * m.x, 1.2 * rain * m.y) * density;   // rain: the Rain slider (x the model's)
     vec2 e = min(uvw.xy, 1.0 - uvw.xy) / 0.03;                 // the box's sides fade: no walls of cloud
     s *= clamp(min(e.x, e.y), 0.0, 1.0);
     if (mode > 0 && detail > 0.0 && s.x + s.y > 1e-3) {
@@ -457,14 +457,14 @@ const Vol = (() => {
   const FS_LIGHT = `#version 300 es
   precision highp float; precision highp sampler3D;
   in vec2 ndc; out vec4 frag;
-  uniform sampler3D vol; uniform vec3 size, toKm, sunDir, lres; uniform float density, layer;
+  uniform sampler3D vol; uniform vec3 size, toKm, sunDir, lres; uniform float density, rain, layer;
   float sig0(vec3 p) {
     vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
     if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) return 0.0;
     vec2 c = texture(vol, uvw).rg * 255.0;
     vec2 m = vec2(c.x < 0.5 ? 0.0 : pow(10.0, (c.x - 1.0) / 40.0 - 3.0), c.y < 0.5 ? 0.0 : pow(10.0, (c.y - 1.0) / 40.0 - 3.0));
     vec2 e = min(uvw.xy, 1.0 - uvw.xy) / 0.03;
-    return (25.0 * m.x + 1.2 * m.y) * density * clamp(min(e.x, e.y), 0.0, 1.0);
+    return (25.0 * m.x + 1.2 * rain * m.y) * density * clamp(min(e.x, e.y), 0.0, 1.0);
   }
   void main() {
     vec3 uvw = vec3(gl_FragCoord.xy / lres.xy, (layer + 0.5) / lres.z);
@@ -564,7 +564,7 @@ const Vol = (() => {
     const c = cloudMode();
     $('volBoth').parentElement.classList.toggle('hidden', !F.signed || c);
     for (const id of ['volField', 'volThrLbl']) $(id).classList.toggle('hidden', c);
-    for (const id of ['volSunLbl', 'volSunHLbl', 'volReliefLbl', 'volDetailLbl']) $(id).classList.toggle('hidden', !c);
+    for (const id of ['volSunLbl', 'volSunHLbl', 'volReliefLbl', 'volDetailLbl', 'volRainLbl']) $(id).classList.toggle('hidden', !c);
     showTime();
     $('volOpaName').textContent = c ? 'Density' : 'Opacity';
     // the tornado view reads the model's state (no radar reflectivity there), and has its pressure drop
@@ -780,9 +780,9 @@ const Vol = (() => {
   window.volBaseChanged = () => { if (gl && box) loadMap().then(() => { if (head) draw(); }); };
 
   // the light volume for the current data, sun, density and heights (FS_LIGHT), rebuilt only when one changes
-  function buildLight(G, sun, dens) {
+  function buildLight(G, sun, dens, rain) {
     if (!lightProg) return false;
-    const key = [head.nx, head.ny, head.nz, loadSeq, ...sun.map(v => v.toFixed(4)), dens, G.sx, G.sy, G.sz].join('/');
+    const key = [head.nx, head.ny, head.nz, loadSeq, ...sun.map(v => v.toFixed(4)), dens, rain, G.sx, G.sy, G.sz].join('/');
     if (key === lightKey) return true;
     const nx = head.nx, ny = head.ny, nz = head.nz;
     gl.bindTexture(gl.TEXTURE_3D, lightTex);
@@ -798,6 +798,7 @@ const Vol = (() => {
     gl.uniform3f(u('sunDir'), ...sun);
     gl.uniform3f(u('lres'), nx, ny, nz);
     gl.uniform1f(u('density'), dens);
+    gl.uniform1f(u('rain'), rain);
     gl.bindFramebuffer(gl.FRAMEBUFFER, lightFbo);
     gl.viewport(0, 0, nx, ny);
     let ok = true;
@@ -817,9 +818,10 @@ const Vol = (() => {
   function drawCloud(G, eye, VP) {
     const az = +$('volSun').value * Math.PI / 180, el = +$('volSunH').value * Math.PI / 180;
     const sun = [Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el)], dens = 2 * +$('volOpa').value;
+    const rain = +$('volRain').value;
     const blend = gl.isEnabled(gl.BLEND);
     if (blend) gl.disable(gl.BLEND);
-    const lit = buildLight(G, sun, dens);
+    const lit = buildLight(G, sun, dens, rain);
     if (blend) gl.enable(gl.BLEND);
     gl.useProgram(cloudProg); gl.bindVertexArray(vao);
     const u = n => gl.getUniformLocation(cloudProg, n);
@@ -830,7 +832,8 @@ const Vol = (() => {
     gl.uniform3f(u('size'), G.sx, G.sy, G.sz);
     gl.uniform3f(u('toKm'), 1 / G.k, 1 / G.k, 1 / (G.k * G.ex));
     gl.uniform3f(u('sunDir'), Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el));
-    gl.uniform1f(u('density'), 2 * +$('volOpa').value);
+    gl.uniform1f(u('density'), dens);
+    gl.uniform1f(u('rain'), rain);
     gl.uniform1f(u('relief'), +$('volRelief').value);
     gl.uniform3f(u('texel'), 1 / head.nx, 1 / head.ny, 1 / head.nz);
     gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_3D, noiseTex); gl.uniform1i(u('noiseTex'), 4);
@@ -1130,7 +1133,7 @@ const Vol = (() => {
       if (c !== was) load(true); else draw();
     };
     $('volThr').oninput = () => { setSlider(true); draw(); };
-    for (const id of ['volOpa', 'volEx', 'volBoth', 'volSun', 'volSunH', 'volRelief', 'volTrack', 'volPaths', 'volDetail']) $(id).oninput = draw;
+    for (const id of ['volOpa', 'volEx', 'volBoth', 'volSun', 'volSunH', 'volRelief', 'volTrack', 'volPaths', 'volDetail', 'volRain']) $(id).oninput = draw;
     $('volCam').onchange = () => setCamMode($('volCam').value);
     $('volT').oninput = () => { stopPlay(); goTime(+$('volT').value, false); };
     $('volPlay').onclick = play;
@@ -1143,7 +1146,7 @@ const Vol = (() => {
       $('volField').value = first; $('volMode').value = 'iso'; lastMode = 'iso';
       $('volRelief').value = 0.6;
       $('volOpa').value = 0.5; $('volEx').value = 3; $('volSun').value = 235; $('volSunH').value = 30;
-      $('volBoth').checked = false; $('volDetail').value = 0.7;
+      $('volBoth').checked = false; $('volDetail').value = 0.7; $('volRain').value = 1;
       Object.assign(cam, CAM0); cam.fp = null; $('volCam').value = 'orbit';
       if (replayT !== null) { stopPlay(); replayT = null; followMap = false; $('volLive').checked = true; refreshTimes(); return load(true); }
       $('volLive').checked = true;

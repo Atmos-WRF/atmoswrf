@@ -184,6 +184,11 @@ SPIN_UP_MIN = 20.0       # min the environment's wind is mixed before a single-s
 SPIN_UP_GROUND_MIN = 30.0   # min of it, with the ground's friction, without the steady environment
 EDGE_TKE_CELLS = 5       # cells at a patch edge given the reference column's TKE, then as many fading out
 FOLLOW_REF_EVERY = 300.0  # s between updates of a suite run's environment from its reference column (_follow_reference)
+# the steady environment with a physics suite (Engine._suite_weights): each cell's share of the column's sunny-day
+# drift is its sunshine over the column's, up to SUN_SHARE_MAX; below SUN_SHARE_MIN W/m2 at the column the plain drift
+SUN_SHARE_MAX = 1.2
+SUN_SHARE_MIN = 30.0
+MIX_MIN_M = 300.0         # m: the shallowest boundary layer the column's day is spread through (_through_bl)
 
 
 _DEBUG_NAN = bool(__import__("os").environ.get("ARHTMODELVIEWER_DEBUG_NAN"))
@@ -502,48 +507,92 @@ class Engine:
         st = self._ref
         keep = self._ambient_keep() if oc is not None else None
         sun = self._suite_weights() if self.env.suite else None
+        layer = self._ref_layer() if self.env.suite and keep is None else None
         for n, prof in self._ref_profile.items():
             arr = getattr(st, n)
             delta = arr.mean(axis=(1, 2)) - prof
             d3 = delta[:, None, None]
             arr -= d3
             dp = d3 * keep if keep is not None and n in ("thp", "qv") else d3
+            split = layer is not None and n in ("thp", "qv")
+            if split:
+                # a suite's sunny day: what the column gained inside its boundary layer is taken off each cell as one
+                # amount spread through the CELL's own boundary layer (the heat / moisture kept, times the cell's
+                # sunshine share); above it, level by level.  Held at the sounding every step, the column puts its
+                # surface heating into its lowest levels, while a cell mixes its own through its boundary layer:
+                # taken off level by level, a cell's lowest level lost more than the sun gave it, every step, until
+                # it was 6-16 K too cold and foggy (2026-11-04)
+                inside, wz = layer
+                amount = (delta * wz * inside).sum()
+                above = (delta * (1.0 - inside))[:, None, None]
             for p in self.patches + self.nest_patches():
-                dq = _on_levels(dp, self.env, p.env)
-                w = sun(p, n) if sun is not None and n in ("thp", "qv") else None
-                if w is not None and w.shape[0] != dq.shape[0]:      # a nest on its own levels: the plain drift
-                    w = None
-                getattr(p.state, n)[...] -= dq if w is None else dq * w
+                if split and p.env.grid.nz == self.env.grid.nz:
+                    getattr(p.state, n)[...] -= above + self._through_bl(p, amount, wz, sun(p) if sun else None)
+                    continue
+                getattr(p.state, n)[...] -= _on_levels(dp, self.env, p.env)    # a nest on its own levels: plain
         _clamp_vapour(st)
+
+    def _ref_layer(self):
+        """The reference column's boundary layer: (inside 0/1 per level, each level's air weight dz * rho), or None
+        without a PBL height."""
+        import cupy as cp
+        from .patch import driver_lookup
+        pb = driver_lookup(self._ref, "fields/pblh")
+        if pb is None:
+            return None
+        z = np.asarray(self.env.z_h, dtype=np.float64)
+        zw = np.asarray(self.env.z_w, dtype=np.float64)
+        wz = np.diff(zw)[:len(z)] * np.exp(-z / 8500.0)
+        top = max(1.4 * float(pb.mean()), MIX_MIN_M)
+        return (cp.asarray((z < top).astype(np.float32)), cp.asarray(wz, dtype=cp.float32))
+
+    def _through_bl(self, p, amount, wz, share):
+        """``amount`` (a column integral, sum of change x wz) spread evenly through each cell's own boundary layer
+        (its PBL height, at least MIX_MIN_M), times its sunshine ``share`` (1, ny, nx) or in full: (nz, ny, nx)."""
+        import cupy as cp
+        from .patch import driver_lookup
+        st = p.state
+        nz = st.thp.shape[0]
+        h = driver_lookup(st, "fields/pblh")
+        z = cp.asarray(np.asarray(self.env.z_h, dtype=np.float32))[:, None, None]
+        if h is None:
+            inside = (z < MIX_MIN_M).astype(cp.float32) + cp.zeros(st.thp.shape[1:], cp.float32)[None]
+        else:
+            inside = (z < cp.clip(h, MIX_MIN_M, 4000.0)[None]).astype(cp.float32)
+        W = (wz[:nz, None, None] * inside).sum(axis=0, keepdims=True)
+        out = amount * inside / cp.maximum(W, 1e-6)
+        return out if share is None else out * share
 
     def _suite_weights(self):
         """A physics suite's theta / moisture drift is the column's sunny day: its land surface heating and
         moistening a growing boundary layer.  The steady environment takes it off each patch cell in the share
-        of that day the cell has had -- its own surface sensible (theta) or latent (qv) heat flux over the
-        column's, 0..1.5, inside the column's boundary layer (fading out to 1.4 x its depth; above it, the
-        whole drift).  Taken off in full everywhere, every cell the anvil or the cumulus shaded cooled as much as
+        of that day the cell has had -- share(p), its sunshine over the column's, 0..SUN_SHARE_MAX -- spread
+        through the cell's own boundary layer (_drift_correction, _through_bl; above the column's boundary layer,
+        the whole drift, level by level).  Taken off in full everywhere, every cell the anvil or the cumulus shaded cooled as much as
         the sun warmed the column: cold pools without storms (2026-11-02, DVN 2008-06-10, 750 m).  Not taken
         off at all, the sun kept heating an afternoon sounding that already holds the day's heating and the
-        whole domain fired (OUN 1999-05-03, 500 m: popcorn and lines everywhere, the storms starved)."""
+        whole domain fired (OUN 1999-05-03, 500 m: popcorn and lines everywhere, the storms starved).
+
+        The share is the cell's SUNSHINE (downward shortwave at the ground) over the column's, 0..SUN_SHARE_MAX:
+        what the sun gave it, which the air's own temperature cannot change.  It was the sensible / latent heat
+        flux ratio, and that ran away in the late afternoon (2026-11-04, DVN sounding, 500 m, steady + Noah): the
+        column's flux fell to ~50 W/m2 while every cell's was larger, the ratio sat at its 1.5 cap, the cells were
+        cooled faster than the sun heated them, a colder cell's air-ground contrast raised its flux, and so its
+        cooling: the lowest level of every quiet cell 6-16 K too cold and saturated (fog) within ~2 h, a fresh
+        cell (a patch's growth) in ~5 min -- cold pools of 30 000-80 000 km2 with no storm over them."""
         import cupy as cp
         from .patch import driver_lookup
-        ref = self._ref
-        hr, lr = driver_lookup(ref, "fields/hfx"), driver_lookup(ref, "fields/lh")
-        pb = driver_lookup(ref, "fields/pblh")
-        if hr is None or pb is None:
+        sr = driver_lookup(self._ref, "fields/swdown")
+        if sr is None:
             return None
-        hr, lr, pb = float(hr.mean()), float(lr.mean()) if lr is not None else 0.0, float(pb.mean())
-        z = np.asarray(self.env.z_h, dtype=np.float64)
-        bl = cp.asarray(np.clip((1.4 * pb - z) / max(0.4 * pb, 1.0), 0.0, 1.0), dtype=cp.float32)[:, None, None]
+        sr = float(sr.mean())
+        if sr < SUN_SHARE_MIN:                           # little sun (morning, evening, night): the plain drift
+            return None
 
-        def weights(p, n):
-            ref_flux, key = (hr, "fields/hfx") if n == "thp" else (lr, "fields/lh")
-            f = driver_lookup(p.state, key)
-            if f is None or ref_flux < 20.0:             # little sun (morning, evening, night): the plain drift
-                return None
-            r = cp.clip(f / ref_flux, 0.0, 1.5)[None]
-            return 1.0 + bl * (r - 1.0)
-        return weights
+        def share(p):
+            f = driver_lookup(p.state, "fields/swdown")
+            return None if f is None else cp.clip(f / sr, 0.0, SUN_SHARE_MAX)[None]
+        return share
 
     def _follow_reference(self) -> None:
         """Physics-suite runs (with the steady environment it holds their wind only): the reference column runs the suite (land surface,

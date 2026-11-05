@@ -1,4 +1,4 @@
-"""NEXRAD Level II (Archive II, message 31) writer and reader.
+"""NEXRAD Level II (Archive II, message 31) writer and reader -- and the legacy (1990s-2008) message 1 one.
 
 File layout (RDA/RPG ICD 2620002 / 2620010):
   * 24-byte volume header: "AR2V0006." + "001" + modified Julian date (4) +
@@ -12,6 +12,11 @@ File layout (RDA/RPG ICD 2620002 / 2620010):
 
 ``read_volume`` decodes what ``encode_volume`` writes (and real message-31
 files) so exports can be checked without third-party readers.
+
+A legacy WSR-88D's volume (before Build 10's message 31, 2008: radar.LEGACY_VCPS) is written the way the radars
+archived it then: "AR2V0001." volumes whose radials are message type 1 -- one fixed 2432-byte segment each, a
+100-byte digital radar data header, then reflectivity (1 km gates), velocity and spectrum width (250 m) as bytes
+(encode_volume_legacy).  ``read_volume`` and ``retime`` read both kinds.
 """
 from __future__ import annotations
 
@@ -63,7 +68,7 @@ def _angle_code(deg: float) -> int:
     return int(round((deg % 360.0) * 65536.0 / 360.0)) & 0xFFFF
 
 
-def _msg5(cuts, vcp: int, epoch_ms: int, seq: int, vel_res: int = 2) -> bytes:
+def _msg5(cuts, vcp: int, epoch_ms: int, seq: int, vel_res: int = 2, legacy: bool = False) -> bytes:
     buf = bytearray(SEG)
     n = len(cuts)
     length = 22 + 46 * n                       # bytes of message-5 data
@@ -79,7 +84,7 @@ def _msg5(cuts, vcp: int, epoch_ms: int, seq: int, vel_res: int = 2) -> bytes:
         # channel config, waveform (1 CS, 2 CD, 4 batch), super-res bits
         # (1 half-degree azimuths, 2 quarter-km REF, 4 300-km Doppler, 8 dual pol)
         wf = {"surv": 1, "dop": 2, "both": 4}[c.kind]
-        sres = (0x0B if c.kind == "surv" else 0x07 if c.kind == "dop" else 0x0E) if c.super_res else 0x08
+        sres = 0 if legacy else (0x0B if c.kind == "surv" else 0x07 if c.kind == "dop" else 0x0E) if c.super_res else 0x08
         prf_num = 1 if c.kind == "surv" else 5
         az_rate = min(int(round(360.0 / c.seconds * 16384.0 / 22.5)), 0xFFFF)   # BAMS deg/s (to ~90)
         struct.pack_into(">HBBBBHH", buf, o, _angle_code(c.elev), 0, wf, sres, prf_num,
@@ -92,7 +97,7 @@ def _msg5(cuts, vcp: int, epoch_ms: int, seq: int, vel_res: int = 2) -> bytes:
     return bytes(buf)
 
 
-def _msg2(vcp: int, epoch_ms: int, seq: int) -> bytes:
+def _msg2(vcp: int, epoch_ms: int, seq: int, legacy: bool = False) -> bytes:
     buf = bytearray(SEG)
     jd, ms = _mjd(epoch_ms)
     hw = [
@@ -105,9 +110,9 @@ def _msg2(vcp: int, epoch_ms: int, seq: int) -> bytes:
         0x001C,         # data transmission enabled: REF, VEL, SW
         vcp,            # VCP
         0x0000,         # control authorization
-        1902,           # RDA build 19.02 (x100)
+        800 if legacy else 1902,           # RDA build 8.0 / 19.02 (x100)
         0x0004,         # operational mode: operational
-        0x0002,         # super-resolution: enabled
+        0x0004 if legacy else 0x0002,      # super-resolution: disabled / enabled
         0x0002,         # clutter mitigation decision: enabled
         0x0002,         # AVSET
         0x0000,         # alarm summary
@@ -126,13 +131,13 @@ def _msg2(vcp: int, epoch_ms: int, seq: int) -> bytes:
     return bytes(buf)
 
 
-def _metadata(cuts, vcp, epoch_ms, vel_res: int = 2) -> bytes:
+def _metadata(cuts, vcp, epoch_ms, vel_res: int = 2, legacy: bool = False) -> bytes:
     segs = [bytes(SEG)] * 131
     m3 = bytearray(SEG)
     _msg_header(m3, 0, 488, 3, 1, epoch_ms)
     segs.append(bytes(m3))
-    segs.append(_msg5(cuts, vcp, epoch_ms, 2, vel_res))
-    segs.append(_msg2(vcp, epoch_ms, 3))
+    segs.append(_msg5(cuts, vcp, epoch_ms, 2, vel_res, legacy))
+    segs.append(_msg2(vcp, epoch_ms, 3, legacy))
     return b"".join(segs)
 
 
@@ -258,9 +263,111 @@ def encode_volume(icao: str, lat: float, lon: float, height_m: float, vcp: int,
     return b"".join(out)
 
 
-def archive_name(icao: str, epoch_ms: int) -> str:
+# ------------------------------------------------------------------ legacy (message 1)
+M1_HW = 1208                      # message 1's size in halfwords (16-byte header + 2400 bytes), always
+
+
+def _m1_angle(deg) -> np.ndarray:
+    """Message 1's coded angle: (code / 8) x (180 / 4096) degrees."""
+    return (np.rint((np.asarray(deg, np.float64) % 360.0) * 8.0 * 4096.0 / 180.0).astype(np.int64) & 0xFFF8).astype(">u2")
+
+
+def _radials_m1(sweep, elev_num, nsweeps, seq0, vcp):
+    """All message-1 radials of one sweep as a (nrad, SEG) uint8 array: 12-byte CTM, 16-byte message header,
+    100-byte digital radar data header, then the reflectivity, velocity and spectrum width bytes."""
+    cut = sweep["cut"]
+    nrad = int(sweep["nrad"])
+    mom = sweep["moments"]
+    ref, vel, sw = mom.get("REF"), mom.get("VEL"), mom.get("SW")
+    n_sur = ref[1] if ref is not None else 0
+    n_dop = vel[1] if vel is not None else (sw[1] if sw is not None else 0)
+    if 100 + n_sur + 2 * n_dop > SEG - 28:
+        raise ValueError(f"a message-1 radial holds 2404 bytes: {n_sur} + 2 x {n_dop} gates do not fit")
+    t0 = int(sweep["start_ms"])
+    dur = float(sweep["dur_ms"])
+    az0 = float(sweep.get("az0", 0.0))
+    buf = bytearray(SEG)
+    struct.pack_into(">HBBHHIHH", buf, 12, M1_HW, 0, 1, 0, 0, 0, 1, 1)
+    d = 28
+    vres = (4 if float(vel[3]) == 1.0 else 2) if vel is not None else 0      # 0: a surveillance sweep's
+    ptr = 100
+    sur_ptr = ptr if ref is not None else 0
+    ptr += n_sur
+    vel_ptr = ptr if vel is not None else 0
+    ptr += n_dop if vel is not None else 0
+    sw_ptr = ptr if sw is not None else 0
+    unamb = int(round(getattr(cut, "unamb_m", 4.66e5) / 100.0))
+    struct.pack_into(">h", buf, d + 6, min(unamb, 32767))
+    struct.pack_into(">hhHHHH", buf, d + 18, int(round(sweep.get("ref_first", sweep.get("first_gate", 2125)))),
+                     int(round(sweep.get("first_gate", 2125))), int(round(sweep.get("ref_gate", 1000))),
+                     int(round(sweep.get("gate", 250))), n_sur, n_dop)
+    struct.pack_into(">H", buf, d + 30, 1)
+    struct.pack_into(">f", buf, d + 32, 24.0 if ref is not None and vel is None else 0.0)   # the RDAs' calibration
+    struct.pack_into(">HHHHH", buf, d + 36, sur_ptr, vel_ptr, sw_ptr, vres, vcp)
+    nyq = int(round(float(sweep.get("nyquist", cut.nyquist)) * 100)) if vel is not None else 0
+    struct.pack_into(">hhh", buf, d + 60, min(nyq, 32767), -12, 16)
+    struct.pack_into(">H", buf, d + 16, elev_num)
+    struct.pack_into(">H", buf, d + 14, int(_m1_angle([cut.elev])[0]))      # (a NumPy scalar would lose >)
+    arr = np.tile(np.frombuffer(bytes(buf), dtype=np.uint8), (nrad, 1))
+    ri = np.arange(nrad)
+    tms = t0 + np.rint(dur * ri / nrad).astype(np.int64)
+    days = tms // 86400000
+    jd = (days + 1).astype(">u2")
+    jms = (tms - days * 86400000).astype(">u4")
+    status = np.ones(nrad, dtype=">u2")
+    status[0] = 3 if elev_num == 1 else 0
+    status[-1] = 4 if elev_num == nsweeps else 2
+
+    def put(off, vals):
+        v = np.ascontiguousarray(vals)
+        arr[:, off:off + v.itemsize] = v.view(np.uint8).reshape(nrad, v.itemsize)
+
+    put(12 + 4, ((seq0 + ri) & 0xFFFF).astype(">u2"))
+    put(12 + 6, jd)
+    put(12 + 8, jms)
+    put(d + 0, jms)
+    put(d + 4, jd)
+    put(d + 8, _m1_angle(az0 + (ri + 0.5) * 360.0 / nrad))
+    put(d + 10, (ri + 1).astype(">u2"))
+    put(d + 12, status)
+    for p_, m in ((sur_ptr, ref), (vel_ptr, vel), (sw_ptr, sw)):
+        if m is not None and p_:
+            codes = np.ascontiguousarray(m[0]).astype(np.uint8)
+            arr[:, d + p_:d + p_ + codes.shape[1]] = codes
+    return arr
+
+
+def encode_volume_legacy(icao: str, lat: float, lon: float, height_m: float, vcp: int,
+                         start_ms: int, sweeps: list) -> bytes:
+    """A legacy WSR-88D's volume ("AR2V0001.", message-1 radials, 120 per bzip2 record), from sweeps as
+    encode_volume takes them, plus each sweep's "ref_first" / "ref_gate" (its 1 km reflectivity gates).  Message 1
+    carries no site position: viewers place the radar from their own site lists (GR2Analyst does)."""
+    shift = l2_shift_ms(int(start_ms))
+    if shift:
+        start_ms = int(start_ms) + shift
+        sweeps = [dict(s, start_ms=int(s["start_ms"]) + shift) for s in sweeps]
+    cuts = [s["cut"] for s in sweeps]
+    one = any(s["moments"].get("VEL", (None,) * 5)[3] == 1.0 for s in sweeps)
+    records = [_metadata(cuts, vcp, start_ms, 4 if one else 2, legacy=True)]
+    seq = 10
+    for e, s in enumerate(sweeps):
+        arr = _radials_m1(s, e + 1, len(sweeps), seq, vcp)
+        seq += arr.shape[0]
+        for i in range(0, arr.shape[0], 120):
+            records.append(arr[i:i + 120].tobytes())
+    jd, ms = _mjd(start_ms)
+    out = [b"AR2V0001.001" + struct.pack(">ii", jd, ms) + icao.encode("ascii")[:4].ljust(4, b" ")]
+    comp = list(_POOL.map(lambda r: bz2.compress(r, 5), records))
+    for i, c in enumerate(comp):
+        out.append(struct.pack(">i", -len(c) if i == len(comp) - 1 else len(c)))
+        out.append(c)
+    return b"".join(out)
+
+
+def archive_name(icao: str, epoch_ms: int, legacy: bool = False) -> str:
+    """The archive's file name: ..._V06 (message 31), ..._V03 (a legacy radar's message 1, as NCEI names them)."""
     t = utc(int(epoch_ms) + l2_shift_ms(int(epoch_ms)))
-    return "%s%s_V06" % (icao.upper(), t.strftime("%Y%m%d_%H%M%S"))
+    return "%s%s_%s" % (icao.upper(), t.strftime("%Y%m%d_%H%M%S"), "V03" if legacy else "V06")
 
 
 def _shift_date(buf, off_jd, off_ms, shift_ms, jd_fmt):
@@ -289,12 +396,18 @@ def retime(data: bytes, end_ms: int) -> bytes:
         if n < 0:
             break
     raw = [bytearray(r) for r in _POOL.map(bz2.decompress, recs)]
-    radials, segments = [], []                  # offsets of message-31 and fixed-size messages
+    radials, segments, m1 = [], [], []          # offsets of message-31, fixed-size and message-1 messages
     last = None
     for k, rec in enumerate(raw):
         p = 0
         while p + 28 <= len(rec):
             size_hw, _, mtype = struct.unpack_from(">HBB", rec, p + 12)
+            if mtype == 1:                        # a legacy radial: its own time in its data header too
+                m1.append((k, p))
+                (ms,) = struct.unpack_from(">I", rec, p + 28)
+                (jd,) = struct.unpack_from(">H", rec, p + 32)
+                t = (jd - 1) * 86400000 + ms
+                last = t if last is None else max(last, t)
             if mtype != 31:
                 if mtype:
                     segments.append((k, p))
@@ -313,6 +426,8 @@ def retime(data: bytes, end_ms: int) -> bytes:
     for k, p in radials:
         _shift_date(raw[k], p + 18, p + 20, shift, ">H")
         _shift_date(raw[k], p + 28 + 8, p + 28 + 4, shift, ">H")
+    for k, p in m1:
+        _shift_date(raw[k], p + 28 + 4, p + 28, shift, ">H")
     hdr = bytearray(data[:24])
     _shift_date(hdr, 12, 16, shift, ">i")
     comp = list(_POOL.map(lambda r: bz2.compress(bytes(r), 5), raw))
@@ -356,6 +471,8 @@ def read_volume(data: bytes) -> dict:
         p = 0
         while p + 28 <= len(rec):
             size_hw, chan, mtype = struct.unpack(">HBB", rec[p + 12:p + 16])
+            if mtype == 1:
+                _read_m1(rec, p, sweeps)
             if mtype != 31:
                 p += SEG
                 continue
@@ -387,6 +504,32 @@ def read_volume(data: bytes) -> dict:
                 sw.setdefault("gates", {})[mname] = (first, gate)        # first gate and spacing (m)
             p += 12 + 2 * size_hw
     for sw in sweeps.values():
+        if "m1" in sw:                          # legacy radials: each moment's gates padded to the longest
+            for mname, rows in sw.pop("m1").items():
+                n = max(len(r) for r in rows)
+                sw["moments"][mname] = [np.pad(r, (0, n - len(r)), constant_values=np.nan) for r in rows]
         sw["az"] = np.array(sw["az"])
         sw["moments"] = {k: np.array(v) for k, v in sw["moments"].items()}
     return {"icao": icao, "vcp": vcp, "ncuts": ncuts, "sweeps": sweeps}
+
+
+def _read_m1(rec, p, sweeps) -> None:
+    """One legacy (message 1) radial at ``p`` into ``sweeps`` (read_volume's)."""
+    d = p + 28
+    az_c, _, _, el_c, elnum, sur_first, dop_first, sur_gate, dop_gate, n_sur, n_dop = struct.unpack(
+        ">HHHHHhhHHHH", rec[d + 8:d + 30])
+    sur_ptr, vel_ptr, sw_ptr, vres = struct.unpack(">HHHH", rec[d + 36:d + 44])
+    (nyq,) = struct.unpack(">h", rec[d + 60:d + 62])
+    sw = sweeps.setdefault(elnum, {"elev": (el_c >> 3) * 180.0 / 4096.0, "az": [], "moments": {}, "m1": {}})
+    sw["az"].append((az_c >> 3) * 180.0 / 4096.0)
+    sw["nyquist"] = nyq / 100.0
+    rows = sw.setdefault("m1", {})
+    for name, ptr, n, first, gate, scale in (("REF", sur_ptr, n_sur, sur_first, sur_gate, 2.0),
+                                             ("VEL", vel_ptr, n_dop, dop_first, dop_gate, 1.0 if vres == 4 else 2.0),
+                                             ("SW", sw_ptr, n_dop, dop_first, dop_gate, 2.0)):
+        if not ptr or not n:
+            continue
+        g = np.frombuffer(rec[d + ptr:d + ptr + n], dtype=np.uint8)
+        off = 66.0 if name == "REF" else 129.0
+        rows.setdefault(name, []).append(np.where(g >= 2, (g.astype(np.float32) - off) / scale, np.nan))
+        sw.setdefault("gates", {})[name] = (first, gate)

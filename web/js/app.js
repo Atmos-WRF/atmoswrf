@@ -1244,7 +1244,9 @@ async function onMapClick(x, y) {
     const want = +$('radarKind').value;
     for (const s of S.sites) { const d = Math.hypot(s.x - x, s.y - y); if (d < bd && siteOfKind(s, want)) { bd = d; best = s; } }
     if (!best || bd > 150) { alert(`No ${want === 3 ? 'TDWR' : want === 4 ? 'international radar' : 'WSR-88D'} within 150 km of that point.`); return; }
-    const r = { icao: best.icao, kind: want === 3 ? 'tdwr' : best.type === 5 ? 'cband' : 'wsr88d', vcp: +$('radarVcp').value, sails: +$('radarSails').value,
+    const legacy = $('radarEra').value === 'legacy' && want === 1;        // a 1990s WSR-88D (radar.LEGACY_VCPS)
+    const r = { icao: best.icao, kind: want === 3 ? 'tdwr' : best.type === 5 ? 'cband' : legacy ? 'legacy' : 'wsr88d',
+      vcp: +$('radarVcp').value, sails: legacy ? 0 : +$('radarSails').value,
       dealias: $('radarDealias').checked, volume_min: +$('radarVolume').value, floor: +$('radarFloor').value,
       noise: $('radarNoise').checked, clear_air: Math.max(0, Math.min(3, +$('radarClearAir').value || 0)), export: true };
     if (runActive()) await api('/api/run/radar', r);
@@ -1430,13 +1432,24 @@ async function deployDow(x, y) {
 }
 
 // ------------------------------------------------------------------ lists / log
+// the Radar tab's era: a 1990s WSR-88D scans VCP 11 or 21 without SAILS (TDWRs and international radars have none)
+function radarEraUI() {
+  const wsr = $('radarKind').value === '1', legacy = wsr && $('radarEra').value === 'legacy';
+  $('radarEra').disabled = !wsr;
+  const vcps = legacy ? [[11, '11 (severe, 5 min)'], [21, '21 (6 min)']] : [[212, '212'], [12, '12'], [215, '215'], [35, '35']];
+  const sel = $('radarVcp'), was = +sel.value;
+  sel.innerHTML = vcps.map(([v, t]) => `<option value="${v}">${t}</option>`).join('');
+  if (vcps.some(([v]) => v === was)) sel.value = was;
+  $('radarSails').disabled = legacy;
+}
+
 function renderLists() {
   const run = runActive() ? S.run : null;
   const radars = run ? run.radars : S.setup.radars;
   const every = r => { const m = r.volume_min ?? 2.5; return m > 0 ? ` · every ${m < 1 ? Math.round(m * 60) + ' s' : m + ' min'}` : ''; };
   setHTML('radarList', radars.map(r => `<div class="item"><div><b>${r.icao}</b> <span class="meta">` +
     (r.kind === 'dow' ? `DOW, X band, ${r.gate || 75} m gates at ${(+r.lat).toFixed(3)}, ${(+r.lon).toFixed(3)}`
-      : `VCP ${r.vcp}${r.sails ? ' SAILS×' + r.sails : ''}${every(r)}`) +
+      : `${r.kind === 'legacy' ? '1990s, ' : ''}VCP ${r.vcp}${r.sails && r.kind !== 'legacy' ? ' SAILS×' + r.sails : ''}${every(r)}`) +
     `${r.dealias === false ? ' · aliased' : ''}` +
     `${r.noise === false ? ' · clean' : ''}` +
     `${r.volumes !== undefined ? ' · ' + r.volumes + ' volumes' : ''}</span></div>` +
@@ -1716,7 +1729,9 @@ function bindUI() {
     try { gr2Note(await getJSON('/api/gr2/sites', { install: true })); }
     catch (e) { $('gr2SitesNote').textContent = 'Could not add them: ' + e.message; }
   };
-  $('radarKind').onchange = () => { $('radarDealias').checked = $('radarKind').value !== '3'; map.redraw(); };
+  $('radarKind').onchange = () => { $('radarDealias').checked = $('radarKind').value !== '3'; radarEraUI(); map.redraw(); };
+  $('radarEra').onchange = radarEraUI;
+  radarEraUI();
   $('rpSlider').oninput = () => { S.live = false; $('rpLive').classList.remove('on'); S.frameIdx = +$('rpSlider').value; showFrame(); };
   $('rpPrev').onclick = () => step(-1);
   $('rpNext').onclick = () => step(1);

@@ -166,11 +166,17 @@ def make(run_dir, site: str, product: str, tilt: float, first: str | None, last:
     frames = []
     for n, name in enumerate(names):
         v = level2.read_volume((run_dir / site / name).read_bytes())
-        sw = min(v["sweeps"].values(), key=lambda s: abs(float(s["elev"]) - tilt))
+        # the tilt nearest the one asked for that holds the moment (a split cut's surveillance sweep has no
+        # velocity, its Doppler sweep -- on a 1990s radar -- no reflectivity)
+        sws = [s for s in v["sweeps"].values() if mom in s["moments"]] or list(v["sweeps"].values())
+        sw = min(sws, key=lambda s: abs(float(s["elev"]) - tilt))
         a = sw["moments"].get(mom)
         img = np.zeros((H, W, 3), np.uint8)
         img[:] = BG
-        slat, slon = sw.get("site", (settings["map"]["lat0"], settings["map"]["lon0"]))
+        # where the radar is: the volume says (message 31), else the run's radar list (a 1990s radar's message 1
+        # radials carry no position), else the map's centre
+        here = next(((float(r["lat"]), float(r["lon"])) for r in st.get("radars") or [] if r.get("icao") == site), None)
+        slat, slon = sw.get("site") or here or (settings["map"]["lat0"], settings["map"]["lon0"])
         if a is not None:
             first_g, gate = sw.get("gates", {}).get(mom, (2125, 250))
             la0, lo0 = math.radians(slat), math.radians(slon)

@@ -1058,9 +1058,12 @@ class Simulation:
         tdwr = (site is not None and site.get("type") == 3) or kw.get("kind") == "tdwr"
         # an international site (data/radars.csv type 4 = S band, run as a WSR-88D; 5 = C band)
         cband = not tdwr and ((site is not None and site.get("type") == 5) or kw.get("kind") == "cband")
+        # a 1990s WSR-88D (radar.LEGACY_VCPS): a WSR-88D site only
+        legacy = kw.get("kind") == "legacy" and not tdwr and not cband
         r = rd.Radar(icao=icao, lat=lat, lon=lon,
-                     elev_m=float(self.sounding.zsfc) + 20.0, kind="tdwr" if tdwr else "cband" if cband else "wsr88d",
-                     vcp=int(kw.get("vcp", 212)), sails=int(kw.get("sails", 1)),
+                     elev_m=float(self.sounding.zsfc) + 20.0,
+                     kind="tdwr" if tdwr else "cband" if cband else "legacy" if legacy else "wsr88d",
+                     vcp=int(kw.get("vcp", 11 if legacy else 212)), sails=int(kw.get("sails", 1)),
                      alias=not bool(kw.get("dealias", not tdwr)), volume_s=60.0 * float(kw.get("volume_min", 2.5)),
                      floor_dbz=float(kw.get("floor", -5.0)), noise=bool(kw.get("noise", True)),
                      clear_air=max(0.0, min(3.0, float(kw.get("clear_air", 1.0)))),
@@ -2259,7 +2262,10 @@ class Simulation:
                 rd.range_fold(r, cut, data)             # distant echoes overlaying a Doppler cut: RF
                 enc = rd.encode(r, cut, data)
                 r.vol_sweeps.append({"cut": cut, "nrad": cut.nrad, "start_ms": start_ms,
-                                     "first_gate": cut.first, "gate": cut.gate,
+                                     "first_gate": rd.LEGACY_DOP_FIRST if r.kind == "legacy" else cut.first,
+                                     "gate": cut.gate,
+                                     "ref_first": rd.LEGACY_REF_FIRST if r.kind == "legacy" else cut.first,
+                                     "ref_gate": cut.gate * (rd.LEGACY_REF_GATES if r.kind == "legacy" else 1),
                                      "dur_ms": cut.seconds * 1000.0, "az0": 0.0, "moments": enc,
                                      "nyquist": r.nyquist(cut)})
                 # display: the lowest tilt of each kind
@@ -2275,7 +2281,7 @@ class Simulation:
                 if r.export and sweeps:
                     self._l2_pending += 1
                     self._l2_pool.submit(self._write_volume, r.icao, r.lat, r.lon, r.elev_m, r.vcp,
-                                         vol_ms, sweeps)
+                                         vol_ms, sweeps, r.kind == "legacy")
                 r.volumes_written += 1
 
     def _radar_towns(self, r):
@@ -2398,8 +2404,12 @@ class Simulation:
                 "nrad": cut.nrad, "first": cut.first, "gate": cut.gate, "t_ms": start_ms, "kind": r.kind,
                 "conv": float(self.proj.convergence(r.lon))}
         if cut.kind in ("surv", "both"):
-            code = cp.where(has, cp.clip(cp.rint(data["REF"] * 2 + 66), 2, 255), 0).astype(cp.uint8)
-            disp["REF"] = (dict(meta, ngate=ng, scale=2.0, offset=66.0), cp.asnumpy(code))
+            ref, rh, rmeta = data["REF"], has, dict(meta, ngate=ng)
+            if r.kind == "legacy":                        # a 1990s radar: 1 km reflectivity gates
+                ref, rh = rd.legacy_ref(ref[:, :ng], has[:, :ng])
+                rmeta = dict(meta, ngate=ref.shape[1], first=rd.LEGACY_REF_FIRST, gate=cut.gate * rd.LEGACY_REF_GATES)
+            code = cp.where(rh, cp.clip(cp.rint(ref * 2 + 66), 2, 255), 0).astype(cp.uint8)
+            disp["REF"] = (dict(rmeta, scale=2.0, offset=66.0), cp.asnumpy(code))
             for m in (("ZDR", "RHO") if r.dualpol else ()):
                 sc, off, bits = rd.MOMENTS[m]
                 nd = min(ng, rd.DOP_NGATES)
@@ -2427,10 +2437,13 @@ class Simulation:
             code = cp.where(rf, 1, cp.where(h, cp.clip(cp.rint(sw * 2 + 129), 2, 255), 0)).astype(cp.uint8)
             disp["SW"] = (dict(meta, ngate=nd, scale=2.0, offset=129.0), cp.asnumpy(code))
 
-    def _write_volume(self, icao, lat, lon, elev, vcp, vol_ms, sweeps):
+    def _write_volume(self, icao, lat, lon, elev, vcp, vol_ms, sweeps, legacy=False):
         try:
-            data = level2.encode_volume(icao, lat, lon, elev, vcp, vol_ms, sweeps)
-            name = level2.archive_name(icao, vol_ms)
+            if legacy:                    # a 1990s WSR-88D: message type 1 radials, as archived then
+                data = level2.encode_volume_legacy(icao, lat, lon, elev, vcp, vol_ms, sweeps)
+            else:
+                data = level2.encode_volume(icao, lat, lon, elev, vcp, vol_ms, sweeps)
+            name = level2.archive_name(icao, vol_ms, legacy)
             d = self.run_dir / icao
             d.mkdir(parents=True, exist_ok=True)
             part = d / f".{name}.part"          # whole volumes only: polling lists names starting with the site

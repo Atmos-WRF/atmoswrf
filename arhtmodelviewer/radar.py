@@ -169,7 +169,62 @@ def _dow_cuts(gate: float = 75.0) -> list[Cut]:
                 radials=720, wavelength=DOW_LAMBDA, unamb=75000.0) for e in DOW_TILTS]
 
 
+# The legacy WSR-88D (the 1990s to 2008, before super-resolution (Build 10, 2008) and dual polarization (2011-13)):
+# 1-degree radials everywhere, reflectivity in 1 km gates to 460 km and velocity / spectrum width in 250 m gates to
+# 230 km, no dual pol, and the old precipitation VCPs -- 11 (14 tilts in 5 min, for severe storms) and 21 (9 tilts in
+# 6 min) -- whose two lowest tilts are split (a low-PRF surveillance sweep for reflectivity, then a high-PRF Doppler
+# sweep for velocity).  Level II of the time: message type 1 radials (level2.encode_volume_legacy).
+LEGACY_VCPS = (11, 21)
+LEGACY_REF_GATES = 4             # 250 m samples averaged into each 1 km reflectivity gate
+LEGACY_N_DOP = 920               # 250 m Doppler gates: to ~230 km
+# as the legacy RDAs laid their gates out (checked on KTLX 1999-05-03 and 2005-05-12 archives): reflectivity's first
+# gate centred at 0 m (460 x 1 km), the Doppler moments' at -375 m (920 x 250 m) -- the gates nearer than the
+# model's first (REF_FIRST, 2125 m) are written empty
+LEGACY_REF_FIRST, LEGACY_REF_N = 0.0, 460
+LEGACY_DOP_FIRST = -375.0
+
+
+def _legacy_cuts(number: int) -> list[Cut]:
+    def c(e, kind, s, nyq):
+        return Cut(e, kind, s, nyq, False, n_dop=LEGACY_N_DOP, radials=360)
+
+    if number == 21:
+        cuts = ([c(0.5, "surv", 34.0, 8.9), c(0.5, "dop", 30.0, 22.9), c(1.45, "surv", 34.0, 8.9),
+                 c(1.45, "dop", 30.0, 22.9)]
+                + [c(e, "both", 33.0, 22.9) for e in (2.4, 3.35, 4.3, 6.0)]
+                + [c(e, "both", 36.0, 32.9) for e in (9.9, 14.6, 19.5)])
+    else:
+        cuts = ([c(0.5, "surv", 17.0, 8.9), c(0.5, "dop", 18.0, 27.1), c(1.45, "surv", 17.0, 8.9),
+                 c(1.45, "dop", 18.0, 27.1)]
+                + [c(e, "both", 20.0, 26.4) for e in (2.4, 3.35, 4.3, 5.25, 6.2)]
+                + [c(e, "both", 18.6, 34.3) for e in (7.5, 8.7, 10.0, 12.0, 14.0, 16.7, 19.5)])
+    return cuts
+
+
+def legacy_ref(dbz, has):
+    """Reflectivity in 1 km gates the way a legacy RDA made it -- the mean (linear Z) of the 4 x 250 m samples in
+    each that hold echo (at least 2 of them) -- on its gates (LEGACY_REF_FIRST, LEGACY_REF_N): (dbz, has)."""
+    import cupy as cp
+    n, ng = dbz.shape
+    k = LEGACY_REF_GATES
+    g = 1000.0 * k / 4.0
+    # the first whole 1 km gate whose samples (REF_FIRST + 250 i) all lie inside it, and the samples it starts at
+    k0 = int(math.ceil((REF_FIRST - REF_GATE / 2 + g / 2 - LEGACY_REF_FIRST) / g))
+    s0 = int(round((LEGACY_REF_FIRST + k0 * g - g / 2 + REF_GATE / 2 - REF_FIRST) / REF_GATE))
+    m = min((ng - s0) // k, LEGACY_REF_N - k0)
+    h = has[:, s0:s0 + m * k].reshape(n, m, k)
+    z = cp.where(h, 10.0 ** (0.1 * dbz[:, s0:s0 + m * k].reshape(n, m, k)), 0.0).sum(axis=2)
+    cnt = h.sum(axis=2)
+    out = cp.full((n, k0 + m), -99.0, cp.float32)
+    ok = cp.zeros((n, k0 + m), bool)
+    out[:, k0:] = 10.0 * cp.log10(cp.maximum(z / cp.maximum(cnt, 1), 1e-10))
+    ok[:, k0:] = cnt >= 2
+    return out, ok
+
+
 VCP_INFO = {
+    11: "VCP 11 (1990s) - severe weather, 14 tilts in 5 min",
+    21: "VCP 21 (1990s) - precipitation, 9 tilts in 6 min",
     212: "VCP 212 - precipitation, 14 tilts (SAILS-capable)",
     12: "VCP 12 - precipitation, 14 tilts",
     215: "VCP 215 - general precipitation, 15 tilts",
@@ -222,6 +277,10 @@ class Radar:
             self.sens_50km = 5.0                          # -5 dBZ at 15 km
             self.volume_s = 0.0
             cuts = _dow_cuts(self.gate_m)
+        elif self.kind == "legacy":
+            self.vcp = self.vcp if self.vcp in LEGACY_VCPS else 11
+            self.sails = 0
+            cuts = _legacy_cuts(self.vcp)
         else:
             cuts = _vcp_cuts(self.vcp, self.sails if self.vcp in (212, 215) else 0)
             if self.kind == "cband":
@@ -240,7 +299,7 @@ class Radar:
 
     @property
     def dualpol(self) -> bool:
-        return self.kind != "tdwr"
+        return self.kind not in ("tdwr", "legacy")
 
     @property
     def volume_seconds(self) -> float:
@@ -2549,6 +2608,9 @@ def encode(radar: Radar, cut: Cut, data: dict) -> dict:
         names = ["REF", "VEL", "SW", "ZDR", "PHI", "RHO"]
     if not radar.dualpol:
         names = [m for m in names if m in ("REF", "VEL", "SW")]
+    legacy = radar.kind == "legacy"
+    if legacy and cut.kind == "dop":                # a legacy split cut's Doppler sweep: velocity only
+        names = ["VEL", "SW"]
     rf = data.get("_rf")
     out = {}
     for m in names:
@@ -2557,6 +2619,18 @@ def encode(radar: Radar, cut: Cut, data: dict) -> dict:
         ng = ngate if m == "REF" else (min(ngate, cut.n_dop) if m in ("VEL", "SW") else min(ngate, DOP_NGATES))
         v = val[:, :ng]
         h = has[:, :ng]
+        rfm = rf[:, :ng] if rf is not None else None
+        if legacy and m == "REF":                   # 1 km gates (legacy_ref)
+            v, h = legacy_ref(v, h)
+            ng = v.shape[1]
+        if legacy and m in ("VEL", "SW"):           # from -375 m (LEGACY_DOP_FIRST): empty gates in front
+            pad = int(round((REF_FIRST - LEGACY_DOP_FIRST) / REF_GATE))
+            keep = min(ng, LEGACY_N_DOP - pad)
+            v = cp.concatenate([cp.zeros((v.shape[0], pad), v.dtype), v[:, :keep]], axis=1)
+            h = cp.concatenate([cp.zeros((h.shape[0], pad), bool), h[:, :keep]], axis=1)
+            if rfm is not None:
+                rfm = cp.concatenate([cp.zeros((rfm.shape[0], pad), bool), rfm[:, :keep]], axis=1)
+            ng = pad + keep
         if m == "VEL" and radar.alias:
             vn = cut.nyquist
             v = cp.mod(v + vn, 2.0 * vn) - vn
@@ -2568,8 +2642,8 @@ def encode(radar: Radar, cut: Cut, data: dict) -> dict:
         hi = 255 if bits == 8 else 1023
         code = cp.clip(cp.rint(v * scale + offset), 2, hi)
         code = cp.where(h, code, 0)
-        if rf is not None and m in ("VEL", "SW"):
-            code = cp.where(rf[:, :ng], 1, code)             # range folded: Level II's RF code
+        if rfm is not None and m in ("VEL", "SW"):
+            code = cp.where(rfm[:, :ng], 1, code)            # range folded: Level II's RF code
         arr = code.astype(cp.uint16 if bits == 16 else cp.uint8)
         host = cp.asnumpy(arr)
         if bits == 16:

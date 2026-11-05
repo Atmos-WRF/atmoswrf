@@ -24,11 +24,16 @@ FINE_Z = (5, 12, 20, 30, 45, 60, 80, 105, 135, 170, 210, 260, 320, 400, 500, 620
 STORM_SIDE = 128                 # points along the storm box's side at most
 STORM_RES_MIN = 250.0            # m
 FINE_SIDE = 160
+# the cloud volumes for drawing (even levels, so the mod can use them as 3-D textures as they are)
+CLOUD3D_DZ, CLOUD3D_NZ = 250.0, 60        # storm box: ground to 15 km
+FINE3D_DZ, FINE3D_NZ = 50.0, 32           # tornado box: ground to 1.6 km (the lowering and the funnel)
 TORNADO_MS = 29.0                # ground wind (m/s) that counts as the tornado's, for its width
 # field: (dtype, scale, offset); dtype codes "i1" "u1" "i2"
 CODES = {
     "storm": {"u": ("i1", 1.0, 0.0), "v": ("i1", 1.0, 0.0), "w": ("i1", 2.0, 0.0),
               "dbz": ("u1", 2.0, 66.0), "cloud": ("u1", 40.0, 121.0), "precip": ("u1", 40.0, 121.0)},
+    "cloud3d": {"cloud": ("u1", 40.0, 121.0), "precip": ("u1", 40.0, 121.0)},
+    "fine3d": {"cloud": ("u1", 40.0, 121.0)},
     "fine": {"u": ("i2", 50.0, 0.0), "v": ("i2", 50.0, 0.0), "w": ("i2", 50.0, 0.0),
              "pp": ("i2", 100.0, 0.0), "cloud": ("u1", 40.0, 121.0)},
 }
@@ -171,8 +176,10 @@ def pick(tg: dict):
     return None
 
 
-def frame(sim, cx=None, cy=None, storm_km: float = 40.0, fine_km: float = 3.0, fine: bool = True) -> bytes | None:
-    """One frame of the feed around (cx, cy) (world m; None: pick()), or None with no storm patch there."""
+def frame(sim, cx=None, cy=None, storm_km: float = 40.0, fine_km: float = 3.0, fine: bool = True,
+          cloud: bool = True) -> bytes | None:
+    """One frame of the feed around (cx, cy) (world m; None: pick()), or None with no storm patch there.  ``cloud``:
+    also the cloud volumes for drawing ("cloud3d", "fine3d": the storm's and the tornado box's grids, even levels)."""
     eng = sim.engine
     patches = list(eng.patches) + list(eng.nest_patches())
     tg = targets(sim)
@@ -196,6 +203,12 @@ def frame(sim, cx=None, cy=None, storm_km: float = 40.0, fine_km: float = 3.0, f
                   "fields": [[n] + list(CODES["storm"][n]) for n in names]})
     blobs += [_encode("storm", n, got[n], shape) for n in names]
     tor = _tornado(X, Y, step, got["u"], got["v"])
+    if cloud:
+        zc = (np.arange(CLOUD3D_NZ) + 0.5) * CLOUD3D_DZ
+        gc = sample(patches, X, Y, zc, ("cloud", "precip"))
+        grids.append({"name": "cloud3d", "box": box, "nx": X.shape[1], "ny": X.shape[0], "dx": step,
+                      "z": [float(z) for z in zc], "fields": [[n] + list(CODES["cloud3d"][n]) for n in ("cloud", "precip")]})
+        blobs += [_encode("cloud3d", n, gc[n], (CLOUD3D_NZ,) + X.shape) for n in ("cloud", "precip")]
     if fine:
         dxf = min((p.env.grid.dx for p in patches if p.state is not None
                    and p.world_x0() <= cx <= p.world_x0() + p.rect.nx * p.env.grid.dx
@@ -211,6 +224,12 @@ def frame(sim, cx=None, cy=None, storm_km: float = 40.0, fine_km: float = 3.0, f
                           "z": list(FINE_Z), "model_dx": dxf,
                           "fields": [[n] + list(CODES["fine"][n]) for n in fnames]})
             blobs += [_encode("fine", n, gf[n], shp) for n in fnames]
+            if cloud:
+                zc = (np.arange(FINE3D_NZ) + 0.5) * FINE3D_DZ
+                gc = sample(patches, Xf, Yf, zc, ("cloud",))
+                grids.append({"name": "fine3d", "box": boxf, "nx": Xf.shape[1], "ny": Xf.shape[0], "dx": stepf,
+                              "z": [float(z) for z in zc], "fields": [["cloud"] + list(CODES["fine3d"]["cloud"])]})
+                blobs.append(_encode("fine3d", "cloud", gc["cloud"], (FINE3D_NZ,) + Xf.shape))
             tor = _tornado(Xf, Yf, stepf, gf["u"], gf["v"]) or tor
     motion = (0.0, 0.0)
     near = min(tg["patches"], key=lambda d: math.hypot(d["x"] - cx, d["y"] - cy), default=None)

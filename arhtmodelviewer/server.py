@@ -801,7 +801,7 @@ class Handler(BaseHTTPRequestHandler):
         if since is not None and sim.engine.t <= since:
             return self._send(204, b"", "application/octet-stream")
         with sim.lock:
-            blob = pmw.frame(sim, cx, cy, storm_km, fine_km, q.get("fine", "1") != "0")
+            blob = pmw.frame(sim, cx, cy, storm_km, fine_km, q.get("fine", "1") != "0", q.get("cloud", "1") != "0")
         if blob is None:
             return self._error(404, "no storm patch there")
         return self._send(200, zlib.compress(blob, 1), "application/octet-stream", encoding="deflate")

@@ -438,6 +438,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._ppi(q)
             if path == "/api/volume":
                 return self._volume(q)
+            if path in ("/api/pmw/frame", "/api/pmw/targets"):
+                return self._pmw(path, q)
             if path == "/api/volume/times":
                 # the 3-D replay's snapshots (volume.snapshot): model times (s), and the radar frames' clock
                 from . import volume
@@ -775,6 +777,34 @@ class Handler(BaseHTTPRequestHandler):
         if blob is None:
             return self._error(404, "no storm patch in that box")
         self._send(200, zlib.compress(blob, 1), "application/octet-stream", encoding="deflate")
+
+    def _pmw(self, path, q):
+        """The PMWeather addon's live feed (pmw.py): targets as JSON, or a frame around x, y (m; none: the tornado
+        zoom, else a tornado, else a storm) with a storm box storm_km and a fine box fine_km a side.  since=t
+        (model s): 204 until the model has moved on past t."""
+        from . import pmw
+        sim = APP.sim
+        if sim is None or sim.engine is None:
+            return self._error(404, "no run")
+        if path == "/api/pmw/targets":
+            with sim.lock:
+                d = pmw.targets(sim)
+            return self._json(d)
+        try:
+            since = float(q["since"]) if q.get("since") not in (None, "") else None
+            cx = float(q["x"]) if q.get("x") not in (None, "") else None
+            cy = float(q["y"]) if q.get("y") not in (None, "") else None
+            storm_km = float(q.get("storm_km", 40))
+            fine_km = float(q.get("fine_km", 3))
+        except ValueError:
+            return self._error(400, "x, y (m), storm_km, fine_km, since must be numbers")
+        if since is not None and sim.engine.t <= since:
+            return self._send(204, b"", "application/octet-stream")
+        with sim.lock:
+            blob = pmw.frame(sim, cx, cy, storm_km, fine_km, q.get("fine", "1") != "0")
+        if blob is None:
+            return self._error(404, "no storm patch there")
+        return self._send(200, zlib.compress(blob, 1), "application/octet-stream", encoding="deflate")
 
     def _tornado_paths(self):
         """The tornado zoom's track and its parcels' paths (tornado.py): x, y, z m triples per path."""

@@ -769,7 +769,8 @@ class Handler(BaseHTTPRequestHandler):
         except (KeyError, ValueError):
             return self._error(400, "x0, y0, x1, y1 (km) needed")
         with sim.lock:
-            patches = {p.id: p for p in sim.engine.patches} if sim.engine is not None else {}
+            patches = ({p.id: p for p in sim.engine.patches + sim.engine.nest_patches()}
+                       if sim.engine is not None else {})
             blob = volume.extract(fields, box, q.get("field", "dbz"), patches)
         if blob is None:
             return self._error(404, "no storm patch in that box")

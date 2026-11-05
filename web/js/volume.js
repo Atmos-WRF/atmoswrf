@@ -36,6 +36,7 @@ const Vol = (() => {
   const cam = { ...CAM0, fp: null, speed: 1 };
   const EYE_KM = 0.002;
   let noiseTex = null, gMap = null;
+  const insTex = [];                               // the nests' volumes (volume.py insets)
   let lightProg = null, lightTex = null, lightFbo = null, lightKey = '';   // the cloud view's light volume                 // the cloud's detail noise; the ground under the box (km)
   // the cloud view's frames, jittered and averaged while the view is still (half size, no smoothing while it moves)
   const ACC_MAX = 16;
@@ -132,7 +133,26 @@ const Vol = (() => {
     for (int k = 0; k < 8; k++) { float tm = 0.5 * (ta + tb); vec3 p = ro + rd * tm; if (p.z < gz(p.xy)) tb = tm; else ta = tm; }
     return tb;
   }
-  float val(vec3 p) { return texture(vol, vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z)).r * 255.0; }
+  // the nests (volume.py insets): up to four finer volumes, finest first, each over part of the box from the ground
+  // to its own top; a point inside one reads it, blended into the box's volume over its outer 8 %
+  uniform sampler3D ins0, ins1, ins2, ins3; uniform int insN; uniform vec4 insBox[4]; uniform float insTop[4];
+  float insW(vec3 p, int i, out vec3 u) {
+    vec4 b = insBox[i];
+    u = vec3((p.x - b.x) / (b.z - b.x), (p.y - b.y) / (b.w - b.y), p.z / insTop[i]);
+    if (any(lessThan(u, vec3(0.0))) || any(greaterThan(u, vec3(1.0)))) return 0.0;
+    vec2 e = min(u.xy, 1.0 - u.xy);
+    return clamp(min(min(e.x, e.y), 1.0 - u.z) / 0.08, 0.0, 1.0);
+  }
+  vec4 nested(vec3 p, vec4 base) {
+    if (insN == 0) return base;
+    vec3 u; float w = insW(p, 0, u);
+    if (w > 0.0) return mix(base, textureLod(ins0, u, 0.0), w);
+    if (insN > 1) { w = insW(p, 1, u); if (w > 0.0) return mix(base, textureLod(ins1, u, 0.0), w); }
+    if (insN > 2) { w = insW(p, 2, u); if (w > 0.0) return mix(base, textureLod(ins2, u, 0.0), w); }
+    if (insN > 3) { w = insW(p, 3, u); if (w > 0.0) return mix(base, textureLod(ins3, u, 0.0), w); }
+    return base;
+  }
+  float val(vec3 p) { return nested(p, texture(vol, vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z))).r * 255.0; }
   vec4 col(float code) { return texture(lut, vec2((code + 0.5) / 256.0, 0.5)); }
   bool inside(float c) { return c >= thrHi || (signedField == 1 && c > 0.5 && c <= thrLo); }
   vec3 normalAt(vec3 p) {
@@ -284,6 +304,25 @@ const Vol = (() => {
     for (int k = 0; k < 8; k++) { float tm = 0.5 * (ta + tb); vec3 p = ro + rd * tm; if (p.z < gz(p.xy)) tb = tm; else ta = tm; }
     return tb;
   }
+  // the nests (volume.py insets): up to four finer volumes, finest first, each over part of the box from the ground
+  // to its own top; a point inside one reads it, blended into the box's volume over its outer 8 %
+  uniform sampler3D ins0, ins1, ins2, ins3; uniform int insN; uniform vec4 insBox[4]; uniform float insTop[4];
+  float insW(vec3 p, int i, out vec3 u) {
+    vec4 b = insBox[i];
+    u = vec3((p.x - b.x) / (b.z - b.x), (p.y - b.y) / (b.w - b.y), p.z / insTop[i]);
+    if (any(lessThan(u, vec3(0.0))) || any(greaterThan(u, vec3(1.0)))) return 0.0;
+    vec2 e = min(u.xy, 1.0 - u.xy);
+    return clamp(min(min(e.x, e.y), 1.0 - u.z) / 0.08, 0.0, 1.0);
+  }
+  vec4 nested(vec3 p, vec4 base) {
+    if (insN == 0) return base;
+    vec3 u; float w = insW(p, 0, u);
+    if (w > 0.0) return mix(base, textureLod(ins0, u, 0.0), w);
+    if (insN > 1) { w = insW(p, 1, u); if (w > 0.0) return mix(base, textureLod(ins1, u, 0.0), w); }
+    if (insN > 2) { w = insW(p, 2, u); if (w > 0.0) return mix(base, textureLod(ins2, u, 0.0), w); }
+    if (insN > 3) { w = insW(p, 3, u); if (w > 0.0) return mix(base, textureLod(ins3, u, 0.0), w); }
+    return base;
+  }
   vec3 SUN;                                                   // the sunlight: warmer and dimmer as the sun gets low
   // smooth (C2) tricubic B-spline read from 8 trilinear ones (Sigg & Hadwiger 2005): no grid facets in the light
   vec2 cubic(vec3 uvw) {
@@ -317,7 +356,9 @@ const Vol = (() => {
       vec3 wv = vec3(texture(noiseTex, wq).rg, texture(noiseTex, wq.zxy + 0.41).r) - 0.5;
       uvw += wv * texel * 2.2 * detail;
     }
-    vec2 m = gkg(mode == 2 && quality > 0 ? cubic(uvw) : texture(vol, uvw).rg);
+    vec2 raw = mode == 2 && quality > 0 ? cubic(uvw) : texture(vol, uvw).rg;
+    if (insN > 0) raw = nested(vec3((uvw.x - 0.5) * size.x, (uvw.y - 0.5) * size.y, uvw.z * size.z), vec4(raw, 0.0, 0.0)).rg;
+    vec2 m = gkg(raw);
     vec2 s = vec2(25.0 * m.x, 1.2 * rain * m.y) * density;   // rain: the Rain slider (x the model's)
     vec2 e = min(uvw.xy, 1.0 - uvw.xy) / 0.03;                 // the box's sides fade: no walls of cloud
     s *= clamp(min(e.x, e.y), 0.0, 1.0);
@@ -522,6 +563,7 @@ const Vol = (() => {
     vao = gl.createVertexArray();
     volTex = gl.createTexture(); lutTex = gl.createTexture(); gndTex = gl.createTexture(); mapTex = gl.createTexture();
     noiseTex = makeNoise();
+    for (let i = 0; i < 4; i++) insTex.push(gl.createTexture());
     try { Land.init(gl, () => { if (head) draw(); }); } catch (e) { console.warn('3-D landscape:', e); }
     return true;
   }
@@ -666,12 +708,28 @@ const Vol = (() => {
                               [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
           gl.texParameteri(gl.TEXTURE_2D, k, v);
       }
+      // the nests at their own spacing, after the box's points and its ground
+      let off = data.byteOffset + header.nx * header.ny * header.nz * header.channels + (header.ground ? 2 * header.nx * header.ny : 0);
+      header.insets = (header.insets || []).slice(0, 4);
+      header.insets.forEach((ins, i) => {
+        const n = ins.nx * ins.ny * ins.nz * header.channels;
+        gl.bindTexture(gl.TEXTURE_3D, insTex[i]);
+        gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        gl.texImage3D(gl.TEXTURE_3D, 0, two ? gl.RG8 : gl.R8, ins.nx, ins.ny, ins.nz, 0, two ? gl.RG : gl.RED,
+                      gl.UNSIGNED_BYTE, new Uint8Array(data.buffer, off, n));
+        for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                              [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE],
+                              [gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_3D, k, v);
+        off += n;
+      });
       if (!two) await uploadLUT();
       await loadMap();
       const run = past ? `  ·  replay ${clock(header.t)}` : S.run && S.run.t !== undefined ? `  ·  model +${fmtDur(S.run.t)}` : '';
       $('volStatus').textContent = (tor ? `Tornado zoom (${Math.round(header.dx)} m grid) · ` : '') +
         `${(box[2] - box[0]).toFixed(tor ? 1 : 0)} × ${(box[3] - box[1]).toFixed(tor ? 1 : 0)} km, ` +
-        `${header.nx}×${header.ny}×${header.nz} points${run}`;
+        `${header.nx}×${header.ny}×${header.nz} points` +
+        (header.insets.length ? ` + ${header.insets.length} nest${header.insets.length > 1 ? 's' : ''} down to ` +
+          `${Math.round(Math.min(...header.insets.map(s => s.dx)))} m` : '') + run;
       if (key !== lastKey) lastKey = key;
       draw();
     } catch (e) {
@@ -767,6 +825,22 @@ const Vol = (() => {
   }
 
   const COMPASS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+
+  // the nests' volumes for either shader, their boxes in the view's units
+  function bindInsets(u, G) {
+    const ins = (head && head.insets) || [], cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
+    const B = new Float32Array(16), T = new Float32Array(4).fill(1);
+    ins.forEach((s, i) => {
+      B.set([(s.box[0] / 1000 - cx) * G.k, (s.box[1] / 1000 - cy) * G.k, (s.box[2] / 1000 - cx) * G.k, (s.box[3] / 1000 - cy) * G.k], 4 * i);
+      T[i] = s.ztop / 1000 * G.k * G.ex;
+    });
+    for (let i = 0; i < 4; i++) {
+      gl.activeTexture(gl.TEXTURE9 + i); gl.bindTexture(gl.TEXTURE_3D, i < ins.length ? insTex[i] : null);
+      gl.uniform1i(u('ins' + i), 9 + i);
+    }
+    gl.uniform1i(u('insN'), ins.length);
+    gl.uniform4fv(u('insBox'), B); gl.uniform1fv(u('insTop'), T);
+  }
 
   function bindGround(u) {
     gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, gndTex); gl.uniform1i(u('gnd'), 2);
@@ -876,6 +950,7 @@ const Vol = (() => {
     gl.uniform1f(u('rain'), rain);
     gl.uniform1f(u('relief'), +$('volRelief').value);
     gl.uniform3f(u('texel'), 1 / head.nx, 1 / head.ny, 1 / head.nz);
+    bindInsets(u, G);
     gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_3D, noiseTex); gl.uniform1i(u('noiseTex'), 4);
     gl.uniform1f(u('detail'), +$('volDetail').value);
     gl.uniform1f(u('detailKm'), Math.max(0.05, (box[2] - box[0]) / head.nx));
@@ -1002,6 +1077,7 @@ const Vol = (() => {
     gl.uniform3f(u('eye'), ...eye);
     gl.uniform3f(u('size'), G.sx, G.sy, G.sz);
     gl.uniform3f(u('texel'), 1 / head.nx, 1 / head.ny, 1 / head.nz);
+    bindInsets(u, G);
     // a low field (the pressure drop): only "at or below minus the threshold", through the signed path
     gl.uniform1f(u('thrHi'), F.low ? 999 : thr * head.scale + head.offset);
     gl.uniform1f(u('thrLo'), -thr * head.scale + head.offset);

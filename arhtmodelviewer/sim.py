@@ -2460,7 +2460,7 @@ class Simulation:
         if th is not None and th.is_alive():
             return
         try:
-            snap = volume.snapshot(fields_cache, {p.id: p for p in self.engine.patches})
+            snap = volume.snapshot(fields_cache, {p.id: p for p in self.engine.patches + self.engine.nest_patches()})
         except Exception as exc:              # the replay must never stop the run (out of memory included)
             if not getattr(self, "_vol_hist_failed", False):
                 self._vol_hist_failed = True

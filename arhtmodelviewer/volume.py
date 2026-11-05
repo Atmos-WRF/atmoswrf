@@ -23,6 +23,20 @@ FIELDS = {
     "pp": (2.0, 200.0, "hPa"),           # pressure perturbation (the tornado view): -99.5 .. 27.5 hPa
 }
 LIVE_NZ = 96                     # the tornado view's levels, ground to its top
+# nests in the ordinary view: up to INSET_MAX of the finest grids in the box ride along at their own spacing
+# (INSET_SIDE points a side at most), so a tornado zoom's 55 m grid is not smeared onto the box's ~500 m one
+INSET_MAX = 4
+INSET_SIDE = 160
+
+
+def levels_for(dx: float) -> tuple:
+    """(top m, levels) of a grid of spacing dx m in the 3-D view: the box's own levels for storm-scale grids,
+    finer ones low down for the fine nests (where the tornado and its funnel are)."""
+    if dx >= 400.0:
+        return ZTOP, NZ
+    if dx >= 150.0:
+        return 8000.0, 96
+    return 5000.0, 112
 CLOUD_SPECIES = ("qc", "qi", "qs")       # what the cloud is made of; the rest falls out of it
 PRECIP_SPECIES = ("qr", "qg", "qh")
 
@@ -62,6 +76,10 @@ def _sample(f, name: str, X, Y, zv, patch=None):
         a = f.wc
     elif name in ("cloud", "precip"):
         a = _species(patch, CLOUD_SPECIES if name == "cloud" else PRECIP_SPECIES) if patch is not None else None
+        if name == "cloud" and patch is not None and patch.env.grid.dx <= 200.0:
+            # a fine nest: the nearly saturated air of a vortex's pressure drop shows as cloud (the funnel)
+            ny_, nx_ = patch.state.p.shape[1:]
+            a = _near_saturation(patch, (0, ny_, 0, nx_), a)
         if a is None:
             return None
     else:
@@ -210,6 +228,60 @@ def extract_live(patches, box, name: str = "cloud", ztop: float = 6000.0) -> byt
     return struct.pack("<I", len(head)) + head + cp.asnumpy(data).tobytes()
 
 
+def _plan_insets(entries, box, res):
+    """The insets of the box: of ``entries`` [(key, x0, y0, x1, y1, dx) m], the finest (up to INSET_MAX) finer
+    than the box's spacing ``res`` that overlap it, finest first, each its overlap with the box at its own
+    spacing (or INSET_SIDE points a side): [(key, (x0, y0, x1, y1), spacing, nx, ny)]."""
+    x0, y0, x1, y1 = box
+    out = []
+    for key, a, b, c, d, dx in sorted(entries, key=lambda e: e[5]):
+        if dx >= 0.7 * res or a >= x1 or c <= x0 or b >= y1 or d <= y0:
+            continue
+        ib = (max(x0, a), max(y0, b), min(x1, c), min(y1, d))
+        w, h = ib[2] - ib[0], ib[3] - ib[1]
+        r = max(dx, max(w, h) / INSET_SIDE)
+        if r >= 0.7 * res or min(w, h) < 3 * r:
+            continue
+        out.append((key, ib, r, max(2, int(math.ceil(w / r))), max(2, int(math.ceil(h / r)))))
+        if len(out) >= INSET_MAX:
+            break
+    return out
+
+
+def _pack(name, head: dict, main: bytes, insets) -> bytes:
+    """Header (with the insets' boxes, sizes and levels) then the box's points, its ground, the insets' points."""
+    head["insets"] = [m for m, _ in insets]
+    hb = json.dumps(head).encode()
+    return struct.pack("<I", len(hb)) + hb + main + b"".join(d for _, d in insets)
+
+
+def _stack(codes):
+    import cupy as cp
+    return cp.asnumpy(cp.stack(codes, axis=-1) if len(codes) > 1 else codes[0]).tobytes()
+
+
+def _insets_live(fields, box, name, res, patches):
+    """The live insets (_plan_insets) from the radar fields of the nests (and their patches' cloud)."""
+    import cupy as cp
+    by = {f.patch_id: f for f in fields.values()}
+    ent = [(f.patch_id, f.x0, f.y0, f.x0 + f.nx * f.dx, f.y0 + f.ny * f.dx, f.dx) for f in fields.values()]
+    channels = ("cloud", "precip") if name == "cloud" else (name,)
+    out = []
+    for key, ib, r, nx, ny in _plan_insets(ent, box, res):
+        f = by[key]
+        ztop, nz = levels_for(f.dx)
+        xs = ib[0] + (np.arange(nx) + 0.5) * (ib[2] - ib[0]) / nx
+        ys = ib[1] + (np.arange(ny) + 0.5) * (ib[3] - ib[1]) / ny
+        X, Y = np.meshgrid(xs, ys)
+        zv = (np.arange(nz) + 0.5) * ztop / nz
+        codes = []
+        for ch in channels:
+            v = _sample(f, ch, X, Y, zv, (patches or {}).get(f.patch_id))
+            codes.append(_code(ch, v) if v is not None else cp.zeros((nz, ny, nx), cp.uint8))
+        out.append(({"box": list(ib), "nx": nx, "ny": ny, "nz": nz, "ztop": ztop, "dx": f.dx}, _stack(codes)))
+    return out
+
+
 def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None) -> bytes | None:
     """The volume of ``name`` in box (x0, y0, x1, y1, ground m) from the run's radar fields (and, for "cloud",
     ``patches``: the patches by id): a JSON header (dims, box, heights, scale, channels) then nz * ny * nx points
@@ -258,13 +330,12 @@ def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None) -
             code = cp.where(cp.isnan(b), 0, cp.clip(cp.rint(b * scale + offset), 1, 255))
         codes.append(code.astype(cp.uint8))
     data = cp.stack(codes, axis=-1) if len(codes) > 1 else codes[0]
-    head = json.dumps({"field": name, "units": units, "nx": nx, "ny": ny, "nz": NZ, "box": [x0, y0, x1, y1],
-                       "ztop": ZTOP, "scale": scale, "offset": offset, "channels": len(codes),
-                       "ground": gnd is not None}).encode()
-    out = struct.pack("<I", len(head)) + head + cp.asnumpy(data).tobytes()
+    head = {"field": name, "units": units, "nx": nx, "ny": ny, "nz": NZ, "box": [x0, y0, x1, y1],
+            "ztop": ZTOP, "scale": scale, "offset": offset, "channels": len(codes), "ground": gnd is not None}
+    main = cp.asnumpy(data).tobytes()
     if gnd is not None:          # then the ground under each point, uint16 m above the model's zero
-        out += cp.asnumpy(cp.clip(cp.rint(cp.nan_to_num(gnd, nan=0.0)), 0, 65535).astype(cp.uint16)).tobytes()
-    return out
+        main += cp.asnumpy(cp.clip(cp.rint(cp.nan_to_num(gnd, nan=0.0)), 0, 65535).astype(cp.uint16)).tobytes()
+    return _pack(name, head, main, _insets_live(fields, (x0, y0, x1, y1), name, res, patches))
 
 
 # ---------------------------------------------------------------- the history (the page's 3-D replay)
@@ -290,22 +361,24 @@ def _code(name, b):
 
 def snapshot(fields: dict, patches: dict | None = None) -> dict:
     """The volumes of every patch's radar fields (and, for the cloud, ``patches``' state) now, as numpy arrays
-    ready for save_snapshot: per patch "<k>_meta" (first point x, y m, spacing m, nx, ny) and "<k>_<channel>"
-    (NZ, ny, nx) uint8 codes, "<k>_ground" uint16 m over terrain."""
+    ready for save_snapshot: per patch "<k>_meta" (first point x, y m, spacing m, nx, ny, top m, levels) and "<k>_<channel>"
+    (levels, ny, nx) uint8 codes (levels_for: fine nests on finer levels low down), "<k>_ground" uint16 m over
+    terrain."""
     import cupy as cp
     out = {}
-    zv = (np.arange(NZ) + 0.5) * ZTOP / NZ
     for k, f in enumerate(fields.values()):
+        ztop, nz = levels_for(f.dx)
+        zv = (np.arange(nz) + 0.5) * ztop / nz
         s = max(1, int(math.ceil(max(f.nx, f.ny) / HISTORY_SIDE)))
         nx, ny = (f.nx + s - 1) // s, (f.ny + s - 1) // s
         xs = f.x0 + (np.arange(nx) * s + 0.5) * f.dx
         ys = f.y0 + (np.arange(ny) * s + 0.5) * f.dx
         X, Y = np.meshgrid(xs, ys)
         p = (patches or {}).get(f.patch_id)
-        out[f"{k}_meta"] = np.array([xs[0], ys[0], s * f.dx, nx, ny], np.float64)
+        out[f"{k}_meta"] = np.array([xs[0], ys[0], s * f.dx, nx, ny, ztop, nz], np.float64)
         for ch in HISTORY_CHANNELS:
             v = _sample(f, ch, X, Y, zv, p)
-            out[f"{k}_{ch}"] = (cp.asnumpy(_code(ch, v)) if v is not None else np.zeros((NZ, ny, nx), np.uint8))
+            out[f"{k}_{ch}"] = (cp.asnumpy(_code(ch, v)) if v is not None else np.zeros((nz, ny, nx), np.uint8))
         g = ground(f, X, Y)
         if g is not None:
             out[f"{k}_ground"] = cp.asnumpy(cp.clip(cp.rint(cp.nan_to_num(g, nan=0.0)), 0, 65535).astype(cp.uint16))
@@ -381,17 +454,20 @@ def extract_past(folder, t: float, box, name: str = "dbz"):
     channels = ("cloud", "precip") if name == "cloud" else (name,)
     best = [None] * len(channels)
     gnd = None
+    zv = (np.arange(NZ) + 0.5) * ZTOP / NZ
     for k in over:
-        sx, sy, d, mx, my = metas[k]
+        sx, sy, d, mx, my = metas[k][:5]
+        etop, enz = (metas[k][5], int(metas[k][6])) if len(metas[k]) > 6 else (ZTOP, NZ)
         gi, gj = (X - sx) / d, (Y - sy) / d
         inside = (gi >= -0.5) & (gi <= mx - 0.5) & (gj >= -0.5) & (gj <= my - 0.5)
         if not inside.any():
             continue
         J = np.broadcast_to(np.clip(gj, 0, my - 1)[None], (NZ, ny, nx))
         I = np.broadcast_to(np.clip(gi, 0, mx - 1)[None], (NZ, ny, nx))
-        Kz = np.broadcast_to(np.arange(NZ, dtype=np.float64)[:, None, None], (NZ, ny, nx))
+        kz = zv / etop * enz - 0.5                        # the box's levels on the snapshot's own
+        Kz = np.broadcast_to(np.clip(kz, 0, enz - 1)[:, None, None], (NZ, ny, nx))
         coords = xp.asarray(np.stack([Kz, J, I]), dtype=xp.float32)
-        ok = xp.asarray(np.broadcast_to(inside[None], (NZ, ny, nx)))
+        ok = xp.asarray(np.broadcast_to(inside[None] & (zv <= etop)[:, None, None], (NZ, ny, nx)))
         for c, ch in enumerate(channels):
             a = xp.asarray(snap[f"{k}_{ch}"], dtype=xp.float32)
             v = nd.map_coordinates(a, coords, order=1, mode="nearest")
@@ -408,11 +484,29 @@ def extract_past(folder, t: float, box, name: str = "dbz"):
     data = xp.stack([xp.where(xp.isnan(b), 0, xp.clip(xp.rint(b), 0, 255)).astype(xp.uint8) for b in best], axis=-1)
     if len(best) == 1:
         data = data[..., 0]
-    head = json.dumps({"field": name, "units": units, "nx": nx, "ny": ny, "nz": NZ, "box": [x0, y0, x1, y1],
-                       "ztop": ZTOP, "scale": scale, "offset": offset, "channels": len(best),
-                       "ground": gnd is not None, "t": tt}).encode()
+    head = {"field": name, "units": units, "nx": nx, "ny": ny, "nz": NZ, "box": [x0, y0, x1, y1],
+            "ztop": ZTOP, "scale": scale, "offset": offset, "channels": len(best), "ground": gnd is not None, "t": tt}
     host = (lambda a: a.get()) if xp is not np else (lambda a: a)
-    out = struct.pack("<I", len(head)) + head + host(data).tobytes()
+    main = host(data).tobytes()
     if gnd is not None:
-        out += host(xp.clip(xp.rint(xp.nan_to_num(gnd, nan=0.0)), 0, 65535).astype(xp.uint16)).tobytes()
-    return out, tt
+        main += host(xp.clip(xp.rint(xp.nan_to_num(gnd, nan=0.0)), 0, 65535).astype(xp.uint16)).tobytes()
+    # the nests' insets, on the snapshot's own levels
+    ent = [(k, m[0] - m[2] / 2, m[1] - m[2] / 2, m[0] + (m[3] - 0.5) * m[2], m[1] + (m[4] - 0.5) * m[2], m[2])
+           for k, m in metas.items()]
+    insets = []
+    for k, ib, r, inx, iny in _plan_insets(ent, (x0, y0, x1, y1), res):
+        sx, sy, d, mx, my = metas[k][:5]
+        etop, enz = (metas[k][5], int(metas[k][6])) if len(metas[k]) > 6 else (ZTOP, NZ)
+        xs = ib[0] + (np.arange(inx) + 0.5) * (ib[2] - ib[0]) / inx
+        ys = ib[1] + (np.arange(iny) + 0.5) * (ib[3] - ib[1]) / iny
+        IX, IY = np.meshgrid(xs, ys)
+        J = np.broadcast_to(np.clip((IY - sy) / d, 0, my - 1)[None], (enz, iny, inx))
+        I = np.broadcast_to(np.clip((IX - sx) / d, 0, mx - 1)[None], (enz, iny, inx))
+        Kz = np.broadcast_to(np.arange(enz, dtype=np.float64)[:, None, None], (enz, iny, inx))
+        coords = xp.asarray(np.stack([Kz, J, I]), dtype=xp.float32)
+        codes = [xp.clip(xp.rint(nd.map_coordinates(xp.asarray(snap[f"{k}_{ch}"], dtype=xp.float32), coords, order=1,
+                                                    mode="nearest")), 0, 255).astype(xp.uint8) for ch in channels]
+        dat = xp.stack(codes, axis=-1) if len(codes) > 1 else codes[0]
+        insets.append(({"box": list(ib), "nx": inx, "ny": iny, "nz": enz, "ztop": float(etop), "dx": float(d)},
+                       host(dat).tobytes()))
+    return _pack(name, head, main, insets), tt

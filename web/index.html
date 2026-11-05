@@ -683,6 +683,23 @@
         <button id="volPlay" class="vol-btn" title="Play the saved 3-D volumes (one is saved with each radar frame); the map's replay bar moves this too">▶</button>
         <input id="volT" type="range" min="0" max="0" value="0" title="The past: the 3-D view at an earlier model time, like the radar's replay">
         <span id="volTV" class="vol-num"></span>
+        <label class="chk" title="Keep the tornado in the middle of the view: before each volume loads, the box (same size) is moved onto the tornado picked here at that volume's time -- along its track while it is on the ground, on the strongest low-level rotation near it before and after. The camera moves with the box, so it stays locked on through playback, the map's replay and a loop export"><input id="volFollow" type="checkbox"> Follow tornado</label>
+        <select id="volFollowId" class="hidden" title="Which one to follow: the run's strongest tornado, one of its tornado tracks, or (no track needed) the strongest low-level rotation near the view, followed from volume to volume"></select>
+        <label id="volFTrackLbl" class="chk hidden" title="Draw the followed tornado's track on the ground, colored by its EF estimate, up to the volume's time"><input id="volFTrack" type="checkbox"> Track</label>
+        <button id="volExport" class="vol-btn" title="Save the 3-D view as an animated loop (video, GIF or PNG frames) over a range of the saved volumes, exactly as the view is set up now (camera, mode, sliders, Follow tornado)">Export loop…</button>
+      </div>
+      <div id="volExp" class="vol-exp hidden">
+        <label>From <select id="volExFrom"></select></label>
+        <label>To <select id="volExTo"></select></label>
+        <label title="How long each volume stays on screen">Frame <select id="volExMs"><option value="100">0.1 s</option><option value="150">0.15 s</option>
+          <option value="250" selected>0.25 s</option><option value="400">0.4 s</option><option value="700">0.7 s</option></select></label>
+        <label title="The loop's size in pixels (This window: the 3-D view's size on screen now)">Size <select id="volExSize"><option value="win">This window</option>
+          <option value="1280x720" selected>1280 × 720</option><option value="1920x1080">1920 × 1080</option><option value="1080x1080">1080 × 1080</option><option value="960x540">960 × 540</option></select></label>
+        <label title="WebM / MP4: small, smooth video (loop it in the player). GIF: plays and loops anywhere, 256 colours, bigger file. PNG frames: every frame lossless in a .zip, for your own editor">Format <select id="volExFmt">
+          <option value="webm">WebM video</option><option value="mp4">MP4 video</option><option value="gif">GIF</option><option value="zip">PNG frames (.zip)</option></select></label>
+        <label class="chk" title="The model time (and the tornado followed) in the corner of each frame"><input id="volExStamp" type="checkbox" checked> Time stamp</label>
+        <button id="volExGo" class="vol-btn" title="Steps through the volumes, renders each one fully, then encodes and saves the file (keep this window in front while it encodes)">Make the loop</button>
+        <span id="volExMsg" class="vol-exp-msg"></span><a id="volExDl" class="hidden" href="#">Save again</a>
       </div>
       <div class="vol-ctl">
         <select id="volCam" title="Orbit: turn around the box. Free camera: fly anywhere (W A S D, Q / E down / up, Shift faster, drag to look, wheel for speed). From the ground: a chaser's eye 2 m up (W A S D to drive, drag to look)"><option value="orbit">Orbit</option><option value="free">Free camera</option><option value="ground">From the ground</option></select>

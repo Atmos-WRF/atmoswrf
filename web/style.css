@@ -461,6 +461,13 @@ aside#panel { width: 434px; min-width: 434px; flex-direction: row; }
 .vol-time { display: flex; align-items: center; gap: 8px; }
 .vol-time input[type=range] { flex: 1 1 auto; min-width: 120px; }
 .vol-time .vol-num { white-space: nowrap; color: var(--muted); }
+.vol-exp { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 6px 8px; border-radius: 8px; background: rgba(124,200,255,.07); border: 1px solid rgba(124,200,255,.25); }
+.vol-exp label { display: flex; align-items: center; gap: 6px; }
+.vol-exp select { height: 26px; font-size: 12px; }
+.vol-exp-msg { color: var(--muted); font-variant-numeric: tabular-nums; }
+.vol-time select { height: 24px; font-size: 12px; max-width: 220px; }
+.vol-time { flex-wrap: wrap; row-gap: 4px; }
+.vol-time label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
 #volOverlay:focus { outline: none; }
 /* the rail's groups: the steps of a setup, the special modes, then the tools at the bottom */
 .rail-group { flex: 0 0 auto; margin: var(--s2) 0 0; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;

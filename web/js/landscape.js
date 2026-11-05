@@ -100,6 +100,7 @@ const Land = (() => {
     const key = box.join(',');
     if (coarse.key === key || coarse.busy) return;
     coarse.busy = true;
+    let done = false;
     try {
       const lc = await landcover(box, COARSE_PX);
       const cv = paint(lc);
@@ -107,18 +108,22 @@ const Land = (() => {
       drawRoads(cv, box, rd && rd.roads, 3);
       if (!coarse.tex) coarse.tex = gl.createTexture();
       tex2D(coarse.tex, cv);
-      coarse.key = key; coarse.ok = true;
+      coarse.key = key; coarse.ok = true; done = true;
+      coarse.busy = false;            // a moved box (Follow tornado) can load while the roads below still come in
       if (onReady) onReady();
       // the main roads still coming from OpenStreetMap: painted again once they are all in
       for (let tries = 0; rd && rd.pending && tries < 40 && coarse.key === key; tries++) {
         await new Promise(r => setTimeout(r, 8000));
         rd = await roadsIn(box, true);
-        if (!rd || rd.pending) continue;
+        if (!rd || rd.pending || coarse.key !== key) continue;
         const c2 = paint(lc); drawRoads(c2, box, rd.roads, 3); tex2D(coarse.tex, c2);
         if (onReady) onReady();
       }
-    } catch (e) { coarse.ok = false; coarse.key = key; console.warn('3-D land cover:', e); }
-    coarse.busy = false;
+    } catch (e) {
+      if (!done) { coarse.ok = false; coarse.key = key; }
+      console.warn('3-D land cover:', e);
+    }
+    if (!done) coarse.busy = false;
   }
 
   // ---------------------------------------------------------------- close up
@@ -127,6 +132,7 @@ const Land = (() => {
     const key = `${b.join(',')}/${base}`;
     if (detail.busy) return;
     detail.busy = true;
+    let done = false;
     try {
       const lc = await landcover(b, 1024);
       let cv = paint(lc);
@@ -154,6 +160,7 @@ const Land = (() => {
       tex2D(detail.tex, compose(rd));
       Object.assign(detail, { key, box: b, ok: true, lc });
       buildTrees(lc, cx, cy, groundKm);
+      detail.busy = false; done = true;   // the camera can move on (re-centre) while the roads below still come in
       if (onReady) onReady();
       const poll = ++detail.poll;
       for (let tries = 0; rd && rd.pending && tries < 40 && poll === detail.poll; tries++) {
@@ -164,8 +171,8 @@ const Land = (() => {
         if (r2.roads.length !== rd.roads.length || !r2.pending) { tex2D(detail.tex, compose(r2)); if (onReady) onReady(); }
         rd = r2;
       }
-    } catch (e) { detail.key = key; console.warn('3-D close-up ground:', e); }
-    detail.busy = false;
+    } catch (e) { if (!done) detail.key = key; console.warn('3-D close-up ground:', e); }
+    if (!done) detail.busy = false;
   }
 
   // the trees on a 4 m grid fixed to the ground (so they stay put as the picture is re-centred): each cell's land
@@ -377,6 +384,11 @@ const Land = (() => {
     coarse: () => (coarse.ok ? coarse.tex : null),
     detail: () => (detail.ok ? { tex: detail.tex, box: detail.box } : null),
     trees: () => trees,
+    // the loop export waits for this: the box's land cover (box: null when the map is not Plain) and the close-up
+    // ground around the camera (cam: null for the orbit camera) are in
+    ready: (box, cam) => (!box || (coarse.ok && coarse.key === box.join(','))) &&
+      (!cam || (detail.ok && !!detail.box && Math.hypot(cam.x - (detail.box[0] + detail.box[2]) / 2,
+                                                        cam.y - (detail.box[1] + detail.box[3]) / 2) <= DETAIL_KM * 0.22)),
   };
 })();
 window.Land = Land;

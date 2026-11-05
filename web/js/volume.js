@@ -668,8 +668,12 @@ const Vol = (() => {
     if (!box) return;
     if (busy) { again = true; return; }           // a change during a load: loaded again right after it
     const past = replayT !== null && !tor;
-    const key = `${box.join(',')}/${want()}/${past ? replayT : 'now'}`;
     busy = true;
+    if (follow.on && !tor) {                      // Follow tornado: the box onto it at this volume's time first
+      try { await recentre(past ? replayT : null); } catch (e) { console.warn('follow:', e); }
+      if (typeof map !== 'undefined') map.redraw();
+    }
+    const key = `${box.join(',')}/${want()}/${past ? replayT : 'now'}`;
     if (!cache.has(key)) $('volStatus').textContent = 'Loading…';
     try {
       let q = `x0=${box[0]}&y0=${box[1]}&x1=${box[2]}&y1=${box[3]}&field=${want()}`;
@@ -931,7 +935,7 @@ const Vol = (() => {
               (x, y) => groundKm(x - cx, y - cy));
     if (close && cam.mode === 'ground' && !cam.placed) {       // off the road or out of the woods: onto a road
       const s = Land.standNear(cam.fp.x + cx, cam.fp.y + cy);
-      if (s) { cam.fp.x = s[0] - cx; cam.fp.y = s[1] - cy; cam.placed = true; acc = 0; }
+      if (s) { cam.snap = [s[0] - cx - cam.fp.x, s[1] - cy - cam.fp.y]; cam.fp.x = s[0] - cx; cam.fp.y = s[1] - cy; cam.placed = true; acc = 0; }
     }
     const cvs = $('volCanvas');
     const geo = close && $('volTrees').checked && Land.drawTrees(cvs.width, cvs.height, V, fov, eye, G, sun, [cx, cy]);
@@ -1040,10 +1044,11 @@ const Vol = (() => {
   }
 
   function render() {
-    const cv = $('volCanvas'), dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const W = cv.clientWidth, H = cv.clientHeight;
+    // a loop export renders at its own size (forced), full quality
+    const cv = $('volCanvas'), dpr = forced ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+    const W = forced ? forced.W : cv.clientWidth, H = forced ? forced.H : cv.clientHeight;
     if (!W || !H) { acc = ACC_MAX; drawQ = 1; return; }
-    const q = cloudMode() ? drawQ : 1;
+    const q = cloudMode() && !forced ? drawQ : 1;
     if (cv.width !== Math.round(W * dpr * q) || cv.height !== Math.round(H * dpr * q)) {
       cv.width = Math.round(W * dpr * q); cv.height = Math.round(H * dpr * q); acc = 0;
     }
@@ -1062,7 +1067,7 @@ const Vol = (() => {
       }
       drawCloud(G, eye, VP, V, fov);
       gl.disable(gl.BLEND);
-      if (acc === 0) drawPaths(g, G, VP, W, H);
+      if (acc === 0) { drawPaths(g, G, VP, W, H); drawFollowTrack(g, G, VP, W, H); }
       acc++;
       return;
     }
@@ -1107,6 +1112,7 @@ const Vol = (() => {
     w.textContent = `${F.name} ${isoMode() ? 'isosurface at' : 'from'} ${F.fmt(thr)}` +
       (F.signed && $('volBoth').checked ? ` (and ${F.fmt(-thr)})` : '') + `  ·  vertical ×${G.ex}` + camNote();
     drawPaths(g, G, VP, W, H);
+    drawFollowTrack(g, G, VP, W, H);
   }
 
   // ---------------------------------------------------------------- the window
@@ -1140,6 +1146,8 @@ const Vol = (() => {
     cam.px = 0; cam.py = 0;
     if (cam.mode !== 'orbit') { cam.mode = 'orbit'; $('volCam').value = 'orbit'; cam.fp = null; }
     head = null; setSlider(false); draw();
+    follow.at = null;
+    if (follow.on && !tor) fillFollow();
     if (!tor && replayT === null && !S.live && S.frames.length && S.frameIdx >= 0 && S.frames[S.frameIdx])
       replayT = S.frames[S.frameIdx].t;            // opened on a replayed radar frame: that time
     if (replayT !== null) $('volLive').checked = false;
@@ -1157,6 +1165,8 @@ const Vol = (() => {
     clearInterval(timer); timer = null; box = null; tor = false; paths = null;
     Land.reset();
     stopPlay(); keys.clear(); replayT = null; followMap = false; $('volLive').checked = true;
+    if (exp) exp.cancel = true;
+    $('volExp').classList.add('hidden');
     cache.clear(); cacheBytes = 0;
     map.redraw();
   }
@@ -1221,11 +1231,419 @@ const Vol = (() => {
   }
   // the map's replay bar: the 3-D view follows it to the saved volume nearest its frame (t: null = live again)
   function followTime(t) {
-    if (!box || tor || $('volPlay').textContent !== '▶') return;
+    if (!box || tor || exp || $('volPlay').textContent !== '▶') return;
     if (t === null) { if (followMap) goLive(); return; }
     if (!times.length) { refreshTimes().then(() => { if (times.length) goTime(nearest(t), true); }); return; }
     if (t > times[times.length - 1] + 30) refreshTimes().then(() => goTime(nearest(t), true));
     else goTime(nearest(t), true);
+  }
+
+  // ---------------------------------------------------------------- following the tornado
+  // Follow tornado: before each volume loads, the box (its size kept) is centred on the tornado picked in
+  // volFollowId at that volume's time: on its track (Simulation.tornado_tracks) while it is on the ground; before
+  // and after, on the strongest low-level rotation (the snapshot's vertical vorticity, lowest 1.5 km) near where the
+  // track's mean motion puts it.  "rot" needs no track: the strongest low-level rotation near the last centre.
+  // The cameras are placed relative to the box's middle, so they ride along.
+  const follow = { on: false, id: 'auto', at: null, label: '', tr: null };
+  const rotCache = new Map();
+  const runTracks = () => (S.run && S.run.tornado_tracks) || [];
+  function trackFor(id) {
+    if (id === 'rot') return null;
+    const ts = runTracks();
+    if (id !== 'auto') return ts.find(t => String(t.id) === String(id)) || null;
+    let best = null;                               // the run's strongest: highest EF, then peak wind
+    for (const t of ts) if (!best || t.ef > best.ef || (t.ef === best.ef && t.wind > best.wind)) best = t;
+    return best;
+  }
+  function trackAt(tr, t) {                        // km; null when it is not on the ground at t
+    const p = tr.pts;
+    if (t < p[0][0] - 1 || t > p[p.length - 1][0] + 1) return null;
+    for (let i = 1; i < p.length; i++) if (p[i][0] >= t) {
+      const a = p[i - 1], b = p[i], f = b[0] > a[0] ? Math.max(0, (t - a[0]) / (b[0] - a[0])) : 0;
+      return { x: (a[1] + f * (b[1] - a[1])) / 1000, y: (a[2] + f * (b[2] - a[2])) / 1000, ef: Math.max(f < 0.5 ? a[3] : b[3], 0) };
+    }
+    const q = p[p.length - 1];
+    return { x: q[1] / 1000, y: q[2] / 1000, ef: Math.max(q[3], 0) };
+  }
+  function trackGuess(tr, t) {                     // off its ends: carried along the track's mean motion
+    const p = tr.pts, a = p[0], b = p[p.length - 1], dt = Math.max(1, b[0] - a[0]);
+    const u = (b[1] - a[1]) / dt, v = (b[2] - a[2]) / dt, e = t < a[0] ? a : b;
+    return { x: (e[1] + u * (t - e[0])) / 1000, y: (e[2] + v * (t - e[0])) / 1000 };
+  }
+  // the strongest cyclonic low-level column within r km of (cx, cy) km at model time t (null: the newest step)
+  async function rotationNear(cx, cy, r, t) {
+    const key = `${t}/${cx.toFixed(1)}/${cy.toFixed(1)}/${r}`;
+    if (rotCache.has(key)) return rotCache.get(key);
+    let q = `x0=${(cx - r).toFixed(2)}&y0=${(cy - r).toFixed(2)}&x1=${(cx + r).toFixed(2)}&y1=${(cy + r).toFixed(2)}&field=zeta`;
+    if (t !== null) q += `&t=${t}`;
+    let out = null;
+    try {
+      const { header: h, data } = unpack(await (await api('/api/volume?' + q)).arrayBuffer());
+      const nx = h.nx, ny = h.ny, n = nx * ny, ch = h.channels || 1;
+      const kz = Math.min(h.nz, Math.max(1, Math.round(1500 / (h.ztop / h.nz))));
+      const col = new Float32Array(n);
+      for (let k = 0; k < kz; k++) for (let i = 0; i < n; i++) {
+        const c = data[(k * n + i) * ch];
+        if (c) col[i] += (c - h.offset) / h.scale / kz;
+      }
+      const bx = h.box.map(v => v / 1000);
+      let bv = 0.003, bi = -1, bj = -1;          // 0.003 /s: weaker is no rotation worth following
+      for (let j = 1; j < ny - 1; j++) for (let i = 1; i < nx - 1; i++) {
+        let s = 0;
+        for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) s += col[(j + dj) * nx + i + di];
+        const x = bx[0] + (i + 0.5) * (bx[2] - bx[0]) / nx, y = bx[1] + (j + 0.5) * (bx[3] - bx[1]) / ny;
+        const d2 = ((x - cx) ** 2 + (y - cy) ** 2) / (r * r);
+        if (d2 > 1) continue;
+        s = s / 9 * (1 - 0.25 * d2);               // nearer the guess wins between equals
+        if (s > bv) { bv = s; bi = i; bj = j; }
+      }
+      if (bi >= 0) out = { x: bx[0] + (bi + 0.5) * (bx[2] - bx[0]) / nx, y: bx[1] + (bj + 0.5) * (bx[3] - bx[1]) / ny, zeta: bv };
+    } catch (e) { out = null; }
+    rotCache.set(key, out);
+    return out;
+  }
+  async function recentre(t) {
+    const hw = (box[2] - box[0]) / 2, hh = (box[3] - box[1]) / 2;
+    const tt = t !== null ? t : (S.run && S.run.t) || 0;
+    const tr = trackFor(follow.id);
+    let c = null, label = '';
+    follow.tr = tr;
+    if (tr) {
+      const p = trackAt(tr, tt);
+      if (p) { c = p; label = `T${tr.id} EF${p.ef} (est.)`; }
+      else {
+        const g = trackGuess(tr, tt), r = await rotationNear(g.x, g.y, 10, t);
+        c = r || g;
+        label = `${tt < tr.pts[0][0] ? 'before' : 'after'} T${tr.id}` + (r ? ' · low-level rotation' : '');
+      }
+    } else {
+      const s = follow.at || { x: (box[0] + box[2]) / 2, y: (box[1] + box[3]) / 2 };
+      const r = await rotationNear(s.x, s.y, Math.min(25, Math.max(8, Math.min(hw, hh))), t);
+      c = r || s;
+      label = r ? `strongest low-level rotation ${(r.zeta * 1000).toFixed(0)}×10⁻³ /s` : 'no low-level rotation';
+    }
+    follow.at = { x: c.x, y: c.y }; follow.label = label;
+    if (cam.mode === 'ground' && cam.fp) {         // riding along: onto a road / open ground again, from where it meant to be
+      if (cam.snap) { cam.fp.x -= cam.snap[0]; cam.fp.y -= cam.snap[1]; cam.snap = null; }
+      cam.placed = false;
+    }
+    const r2 = v => Math.round(v * 20) / 20;
+    box = [r2(c.x - hw), r2(c.y - hh), r2(c.x + hw), r2(c.y + hh)];
+  }
+  function fillFollow() {
+    const sel = $('volFollowId'), keep = sel.value || follow.id;
+    const ts = runTracks().slice().sort((a, b) => b.ef - a.ef || b.wind - a.wind);
+    sel.innerHTML = `<option value="auto">Strongest tornado</option>` +
+      ts.map(t => `<option value="${t.id}">T${t.id} · EF${t.ef} (est.) · +${fmtDur(t.t0).slice(0, -3)}–${fmtDur(t.t1).slice(0, -3)}</option>`).join('') +
+      `<option value="rot">Strongest rotation (no track)</option>`;
+    sel.value = [...sel.options].some(o => o.value === keep) ? keep : 'auto';
+    follow.id = sel.value;
+  }
+  function setFollow(on) {
+    follow.on = on; follow.at = null; rotCache.clear();
+    $('volFollow').checked = on;
+    $('volFollowId').classList.toggle('hidden', !on);
+    $('volFTrackLbl').classList.toggle('hidden', !on);
+    if (on) { fillFollow(); cam.px = 0; cam.py = 0; }
+    if (box) load(true);
+  }
+  // the followed tornado's track on the ground, in its EF colors, up to the volume's time
+  function drawFollowTrack(g, G, VP, W, H) {
+    if (!follow.on || tor || !follow.tr || !$('volFTrack').checked || !box) return;
+    const tNow = replayT !== null ? replayT : Infinity, P = projector(G, VP, W, H);
+    const pts = follow.tr.pts.filter(p => p[0] <= tNow + 1);
+    const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
+    const s = pts.map(p => [P(p[1], p[2], 1000 * groundKm(p[1] / 1000 - cx, p[2] / 1000 - cy) + 20), Math.max(p[3], 0)]);
+    const cols = typeof EF_COLORS !== 'undefined' ? EF_COLORS : ['#7fdcff', '#3ccf7a', '#f5d33a', '#f2913a', '#e8413c', '#c13ae8'];
+    g.save(); g.lineCap = 'round';
+    for (let i = 1; i < s.length; i++) {
+      if (!s[i - 1][0] || !s[i][0]) continue;
+      g.strokeStyle = cols[Math.min(5, s[i][1])]; g.lineWidth = 2 + 0.8 * s[i][1];
+      g.beginPath(); g.moveTo(...s[i - 1][0]); g.lineTo(...s[i][0]); g.stroke();
+    }
+    g.restore();
+  }
+
+  // ---------------------------------------------------------------- the loop export
+  // Steps through a range of the saved volumes as the view is set up (camera, mode, sliders, Follow tornado),
+  // renders each fully (the cloud view's frames all averaged) at the chosen size, then encodes: WebM / MP4 through
+  // MediaRecorder (the frames played back at the frame time), a GIF (one palette for the whole loop, median cut),
+  // or the PNG frames in a .zip.
+  let forced = null, exp = null, expUrl = null;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const expMsg = s => { $('volExMsg').textContent = s; };
+  function fillExport() {
+    const opts = times.map((t, i) => `<option value="${i}">${clock(t)}</option>`).join('');
+    $('volExFrom').innerHTML = opts; $('volExTo').innerHTML = opts;
+    let a = 0, b = Math.max(0, times.length - 1);
+    const tr = follow.on ? trackFor(follow.id) : null;
+    if (tr && times.length) { a = nearest(tr.t0 - 600); b = nearest(tr.t1 + 300); }
+    $('volExFrom').value = a; $('volExTo').value = b;
+    const mp4 = ['video/mp4;codecs=avc1', 'video/mp4'].some(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+    $('volExFmt').querySelector('option[value="mp4"]').disabled = !mp4;
+    if (!mp4 && $('volExFmt').value === 'mp4') $('volExFmt').value = 'webm';
+    expMsg(times.length ? `${times.length} saved volumes` : 'no saved volumes yet: they are saved with the radar frames');
+  }
+  function caption(g, W, H, t) {
+    const s = Math.max(12, Math.round(H / 40)), pad = Math.round(s * 0.8);
+    const z = ms0 !== null ? new Date(ms0 + 1000 * t).toISOString().slice(11, 19) + 'Z' : '';
+    const line = [z, `+${fmtDur(t)}`, follow.on ? follow.label : ''].filter(Boolean).join('   ·   ');
+    g.save(); g.textBaseline = 'alphabetic'; g.shadowColor = 'rgba(0,0,0,.85)'; g.shadowBlur = s / 3;
+    g.font = `600 ${s}px Inter, Segoe UI, sans-serif`; g.fillStyle = '#f2f6fa'; g.textAlign = 'left';
+    g.fillText(line, pad, H - pad);
+    g.font = `500 ${Math.round(s * 0.75)}px Inter, Segoe UI, sans-serif`; g.fillStyle = 'rgba(230,238,245,.8)'; g.textAlign = 'right';
+    g.fillText(`Atmos-WRF${S.run && S.run.run_id ? '  ·  ' + S.run.run_id : ''}`, W - pad, pad + s * 0.75);
+    g.restore();
+  }
+  const toBlob = (c, type, q) => new Promise((res, rej) => c.toBlob(b => (b ? res(b) : rej(new Error('could not encode a frame'))), type, q));
+
+  async function exportLoop() {
+    if (exp) { exp.cancel = true; return; }
+    await refreshTimes();
+    if (!times.length || !box) { expMsg('No saved volumes yet: they are saved with the radar frames'); return; }
+    let a = +$('volExFrom').value, b = +$('volExTo').value;
+    if (a > b) [a, b] = [b, a];
+    const fmt = $('volExFmt').value, ms = +$('volExMs').value, stamp = $('volExStamp').checked, sz = $('volExSize').value;
+    const cv = $('volCanvas');
+    const [W, H] = sz === 'win' ? [cv.clientWidth & ~1, cv.clientHeight & ~1] : sz.split('x').map(Number);
+    stopPlay();
+    const wasLive = $('volLive').checked, wasT = replayT;
+    exp = { cancel: false };
+    $('volExGo').textContent = 'Cancel'; $('volExDl').classList.add('hidden');
+    const out = document.createElement('canvas'); out.width = W; out.height = H;
+    const g = out.getContext('2d');
+    const shots = [];
+    forced = { W, H };
+    try {
+      for (let i = a; i <= b && !exp.cancel; i++) {
+        expMsg(`Rendering ${i - a + 1} / ${b - a + 1}…`);
+        await goTime(i, false);
+        while (busy) await sleep(30);
+        if (!head || head.field !== want()) continue;           // nothing in the box then
+        if (cloudMode()) {
+          // the ground's textures for this box and camera (requested by the render), up to 20 s
+          drawQ = 1; acc = 0; render();
+          const cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
+          const landWant = () => [baseName() === 'plain' ? box : null,
+                              cam.mode !== 'orbit' && cam.fp ? { x: cam.fp.x + cx, y: cam.fp.y + cy } : null];
+          for (let w = 0; w < 200 && !exp.cancel && !Land.ready(...landWant()); w++) { await sleep(100); render(); }
+          await sleep(50);
+        }
+        drawQ = 1; acc = 0;
+        const n = cloudMode() ? ACC_MAX : 1;
+        for (let k = 0; k < n; k++) render();
+        g.fillStyle = '#0b0e13'; g.fillRect(0, 0, W, H);
+        g.drawImage(cv, 0, 0, W, H); g.drawImage($('volOverlay'), 0, 0, W, H);
+        if (stamp) caption(g, W, H, times[i]);
+        shots.push(await toBlob(out, fmt === 'zip' ? 'image/png' : 'image/webp', 0.95));
+      }
+      forced = null; draw();
+      if (exp.cancel) { expMsg('Cancelled'); return; }
+      if (!shots.length) { expMsg('No volume in the box over that range'); return; }
+      const tag = follow.on && follow.tr ? `_T${follow.tr.id}` : follow.on ? '_rotation' : '';
+      const name = `atmos-wrf_${(S.run && S.run.run_id) || 'run'}${tag}_3d_${times[a]}-${times[b]}s`;
+      let blob, ext = fmt;
+      if (fmt === 'zip') {
+        expMsg('Packing the frames…');
+        const files = [];
+        for (let i = 0; i < shots.length; i++)
+          files.push({ name: `${name}_${String(i + 1).padStart(3, '0')}.png`, data: new Uint8Array(await shots[i].arrayBuffer()) });
+        blob = makeZip(files);
+      } else if (fmt === 'gif') blob = await makeGif(shots, W, H, ms);
+      else ({ blob, ext } = await recordVideo(shots, W, H, ms, fmt));
+      if (exp.cancel) { expMsg('Cancelled'); return; }
+      saveBlob(blob, `${name}.${ext}`);
+      expMsg(`Saved ${name}.${ext} · ${shots.length} frames · ${(blob.size / 1e6).toFixed(1)} MB`);
+    } catch (e) {
+      console.error(e);
+      expMsg('Export failed: ' + ((e && e.message) || e));
+    } finally {
+      forced = null; exp = null;
+      $('volExGo').textContent = 'Make the loop';
+      if (wasLive && wasT === null) goLive();
+      else if (wasT !== null) goTime(nearest(wasT), false);
+      draw();
+    }
+  }
+  function saveBlob(blob, name) {
+    if (expUrl) URL.revokeObjectURL(expUrl);
+    expUrl = URL.createObjectURL(blob);
+    Vol.lastExport = { blob, name };
+    const a = $('volExDl');
+    a.href = expUrl; a.download = name; a.classList.remove('hidden');
+    a.click();
+  }
+
+  async function recordVideo(shots, W, H, ms, fmt) {
+    if (!window.MediaRecorder) throw new Error('this browser cannot record video: pick GIF or PNG frames');
+    const types = fmt === 'mp4' ? ['video/mp4;codecs=avc1.640033', 'video/mp4;codecs=avc1', 'video/mp4']
+      : ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    const mime = types.find(t => MediaRecorder.isTypeSupported(t));
+    if (!mime) throw new Error(`this browser cannot record ${fmt.toUpperCase()}: pick another format`);
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const g = c.getContext('2d');
+    const stream = c.captureStream(0), track = stream.getVideoTracks()[0];
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: Math.round(Math.min(25e6, Math.max(4e6, W * H * 8))) });
+    const parts = [];
+    rec.ondataavailable = e => { if (e.data && e.data.size) parts.push(e.data); };
+    const stopped = new Promise(r => { rec.onstop = r; });
+    let next = await createImageBitmap(shots[0]);
+    g.drawImage(next, 0, 0, W, H);
+    rec.start(1000);
+    const t0 = performance.now();
+    let at = 0;
+    for (let i = 0; i < shots.length && !exp.cancel; i++) {
+      expMsg(`Encoding ${fmt.toUpperCase()} ${i + 1} / ${shots.length}… (keep this window in front)`);
+      g.drawImage(next, 0, 0, W, H); next.close();
+      track.requestFrame();
+      at += i === shots.length - 1 ? Math.max(1000, 4 * ms) : ms;   // a pause on the last frame before it loops
+      next = i + 1 < shots.length ? await createImageBitmap(shots[i + 1]) : null;
+      const wait = t0 + at - performance.now();
+      if (wait > 0) await sleep(wait);
+    }
+    if (next) next.close();
+    g.drawImage(c, 0, 0);                          // the canvas changed again, so this frame counts: it closes the
+    track.requestFrame();                          // last one's time (the pause before the loop)
+    await sleep(100);
+    rec.stop(); await stopped;
+    track.stop();
+    const type = mime.split(';')[0];
+    return { blob: new Blob(parts, { type }), ext: type === 'video/mp4' ? 'mp4' : 'webm' };
+  }
+
+  // GIF89a, looping, one 256-colour palette for every frame (median cut over pixels sampled from all of them),
+  // a light ordered dither against banding in the sky, LZW as the spec has it
+  async function makeGif(shots, W, H, ms) {
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    const pixels = async s => { const b = await createImageBitmap(s); g.drawImage(b, 0, 0, W, H); b.close(); return g.getImageData(0, 0, W, H).data; };
+    const hist = new Uint32Array(32768);
+    for (let f = 0; f < shots.length; f++) {
+      expMsg(`GIF palette ${f + 1} / ${shots.length}…`);
+      const d = await pixels(shots[f]);
+      for (let i = (f * 4) % 28; i < d.length; i += 28) hist[((d[i] >> 3) << 10) | ((d[i + 1] >> 3) << 5) | (d[i + 2] >> 3)]++;
+    }
+    const pal = medianCut(hist, 256), np = pal.length / 3;
+    const lut = new Int16Array(32768).fill(-1);
+    const nearestPal = k => {
+      const r = ((k >> 10) << 3) + 4, gg = (((k >> 5) & 31) << 3) + 4, b = ((k & 31) << 3) + 4;
+      let bi = 0, bd = Infinity;
+      for (let p = 0; p < np; p++) {
+        const dr = r - pal[3 * p], dg = gg - pal[3 * p + 1], db = b - pal[3 * p + 2], dd = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+        if (dd < bd) { bd = dd; bi = p; }
+      }
+      return bi;
+    };
+    const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map(v => Math.round((v - 7.5) * 1.2));
+    const parts = [];
+    const u16 = v => [v & 255, v >> 8];
+    const ptab = new Uint8Array(768); ptab.set(pal);
+    parts.push(new Uint8Array([71, 73, 70, 56, 57, 97, ...u16(W), ...u16(H), 0xF7, 0, 0]), ptab,
+      new Uint8Array([0x21, 0xFF, 11, ...[...'NETSCAPE2.0'].map(ch => ch.charCodeAt(0)), 3, 1, 0, 0, 0]));
+    const idx = new Uint8Array(W * H);
+    for (let f = 0; f < shots.length; f++) {
+      if (exp && exp.cancel) break;
+      expMsg(`GIF frame ${f + 1} / ${shots.length}…`);
+      const d = await pixels(shots[f]);
+      for (let y = 0, p = 0; y < H; y++) for (let x = 0; x < W; x++, p++) {
+        const o = BAYER[((y & 3) << 2) | (x & 3)], i = 4 * p;
+        const r = Math.min(255, Math.max(0, d[i] + o)), gg = Math.min(255, Math.max(0, d[i + 1] + o)), b = Math.min(255, Math.max(0, d[i + 2] + o));
+        const k = ((r >> 3) << 10) | ((gg >> 3) << 5) | (b >> 3);
+        let v = lut[k];
+        if (v < 0) v = lut[k] = nearestPal(k);
+        idx[p] = v;
+      }
+      const cs = Math.max(2, Math.round((f === shots.length - 1 ? Math.max(1000, 4 * ms) : ms) / 10));
+      parts.push(new Uint8Array([0x21, 0xF9, 4, 0, ...u16(cs), 0, 0, 0x2C, 0, 0, 0, 0, ...u16(W), ...u16(H), 0, 8]), lzw(idx), new Uint8Array([0]));
+      await sleep(0);
+    }
+    parts.push(new Uint8Array([0x3B]));
+    return new Blob(parts, { type: 'image/gif' });
+  }
+  function medianCut(hist, n) {
+    const all = [];
+    for (let k = 0; k < 32768; k++) if (hist[k]) all.push(k);
+    const comp = (k, a) => (a === 0 ? k >> 10 : a === 1 ? (k >> 5) & 31 : k & 31);
+    const stat = bins => {
+      const lo = [31, 31, 31], hi = [0, 0, 0];
+      let cnt = 0;
+      for (const k of bins) { cnt += hist[k]; for (let a = 0; a < 3; a++) { const v = comp(k, a); if (v < lo[a]) lo[a] = v; if (v > hi[a]) hi[a] = v; } }
+      const rg = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]], ax = rg.indexOf(Math.max(...rg));
+      return { bins, cnt, ax, span: rg[ax] };
+    };
+    const boxes = [stat(all)];
+    while (boxes.length < n) {
+      let bi = -1, bs = 0;
+      boxes.forEach((bx, i) => { const s = bx.span * Math.sqrt(bx.cnt); if (bx.bins.length > 1 && bx.span > 0 && s > bs) { bs = s; bi = i; } });
+      if (bi < 0) break;
+      const bx = boxes[bi];
+      bx.bins.sort((p, q) => comp(p, bx.ax) - comp(q, bx.ax));
+      let acc2 = 0, cut = 1;
+      for (let i = 0; i < bx.bins.length - 1; i++) { acc2 += hist[bx.bins[i]]; if (acc2 >= bx.cnt / 2) { cut = i + 1; break; } }
+      boxes.splice(bi, 1, stat(bx.bins.slice(0, cut)), stat(bx.bins.slice(cut)));
+    }
+    const pal = [];
+    for (const bx of boxes) {
+      let r = 0, gg = 0, b = 0;
+      for (const k of bx.bins) { const w = hist[k]; r += w * ((k >> 10) * 8 + 4); gg += w * (((k >> 5) & 31) * 8 + 4); b += w * ((k & 31) * 8 + 4); }
+      pal.push(Math.round(r / bx.cnt), Math.round(gg / bx.cnt), Math.round(b / bx.cnt));
+    }
+    while (pal.length < 3 * n) pal.push(0, 0, 0);
+    return pal;
+  }
+  function lzw(idx) {
+    const MIN = 8, CLEAR = 256, EOI = 257;
+    let size = MIN + 1, next = EOI + 1, cur = 0, nb = 0;
+    const table = new Map();
+    let buf = new Uint8Array(65536), len = 0;
+    const put = byte => { if (len === buf.length) { const nbuf = new Uint8Array(buf.length * 2); nbuf.set(buf); buf = nbuf; } buf[len++] = byte; };
+    const emit = code => { cur |= code << nb; nb += size; while (nb >= 8) { put(cur & 255); cur >>>= 8; nb -= 8; } };
+    emit(CLEAR);
+    let ib = idx[0];
+    for (let i = 1; i < idx.length; i++) {
+      const k = idx[i], key = (ib << 8) | k, hit = table.get(key);
+      if (hit !== undefined) { ib = hit; continue; }
+      emit(ib);
+      if (next === 4096) { emit(CLEAR); next = EOI + 1; size = MIN + 1; table.clear(); }
+      else { if (next >= (1 << size)) size++; table.set(key, next++); }
+      ib = k;
+    }
+    emit(ib); emit(EOI);
+    if (nb > 0) put(cur & 255);
+    const out = new Uint8Array(len + Math.ceil(len / 255));     // 255-byte sub-blocks, each with its length first
+    let o = 0;
+    for (let i = 0; i < len; i += 255) { const m = Math.min(255, len - i); out[o++] = m; out.set(buf.subarray(i, i + m), o); o += m; }
+    return out.subarray(0, o);
+  }
+  // a .zip of stored (uncompressed: PNGs are compressed already) files
+  let crcTab = null;
+  function crc32(d) {
+    if (!crcTab) { crcTab = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; crcTab[n] = c >>> 0; } }
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < d.length; i++) c = crcTab[(c ^ d[i]) & 255] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+  function makeZip(files) {
+    const parts = [], cen = [];
+    let off = 0;
+    for (const f of files) {
+      const nm = new TextEncoder().encode(f.name), crc = crc32(f.data), n = f.data.length;
+      const h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(12, 0x21, true);
+      h.setUint32(14, crc, true); h.setUint32(18, n, true); h.setUint32(22, n, true); h.setUint16(26, nm.length, true);
+      parts.push(h.buffer, nm, f.data);
+      const c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(14, 0x21, true);
+      c.setUint32(16, crc, true); c.setUint32(20, n, true); c.setUint32(24, n, true); c.setUint16(28, nm.length, true);
+      c.setUint32(42, off, true);
+      cen.push(c.buffer, nm);
+      off += 30 + nm.length + n;
+    }
+    const csize = cen.reduce((s, p) => s + p.byteLength, 0);
+    const e = new DataView(new ArrayBuffer(22));
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+    e.setUint32(12, csize, true); e.setUint32(16, off, true);
+    return new Blob([...parts, ...cen, e.buffer], { type: 'application/zip' });
   }
 
   // the box on the map while the window is open
@@ -1258,6 +1676,15 @@ const Vol = (() => {
     $('volCam').onchange = () => setCamMode($('volCam').value);
     $('volT').oninput = () => { stopPlay(); goTime(+$('volT').value, false); };
     $('volPlay').onclick = play;
+    $('volFollow').onchange = () => setFollow($('volFollow').checked);
+    $('volFollowId').onchange = () => { follow.id = $('volFollowId').value; follow.at = null; load(true); };
+    $('volFTrack').onchange = draw;
+    $('volExport').onclick = async () => {
+      const p = $('volExp'), opening = p.classList.contains('hidden');
+      p.classList.toggle('hidden', !opening);
+      if (opening) { if (follow.on) fillFollow(); await refreshTimes(); fillExport(); }
+    };
+    $('volExGo').onclick = exportLoop;
     $('volLive').onchange = () => { if ($('volLive').checked) goLive(); };
     $('volTop').oninput = () => { $('volTopV').textContent = `${$('volTop').value} km`; };
     $('volTop').onchange = () => load(true);
@@ -1319,6 +1746,8 @@ const Vol = (() => {
     new ResizeObserver(() => { if (box) draw(); }).observe($('volCanvas'));
   }
 
-  return { init, open, close, drawBox, openTornado, closeTornado, followTime };
+  const state = () => ({ box, replayT, follow: { on: follow.on, id: follow.id, label: follow.label, track: follow.tr && follow.tr.id },
+    cam: { mode: cam.mode, dist: cam.dist, speed: cam.speed, fp: cam.fp && { ...cam.fp } } });
+  return { init, open, close, drawBox, openTornado, closeTornado, followTime, state };
 })();
 window.Vol = Vol;

@@ -1,3 +1,11 @@
+# Atmos-WRF 1.2
+
+**New:** Follow tornado in the 3-D view (locks onto a tornado, or the strongest low-level rotation, and keeps it in the middle through playback, the map's replay and the ground camera), Export loop (save the 3-D view as a WebM / MP4 video, GIF or PNG frames over any range of the saved volumes), 3-D nests at their own resolution (insets, live and in replay), 1990s (legacy) WSR-88D radars (Radar tab, Era), and a live feed for the PMWeather (Minecraft) addon with cloud volumes for drawing
+
+**Fixed:**
+- the steady environment's runaway cold, foggy surface layer (the "random huge cold pool")
+- the 3-D ground (land cover / satellite) staying stale or black after the box moved while roads were still loading
+
 # Atmos-WRF 1.1
 
 **New:** 3-D view upgrades: free camera and a from-the-ground chaser camera, a much more realistic cloud renderer (smooth billowy towers, rain curtains, proper sunlight and shadows, Detail and Rain sliders), replay (go back in time in 3-D like the radar, and it follows the map's replay bar), and the real landscape (3-D trees from ESA WorldCover, real roads from OpenStreetMap, real land cover or sharp satellite ground around the camera)

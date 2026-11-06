@@ -190,7 +190,7 @@ const Chase = (() => {
 
   // ---------------------------------------------------------------- the car
   function place(x, y, yawHint) {
-    const n = Roads.nearest(x, y, 6, 6000);
+    const n = Roads.nearest(x, y, 6, 3000) || Roads.nearest(x, y, 7, 15000);
     let px = x, py = y, yaw = yawHint || 0;
     if (n) {
       px = n.x; py = n.y; yaw = n.yaw;
@@ -279,8 +279,9 @@ const Chase = (() => {
   function resetCar() {
     const c = st.car;
     if (!c) return;
-    place(c.p[0], c.p[1], c.yaw);
-    say('Back on the road', 1500);
+    if (place(c.p[0], c.p[1], c.yaw)) { st.offroadStart = null; say('Back on the road', 1500); }
+    else say(Roads.state.pending ? 'No road loaded near here yet: set upright, the roads are still coming in'
+                                 : 'No road or track within 15 km: set upright where you are', 3500);
   }
 
   // ---------------------------------------------------------------- the camera
@@ -327,7 +328,15 @@ const Chase = (() => {
       if (place(h.x, h.y, h.yaw)) { st.spawned = true; say(`On the road, ${(Math.hypot(c.p[0] - h.x, c.p[1] - h.y) / 1000).toFixed(1)} km from where you were dropped. Chase ${h.what}!`, 5000); }
     }
     if (!st.spawned && !st.dropT) st.dropT = now;
-    if (!st.spawned && now - st.dropT > 90000) { st.spawned = true; say('No roads came in from OpenStreetMap: off-road it is (R puts you on a road once they arrive).', 6000); }
+    if (!st.spawned && now - st.dropT > 45000) {
+      st.spawned = true; st.offroadStart = [c.p[0], c.p[1]];
+      say('The roads are still loading: off-road for now (you go onto a road as soon as one arrives, or press R).', 6000);
+    }
+    // started off-road: onto the first road that arrives, unless the car has already driven off somewhere
+    if (st.offroadStart && Roads.state.segs && Roads.state.segs.n) {
+      if (Math.hypot(c.p[0] - st.offroadStart[0], c.p[1] - st.offroadStart[1]) < 150 && place(c.p[0], c.p[1], c.yaw)) say('On the road now', 2500);
+      st.offroadStart = null;
+    }
     input(dt);
     // the model's rain at the car: a wet road (the lowest levels' precipitation)
     const pr = Render.sample ? Render.sample(c.p[0], c.p[1]) : 0;

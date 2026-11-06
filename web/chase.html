@@ -39,6 +39,15 @@
   .tabs button.on { background: var(--accent); color: #04121c; border-color: var(--accent); font-weight: 600; }
   #menuBtn { position: fixed; right: 16px; top: 34px; cursor: pointer; padding: 4px 10px; font-size: 12px; background: rgba(12,18,26,.7); }
   #visReset { margin-top: 12px; cursor: pointer; }
+  #menuX { position: absolute; right: 10px; top: 10px; width: 30px; height: 30px; padding: 0; font-size: 18px; line-height: 1; cursor: pointer; }
+  #help .tabs { padding-right: 40px; }
+  #multi .code { font: 700 34px Consolas, monospace; letter-spacing: .15em; color: var(--accent); margin: 8px 0; }
+  #multi p { color: var(--dim); margin: 6px 0; }
+  #multi b { color: var(--text); word-break: break-all; }
+  #multi label.chk { text-transform: none; letter-spacing: 0; font-size: 14px; color: var(--text); }
+  .plist { list-style: none; padding: 0; margin: 4px 0; }
+  .plist li { padding: 3px 0; display: flex; gap: 6px; align-items: center; }
+  .plist button { margin-left: auto; padding: 2px 8px; font-size: 12px; cursor: pointer; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -65,13 +74,19 @@
       <input id="color" type="color" value="#c41e24">
     </div>
   </div>
+  <div id="codeRow" class="hidden">
+    <label for="code">Join code (from the host)</label>
+    <input id="code" type="text" inputmode="numeric" maxlength="12" placeholder="6 digits">
+  </div>
   <button id="go">Drive</button>
   <div id="startMsg"></div>
 </div>
 
 <button id="menuBtn" title="Controls and settings (H)">☰ Menu</button>
 <div id="help" class="panel hidden">
-  <div class="tabs"><button data-tab="tabControls" class="on">Controls</button><button data-tab="tabSettings">Settings</button></div>
+  <button id="menuX" title="Close (H or Esc)">×</button>
+  <div class="tabs"><button data-tab="tabControls" class="on">Controls</button><button data-tab="tabSettings">Settings</button><button data-tab="tabMulti">Multiplayer</button></div>
+  <div id="tabMulti" class="hidden"><div id="multi"></div></div>
   <div id="tabControls">
   <table>
     <tr><td>W / ↑</td><td>Throttle</td></tr>
@@ -111,6 +126,8 @@
     </div>
     <h3>Quality</h3>
     <div class="q">
+      <span title="Trees where the real land has them, made on this computer">Trees</span>
+      <select data-k="trees"><option value="full">Full (70 000)</option><option value="light">Light (25 000)</option><option value="off">Off</option></select>
       <span>Render scale</span>
       <select data-k="scale"><option value="0.5">50 %</option><option value="0.66">66 %</option><option value="0.75">75 %</option><option value="0.9">90 %</option><option value="1">100 %</option></select>
       <span>Cloud smoothing</span>
@@ -127,6 +144,8 @@
 <script src="/static/js/chase/carphys.js"></script>
 <script src="/static/js/chase/carmesh.js"></script>
 <script src="/static/js/chase/roads.js"></script>
+<script src="/static/js/chase/scenery.js"></script>
+<script src="/static/js/chase/net.js"></script>
 <script src="/static/js/chase/render.js"></script>
 <script src="/static/js/chase/game.js"></script>
 </body>

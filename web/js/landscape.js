@@ -388,7 +388,7 @@ const Land = (() => {
   }
 
   return {
-    init, want, reset, drawTrees, standNear, coverAt, setTrees: on => { treesOn = !!on; if (!on) trees.n = 0; },
+    init, want, reset, drawTrees, standNear, coverAt, cover: () => (detail.ok ? detail.lc : null), setTrees: on => { treesOn = !!on; if (!on) trees.n = 0; },
     coarse: () => (coarse.ok ? coarse.tex : null),
     detail: () => (detail.ok ? { tex: detail.tex, box: detail.box } : null),
     trees: () => trees,

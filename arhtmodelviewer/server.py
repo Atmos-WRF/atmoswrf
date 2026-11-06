@@ -261,6 +261,9 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if path == "/remote" or path.startswith("/api/r/"):
             return False                          # the phone remote: its API checks its own PIN tokens (remote.py)
+        from . import chase
+        if chase.allowed(path, self.command, self.headers.get("X-Chase-Token")):
+            return False                          # chase mode's friends, while hosting is on (chase.py)
         self._send(403, b"Only the GR2Analyst polling feed (/poll/) is shared with other computers.\n",
                    "text/plain")
         return True
@@ -346,6 +349,21 @@ class Handler(BaseHTTPRequestHandler):
                                   "application/octet-stream", encoding="deflate")
             if path == "/remote":
                 return self._send(200, (WEB / "remote.html").read_bytes(), "text/html; charset=utf-8")
+            if path == "/chase":
+                return self._send(200, (WEB / "chase.html").read_bytes(), "text/html; charset=utf-8")
+            if path == "/api/volume/buildings":
+                # chase mode's buildings (chase.py): OpenStreetMap's footprints in the box, fetched in the background
+                from . import chase
+                sim = APP.sim
+                if sim is None:
+                    return self._error(404, "no run")
+                try:
+                    return self._json(chase.buildings(sim.proj, [float(q[k]) for k in ("x0", "y0", "x1", "y1")]))
+                except (KeyError, ValueError) as e:
+                    return self._error(400, str(e))
+            if path == "/api/c/host":
+                from . import chase
+                return self._json(dict(chase.host(), urls=self._chase_urls()))
             if path.startswith("/api/r/"):
                 return self._remote_get(path[len("/api/r/"):], q)
             if path == "/api/remote/config":
@@ -523,6 +541,34 @@ class Handler(BaseHTTPRequestHandler):
             if got:
                 sim.lock.release()
         return self._json(info)
+
+    # ------------------------------------------------------------ chase mode's multiplayer (chase.py)
+    @staticmethod
+    def _chase_urls() -> list:
+        port = _NET["port"]
+        return [f"http://{a}:{port}/chase" for a in _NET["lan"]]
+
+    def _chase_post(self, what: str, body: dict):
+        from . import chase
+        try:
+            local = ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            local = False
+        tok = self.headers.get("X-Chase-Token")
+        try:
+            if what == "host":
+                if not local:
+                    return self._error(403, "only the host's own PC switches hosting")
+                return self._json(dict(chase.host(body.get("on"), bool(body.get("new_code"))), urls=self._chase_urls()))
+            if what == "join":
+                return self._json(chase.join(body, self.client_address[0], local))
+            if what == "sync":
+                return self._json(chase.sync(tok, body))
+            if what == "leave":
+                return self._json(chase.leave(tok))
+        except PermissionError as e:
+            return self._error(403, str(e))
+        return self._error(404, "unknown chase call")
 
     # ------------------------------------------------------------ phone remote (remote.py)
     @staticmethod
@@ -1035,6 +1081,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(gr2sites.install() if body.get("install") else gr2sites.status())
             if path.startswith("/api/r/"):
                 return self._remote_post(path[len("/api/r/"):], body)
+            if path.startswith("/api/c/"):
+                return self._chase_post(path[len("/api/c/"):], body)
             if path == "/api/remote/config":
                 from . import remote
                 return self._json(dict(remote.update(body), urls=self._remote_urls()))

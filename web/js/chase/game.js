@@ -50,7 +50,8 @@ const Chase = (() => {
   const CAMS = ['chase', 'hood', 'driver'];
   // the look (the 3-D view's cloud-mode settings, plus quality): the menu's Settings tab, kept in this browser
   const VIS0 = { density: 0.5, rain: 1, detail: 0.7, relief: 0.6, haze: 180, sunMode: 'model', sunAz: 235, sunH: 30,
-                 base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3 };
+                 base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3, trees: 'full' };
+  const TREE_BUDGET = { off: 0, light: 25000, full: 70000 };
 
   const st = {
     run: null, targets: null, car: null, box: null, volBusy: false, volAt: 0, volErr: '', started: false,
@@ -205,6 +206,14 @@ const Chase = (() => {
     st.kind = $('vehicle').value;
     st.color = hexRgb($('color').value);
     try { localStorage.setItem('chase.name', st.name); localStorage.setItem('chase.kind', st.kind); localStorage.setItem('chase.color', $('color').value); } catch (e) { /* private */ }
+    $('go').disabled = true; $('startMsg').textContent = Net.local ? '' : 'Joining…';
+    try { await Net.join(st.name, st.kind, st.color, $('code').value.trim()); }
+    catch (e) {
+      // this PC on a viewer older than chase multiplayer: drive alone
+      if (Net.local && /^404|^unknown/.test(e.message)) Net.st.err = 'restart the viewer for multiplayer and buildings';
+      else { $('go').disabled = false; $('startMsg').textContent = `Could not join: ${e.message}`; return; }
+    }
+    if (Net.local) Net.hostStatus();
     $('start').classList.add('hidden');
     st.started = true;
     await poll();
@@ -216,6 +225,8 @@ const Chase = (() => {
     const dx = ux * Math.cos(a) - uy * Math.sin(a), dy = ux * Math.sin(a) + uy * Math.cos(a);
     const sx = s.x + dx * 12000, sy = s.y + dy * 12000;
     st.car = new CarPhys.Car(st.kind, ground);
+    st.car.solid = Scenery.solid;
+    st.extraCars = remoteCars; st.extraMap = remoteMap;
     st.car.reset(sx, sy, 0);
     st.spawnHint = { x: sx, y: sy, yaw: Math.atan2(s.y - sy, s.x - sx), what: s.what };
     say(`Heading for ${s.what}: loading the storm and the roads…`, 4000);
@@ -224,6 +235,17 @@ const Chase = (() => {
     st.last = performance.now();
     requestAnimationFrame(tick);
     setInterval(poll, 4000);
+    // the streaming (network) on its own clock, not the frames'
+    const stream = () => {
+      const c = st.car;
+      Roads.update(c.p[0], c.p[1], Render.terrain, () => Render.setRoads(Roads.state.mesh, Roads.state.origin));
+      loadVolume(false);
+      Scenery.updateBuildings(c.p[0], c.p[1], Render.terrain, () => Render.setBuildings(Scenery.state.bMesh, Scenery.state.bOrigin));
+    };
+    stream();
+    setInterval(stream, 500);
+    // the car to the others on its own clock: it keeps going while this tab is in the background
+    setInterval(() => { if (st.car) Net.tick(st.car, { name: st.name, kind: st.kind, color: st.color }); }, 40);
   }
 
   // ---------------------------------------------------------------- input
@@ -310,14 +332,16 @@ const Chase = (() => {
     st.wet = Math.max(st.wet - dt / 600, Math.min(1, st.rain / 0.6));
     if (st.spawned) c.update(dt);
     if (!isFinite(c.p[0]) || c.p[2] < -50) resetCar();
-    Roads.update(c.p[0], c.p[1], Render.terrain, () => Render.setRoads(Roads.state.mesh, Roads.state.origin));
-    loadVolume(false);
+    if (Scenery.updateTrees(c.p[0], c.p[1], Render.terrain, TREE_BUDGET[st.vis.trees] || 0)) {
+      const ss = Scenery.state;
+      Render.setTrees(ss.trees, ss.treeN, ss.treeNear, ss.treeOrigin);
+    }
     if (st.box) Land.want(st.box, st.vis.base, { x: c.p[0] / 1000, y: c.p[1] / 1000 }, (x, y) => Render.terrain(x * 1000, y * 1000) / 1000);
     const view = camera(dt);
     const q = st.vis;
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
     if (st.extraCars) cars.push(...st.extraCars());
-    const fr = Render.frame({ ...view, sun: sunDir(), scale: q.scale, density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64 }, cars);
+    const fr = Render.frame({ ...view, sun: sunDir(), scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64 }, cars);
     hud(fr, view);
     requestAnimationFrame(tick);
   }
@@ -345,6 +369,17 @@ const Chase = (() => {
       g.beginPath(); g.moveTo(s[0] - 8, s[1] - 14); g.lineTo(s[0], s[1] - 4); g.lineTo(s[0] + 8, s[1] - 14); g.stroke();
       g.font = '600 12px Segoe UI'; g.fillStyle = '#ffd0d0'; g.textAlign = 'center';
       g.fillText(`T${t.id}${t.ef !== null && t.ef !== undefined ? ' EF' + t.ef : ''} · ${(d / 1000).toFixed(1)} km`, s[0], s[1] - 20);
+    }
+    // the other chasers' names over their cars
+    if (fr) for (const o of st.lastOthers || []) {
+      const s = Render.project(fr.VP, fr.G, [o.p[0], o.p[1], o.p[2] + 2.4]);
+      if (!s || s[0] < 0 || s[0] > W || s[1] < 0 || s[1] > H) continue;
+      const d = Math.hypot(o.p[0] - c.p[0], o.p[1] - c.p[1]);
+      g.font = '600 13px Segoe UI'; g.textAlign = 'center';
+      const label = `${o.name} · ${d < 1000 ? Math.round(d) + ' m' : (d / 1000).toFixed(1) + ' km'}`;
+      const w = g.measureText(label).width + 12;
+      g.fillStyle = 'rgba(8,12,18,.55)'; roundRect(g, s[0] - w / 2, s[1] - 18, w, 20, 6); g.fill();
+      g.fillStyle = `rgb(${o.color.map(v => Math.min(255, v + 90)).join(',')})`; g.fillText(label, s[0], s[1] - 4);
     }
     // the speedo
     const v = c.forwardSpeed, sp = st.units === 'mph' ? Math.abs(v) * 2.23694 : Math.abs(v) * 3.6;
@@ -378,6 +413,13 @@ const Chase = (() => {
     else { const s = storm(); if (s) lines.push(`No tornado on the ground · ${s.what} ${(Math.hypot(s.x - c.p[0], s.y - c.p[1]) / 1000).toFixed(1)} km ${bearing(s.x - c.p[0], s.y - c.p[1])}`); }
     const wr = activeWarnings(c.p[0] / 1000, c.p[1] / 1000);
     if (wr.length) lines.push(`You are in a ${wr.map(w => w.kind === 'TOR' ? 'TORNADO WARNING' : w.kind === 'SVR' ? 'severe thunderstorm warning' : w.kind).join(' and a ')}`);
+    const ns = Net.st;
+    if (Net.local && ns.hosting) lines.push(`Hosting · join code ${ns.code} · ${ns.others.size} friend${ns.others.size === 1 ? '' : 's'} here`);
+    else if (!Net.local) lines.push(`Joined the host · ${ns.others.size + 1} chasers · ${Math.round(ns.rtt)} ms`);
+    else if (ns.others.size) lines.push(`${ns.others.size} other chaser${ns.others.size > 1 ? 's' : ''} on this PC`);
+    if (ns.err) lines.push(`Multiplayer: ${ns.err}`);
+    if (Scenery.state.bPending) lines.push(`Fetching buildings from OpenStreetMap (${Scenery.state.bPending} area${Scenery.state.bPending > 1 ? 's' : ''} to go)…`);
+    if (Scenery.state.bErr) lines.push(`Buildings: ${Scenery.state.bErr}`);
     if (Roads.state.pending) lines.push(`Fetching roads from OpenStreetMap (${Roads.state.pending} area${Roads.state.pending > 1 ? 's' : ''} to go)…`);
     if (st.volErr) lines.push(`Storm volume: ${st.volErr}`);
     g.fillStyle = 'rgba(8,12,18,.5)'; roundRect(g, 14, 14, Math.max(...lines.map(l => g.measureText(l).width), 10) + 24, 12 + lines.length * 20, 8); g.fill();
@@ -462,6 +504,63 @@ const Chase = (() => {
     g.strokeStyle = '#111'; g.lineWidth = H * 0.025; g.beginPath(); g.arc(W * 0.33, H * 1.02, H * 0.2, Math.PI * 1.05, Math.PI * 1.95); g.stroke();
   }
 
+  // ---------------------------------------------------------------- the other chasers
+  const mounts = new Map();                         // kind -> the wheels' mounts (from a car of that kind)
+  function wheelMounts(kind) {
+    if (!mounts.has(kind)) mounts.set(kind, new CarPhys.Car(kind, () => ({ h: 0, n: [0, 0, 1], ...SURF.asphalt })).wheels.map(w => w.mount));
+    return mounts.get(kind);
+  }
+  function remoteCars() {
+    const list = Net.others();
+    st.lastOthers = list;
+    return list.map(o => {
+      const kind = CarPhys.SPECS[o.kind] ? o.kind : 'suv', M = CarPhys.qmat(o.q), up = M[2], m = wheelMounts(kind);
+      const wheels = m.map((mt, i) => {
+        const w = CarPhys.toWorld(M, mt);
+        return { c: [o.p[0] + w[0] - up[0] * o.L[i], o.p[1] + w[1] - up[1] * o.L[i], o.p[2] + w[2] - up[2] * o.L[i]],
+                 steer: i < 2 ? o.st[i] : 0, spin: o.sp[i], left: i % 2 === 0 };
+      });
+      return { kind, color: o.color, p: o.p, M, wheels, hidden: false };
+    });
+  }
+  function remoteMap(g, P) {
+    for (const o of st.lastOthers || []) {
+      const s = P(o.p[0], o.p[1]);
+      g.fillStyle = `rgb(${o.color.join(',')})`; g.strokeStyle = '#fff'; g.lineWidth = 1.5;
+      g.beginPath(); g.arc(s[0], s[1], 5, 0, 7); g.fill(); g.stroke();
+      g.font = '600 10px Segoe UI'; g.fillStyle = '#fff'; g.textAlign = 'left'; g.fillText(o.name, s[0] + 7, s[1] + 3);
+    }
+  }
+  const esc = t => String(t).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+  // the Multiplayer tab
+  async function fillMulti() {
+    const ns = Net.st, el = $('multi');
+    if (!el) return;
+    if (Net.local) await Net.hostStatus();
+    const players = [...ns.others.values()];
+    const rows = players.map(o => `<li><span style="color:rgb(${o.color.map(v => Math.min(255, v + 80)).join(',')})">●</span> ${esc(o.name)} <button data-go="${o.id}">Drive to</button></li>`).join('');
+    const where = ns.urls.length ? ns.urls.map(u => `<b>${esc(u)}</b>`).join(' or ')
+      : '<b>http://&lt;this PC address&gt;:8830/chase</b> (the viewer needs --lan, which Atmos-WRF.cmd gives it)';
+    el.innerHTML = Net.local
+      ? `<label class="chk"><input id="hostOn" type="checkbox" ${ns.hosting ? 'checked' : ''}> Let friends join (LAN or Tailscale)</label>` +
+        (ns.hosting ? `<div class="code">${ns.code}</div><p>Friends open ${where} and type this code. Friends away from home use the Tailscale address (100.x.x.x).</p>` +
+                      '<button id="newCode">New code (kicks everyone)</button>'
+                    : '<p>Off: nobody else can reach chase mode or the run.</p>')
+      : `<p>Joined the host as <b>${esc(st.name)}</b>.</p>`;
+    el.innerHTML += `<h3>Chasers</h3><ul class="plist"><li>● ${esc(st.name)} (you)</li>${rows}</ul>`;
+    const on = $('hostOn');
+    if (on) on.onchange = async () => { try { await Net.host(on.checked); } catch (e) { say(e.message, 3000); } fillMulti(); };
+    const nc = $('newCode');
+    if (nc) nc.onclick = async () => { await Net.host(true, true); fillMulti(); };
+    for (const b of el.querySelectorAll('[data-go]')) b.onclick = () => {
+      const o = (st.lastOthers || []).find(o => o.id === +b.dataset.go);
+      if (!o || !st.car) return;
+      const M = CarPhys.qmat(o.q), yaw = Math.atan2(M[0][1], M[0][0]);
+      place(o.p[0] - Math.cos(yaw) * 25, o.p[1] - Math.sin(yaw) * 25, yaw);
+      say(`Behind ${o.name}`, 1500);
+    };
+  }
+
   // a photo: the view at full size and quality (Shift+P: with the HUD), saved as a PNG
   function photo(withHud) {
     const q = st.vis, keep = { scale: q.scale, blend: q.blend };
@@ -469,7 +568,7 @@ const Chase = (() => {
     const view = camera(0), c = st.car;
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
     if (st.extraCars) cars.push(...st.extraCars());
-    Render.frame({ ...view, sun: sunDir(), scale: 1, density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief,
+    Render.frame({ ...view, sun: sunDir(), scale: 1, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief,
                    haze: q.haze, base: q.base, wet: st.wet, quality: 1, blend: 0, seed: 0 }, cars);
     Object.assign(q, keep);
     const v = $('view'), out = document.createElement('canvas');
@@ -555,8 +654,20 @@ const Chase = (() => {
     show();
     for (const b of document.querySelectorAll('.tabs button')) b.onclick = () => {
       for (const o of document.querySelectorAll('.tabs button')) { o.classList.toggle('on', o === b); $(o.dataset.tab).classList.toggle('hidden', o !== b); }
+      if (b.dataset.tab === 'tabMulti') fillMulti();
     };
+    setInterval(() => {
+      if (st.started && !$('tabMulti').classList.contains('hidden') && !$('help').classList.contains('hidden') &&
+          !(document.activeElement && document.activeElement.closest && document.activeElement.closest('#multi'))) fillMulti();
+    }, 3000);
+    if (!Net.local) {
+      $('codeRow').classList.remove('hidden');
+      const c = new URLSearchParams(location.search).get('code');
+      if (c) $('code').value = c;
+      $('go').textContent = 'Join and drive';
+    }
     $('menuBtn').onclick = () => $('help').classList.toggle('hidden');
+    $('menuX').onclick = () => $('help').classList.add('hidden');
   }
 
   return { init, st, surfAt, tornadoes, say };

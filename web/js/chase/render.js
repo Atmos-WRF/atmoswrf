@@ -13,6 +13,9 @@ const Render = (() => {
   const gb = { fbo: null, col: null, dist: null, depth: null, w: 0, h: 0 };
   const roads = { buf: null, vao: null, n: 0, origin: [0, 0] };
   const meshes = new Map();                      // car kind/colour -> { body, wheel }
+  let treeProg = null;
+  const trees = { mesh: null, near: 0, far: 0, inst: null, count: 0, nearCount: 0, origin: [0, 0], vao: null };
+  const blds = { buf: null, vao: null, n: 0, origin: [0, 0] };
 
   // ---------------------------------------------------------------- shaders
   const ROAD_VS = `#version 300 es
@@ -89,6 +92,59 @@ const Render = (() => {
     o1 = vec4(length(wpos - eye), 0.0, 0.0, 1.0);
   }`;
 
+  // the trees (scenery.js): a hexagonal trunk and a lumpy low-poly crown, one instance per tree
+  const TREE_VS = `#version 300 es
+  layout(location = 0) in vec3 p; layout(location = 1) in vec3 n; layout(location = 2) in float part;
+  layout(location = 3) in vec4 a; layout(location = 4) in vec2 b;
+  uniform mat4 VP; uniform vec3 org; uniform float s;
+  out vec3 wpos; out vec3 nw; out vec3 col;
+  void main() {
+    float h = a.w, cr = b.x, sd = b.y;
+    vec3 local, nn;
+    if (part < 0.5) {
+      float tr = 0.12 + h * 0.018;
+      local = vec3(p.xy * tr, p.z * (h - cr * 1.1));
+      nn = n; col = vec3(0.42, 0.35, 0.29);
+    } else {
+      float lump = 1.0 + 0.2 * sin(p.x * 3.1 + sd * 40.0) * sin(p.y * 2.7 + sd * 17.0) + 0.14 * sin(p.z * 4.3 + sd * 9.0);
+      vec3 sc = vec3(cr, cr * (0.85 + 0.3 * fract(sd * 3.7)), cr * (0.8 + 0.45 * fract(sd * 7.3)));
+      local = vec3(0.0, 0.0, h - sc.z) + p * sc * lump;
+      nn = normalize(n / sc);
+      col = mix(vec3(0.34, 0.43, 0.23), vec3(0.50, 0.55, 0.32), fract(sd * 13.7)) * (0.82 + 0.22 * p.z);
+    }
+    float c = cos(sd * 31.0), si = sin(sd * 31.0);
+    mat2 rot = mat2(c, si, -si, c);
+    local.xy = rot * local.xy; nn.xy = rot * nn.xy;
+    nw = nn;
+    wpos = org + (a.xyz + local) * s;
+    gl_Position = VP * vec4(wpos, 1.0);
+  }`;
+  function treeMesh() {
+    const V = [];
+    const P = (x, y, z, nx, ny, nz, part) => V.push(x, y, z, nx, ny, nz, part);
+    for (let i = 0; i < 6; i++) {                     // the trunk: a hexagonal prism, radius 1, 0..1 high
+      const a0 = i * Math.PI / 3, a1 = (i + 1) * Math.PI / 3, am = (a0 + a1) / 2;
+      const q = [[Math.cos(a0), Math.sin(a0), 0], [Math.cos(a1), Math.sin(a1), 0], [Math.cos(a1), Math.sin(a1), 1], [Math.cos(a0), Math.sin(a0), 1]];
+      for (const k of [0, 1, 2, 0, 2, 3]) P(...q[k], Math.cos(am), Math.sin(am), 0, 0);
+    }
+    // the crown: an icosahedron, each face split in four, pushed out to the sphere
+    const t = (1 + Math.sqrt(5)) / 2;
+    let vs = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]];
+    const fs = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+                [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+    const nrm = v => { const l = Math.hypot(...v); return v.map(x => x / l); };
+    vs = vs.map(nrm);
+    for (const [a, b, c] of fs) {
+      const A = vs[a], B = vs[b], C = vs[c];
+      const ab = nrm(A.map((x, i) => x + B[i])), bc = nrm(B.map((x, i) => x + C[i])), ca = nrm(C.map((x, i) => x + A[i]));
+      for (const tri of [[A, ab, ca], [ab, B, bc], [ca, bc, C], [ab, bc, ca]]) for (const v of tri) P(v[0], v[1], v[2], v[0], v[1], v[2], 1);
+    }
+    const near = V.length / 7;
+    // far away: the plain icosahedron, no trunk
+    for (const f of fs) for (const k of f) P(...vs[k], ...vs[k], 1);
+    return { data: new Float32Array(V), near, far: V.length / 7 - near };
+  }
+
   function compile(type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src); gl.compileShader(s);
@@ -121,6 +177,20 @@ const Render = (() => {
     lightProg = program(L().VS, L().FS_LIGHT);
     roadProg = program(ROAD_VS, ROAD_FS);
     meshProg = program(MESH_VS, MESH_FS);
+    treeProg = program(TREE_VS, MESH_FS);
+    trees.vao = gl.createVertexArray(); trees.mesh = gl.createBuffer(); trees.inst = gl.createBuffer();
+    const tm = treeMesh();
+    gl.bindVertexArray(trees.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, trees.mesh); gl.bufferData(gl.ARRAY_BUFFER, tm.data, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 28, 12);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 28, 24);
+    gl.bindBuffer(gl.ARRAY_BUFFER, trees.inst);
+    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 24, 0); gl.vertexAttribDivisor(3, 1);
+    gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 2, gl.FLOAT, false, 24, 16); gl.vertexAttribDivisor(4, 1);
+    gl.bindVertexArray(null);
+    trees.near = tm.near; trees.far = tm.far;
+    blds.vao = gl.createVertexArray(); blds.buf = gl.createBuffer();
     vao = gl.createVertexArray();
     volTex = gl.createTexture(); gndTex = gl.createTexture(); lightTex = gl.createTexture(); lightFbo = gl.createFramebuffer();
     for (let i = 0; i < 4; i++) insTex.push(gl.createTexture());
@@ -241,6 +311,22 @@ const Render = (() => {
     roads.n = verts.length / 7; roads.origin = origin;
   }
 
+  // the trees' instances (6 floats each), the first nearCount of them close enough for the detailed tree
+  function setTrees(inst, n, nearCount, origin) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, trees.inst);
+    gl.bufferData(gl.ARRAY_BUFFER, inst, gl.STATIC_DRAW);
+    trees.count = n; trees.nearCount = nearCount; trees.origin = origin;
+  }
+  function setBuildings(mesh, origin) {
+    gl.bindVertexArray(blds.vao); gl.bindBuffer(gl.ARRAY_BUFFER, blds.buf);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 36, 12);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 36, 24);
+    gl.bindVertexArray(null);
+    blds.n = mesh.length / 9; blds.origin = origin;
+  }
+
   function meshBuffer(arr) {
     const v = gl.createVertexArray(), b = gl.createBuffer();
     gl.bindVertexArray(v); gl.bindBuffer(gl.ARRAY_BUFFER, b);
@@ -290,7 +376,7 @@ const Render = (() => {
     return new Float32Array([...x, ...l, ...z]);
   }
 
-  function drawGeometry(G, VP, eye, sun, cars, wet) {
+  function drawGeometry(G, VP, eye, sun, cars, wet, showTrees) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, gb.fbo);
     gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.viewport(0, 0, gb.w, gb.h);
@@ -307,10 +393,32 @@ const Render = (() => {
       gl.bindVertexArray(roads.vao);
       gl.drawArrays(gl.TRIANGLES, 0, roads.n);
     }
+    if (trees.count && showTrees) {
+      gl.useProgram(treeProg);
+      const t = treeProg.u;
+      gl.uniformMatrix4fv(t.VP, false, VP);
+      gl.uniform3f(t.org, ...toBox(G, [trees.origin[0], trees.origin[1], 0]));
+      gl.uniform1f(t.s, s); gl.uniform3f(t.eye, ...eye); gl.uniform3f(t.sunDir, ...sun);
+      gl.bindVertexArray(trees.vao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, trees.inst);
+      gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 24, 0); gl.vertexAttribPointer(4, 2, gl.FLOAT, false, 24, 16);
+      if (trees.nearCount) gl.drawArraysInstanced(gl.TRIANGLES, 0, trees.near, trees.nearCount);
+      const nf = trees.count - trees.nearCount;
+      if (nf > 0) {
+        const o = trees.nearCount * 24;
+        gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 24, o); gl.vertexAttribPointer(4, 2, gl.FLOAT, false, 24, o + 16);
+        gl.drawArraysInstanced(gl.TRIANGLES, trees.near, trees.far, nf);
+      }
+    }
     gl.useProgram(meshProg);
     const u = meshProg.u;
     gl.uniformMatrix4fv(u.VP, false, VP);
     gl.uniform3f(u.eye, ...eye); gl.uniform3f(u.sunDir, ...sun); gl.uniform1f(u.s, s);
+    if (blds.n) {
+      gl.uniformMatrix3fv(u.R, false, new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]));
+      gl.uniform3f(u.org, ...toBox(G, [blds.origin[0], blds.origin[1], 0]));
+      gl.bindVertexArray(blds.vao); gl.drawArrays(gl.TRIANGLES, 0, blds.n);
+    }
     gl.enable(gl.CULL_FACE);
     for (const c of cars) {
       if (c.hidden) continue;
@@ -369,7 +477,7 @@ const Render = (() => {
     const VPr = L().mul(L().perspective(view.fov, W / H, near, far), V);
     const VPc = L().mul(L().perspective(view.fov, W / H, 0.001, 50), V);
     targets(W, H);
-    drawGeometry(G, VPr, eye, view.sun, cars, view.wet);
+    drawGeometry(G, VPr, eye, view.sun, cars, view.wet, view.trees !== false);
     buildLight(G, view.sun, view.density, view.rain);
     gl.viewport(0, 0, W, H);
     if (view.blend > 0) {
@@ -434,6 +542,6 @@ const Render = (() => {
     return [(o[0] / o[3] * 0.5 + 0.5) * cv.clientWidth, (1 - (o[1] / o[3] * 0.5 + 0.5)) * cv.clientHeight];
   }
 
-  return { init, setVolume, setRoads, frame, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
+  return { init, setVolume, setRoads, setTrees, setBuildings, frame, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
 })();
 window.Render = Render;

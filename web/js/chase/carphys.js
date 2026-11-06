@@ -91,6 +91,14 @@
       const zb = S.ground - S.cgH, zt = dh - S.cgH, x0 = -b - (dl - L) / 2, x1 = a + (dl - L) / 2;
       this.corners = [];
       for (const x of [x0, x1, (x0 + x1) / 2]) for (const y of [-dw / 2, dw / 2]) for (const z of [zb, zt]) this.corners.push([x, y, z]);
+      // where the body meets walls and trunks (solid()): a ring round it at bumper height, the roof's corners
+      const zl = S.ground + 0.3 - S.cgH, zu = dh * 0.75 - S.cgH;
+      this.probes = [];
+      for (const [x, y] of [[x1, 0], [x1, dw / 2], [x1, -dw / 2], [x0, 0], [x0, dw / 2], [x0, -dw / 2],
+                            [(x0 + x1) / 2, dw / 2], [(x0 + x1) / 2, -dw / 2], [x1 - (x1 - x0) / 4, dw / 2], [x1 - (x1 - x0) / 4, -dw / 2],
+                            [x0 + (x1 - x0) / 4, dw / 2], [x0 + (x1 - x0) / 4, -dw / 2], [x1, dw / 4], [x1, -dw / 4]]) this.probes.push([x, y, zl]);
+      for (const x of [x0 + 0.4, x1 - 0.6]) for (const y of [-dw / 2 + 0.1, dw / 2 - 0.1]) this.probes.push([x, y, zu]);
+      this.solid = null;                        // (x, y, z) -> { n, d } inside a wall or a trunk (scenery.js)
       this.reset(0, 0, 0);
     }
 
@@ -294,6 +302,21 @@
         const Ff = vtl > 1e-3 ? scl(vt, -Math.min(0.6 * Fn, S.mass * 3 * vtl) / vtl) : [0, 0, 0];
         apply(add(scl(g.n, Fn), Ff), p);
         hit = Math.max(hit, -vn);
+      }
+      // ---- walls and trunks
+      if (this.solid) {
+        for (const cb of this.probes) {
+          const p = add(this.p, toWorld(M, cb));
+          const s = this.solid(p[0], p[1], p[2]);
+          if (!s) continue;
+          const vp = add(this.v, cross(this.w, sub(p, this.p)));
+          const vn = dot(vp, s.n);
+          const Fn = Math.max(0, S.mass * 300 * s.d - S.mass * 30 * Math.min(vn, 0));
+          const vt = sub(vp, scl(s.n, vn)), vtl = len(vt);
+          const Ff = vtl > 1e-3 ? scl(vt, -Math.min(0.4 * Fn, S.mass * 4 * vtl) / vtl) : [0, 0, 0];
+          apply(add(scl(s.n, Fn), Ff), p);
+          hit = Math.max(hit, -vn);
+        }
       }
       this.impact = Math.max(this.impact * Math.exp(-dt * 3), hit);
 

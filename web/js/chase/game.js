@@ -33,25 +33,26 @@ const Chase = (() => {
   // what is under a wheel: grip (mu), rolling drag, the slip at the grip's peak (driving, cornering), the curve's
   // shape (lower: a flatter peak, looser), roughness m
   const SURF = {
-    asphalt: { name: 'Asphalt', mu: 1.0, crr: 0.012, kpk: 0.12, apk: 0.14, C: 1.4, rough: 0 },
-    wet: { name: 'Wet asphalt', mu: 0.72, crr: 0.014, kpk: 0.1, apk: 0.12, C: 1.45, rough: 0 },
-    gravel: { name: 'Gravel', mu: 0.66, crr: 0.03, kpk: 0.2, apk: 0.22, C: 1.15, rough: 0.015 },
-    verge: { name: 'Verge', mu: 0.55, crr: 0.05, kpk: 0.2, apk: 0.22, C: 1.15, rough: 0.025 },
-    grass: { name: 'Grass', mu: 0.5, crr: 0.07, kpk: 0.22, apk: 0.25, C: 1.1, rough: 0.05 },
-    crops: { name: 'Field', mu: 0.55, crr: 0.1, kpk: 0.25, apk: 0.25, C: 1.08, rough: 0.07 },
-    bare: { name: 'Dirt', mu: 0.6, crr: 0.05, kpk: 0.22, apk: 0.24, C: 1.12, rough: 0.04 },
-    town: { name: 'Lawns and lots', mu: 0.7, crr: 0.03, kpk: 0.15, apk: 0.18, C: 1.25, rough: 0.02 },
-    wood: { name: 'Woods', mu: 0.45, crr: 0.15, kpk: 0.25, apk: 0.25, C: 1.05, rough: 0.1 },
-    marsh: { name: 'Marsh', mu: 0.32, crr: 0.25, kpk: 0.3, apk: 0.3, C: 1.0, rough: 0.06 },
-    water: { name: 'Water', mu: 0.25, crr: 0.6, kpk: 0.3, apk: 0.3, C: 1.0, rough: 0.0 },
-    mud: { name: 'Mud', mu: 0.33, crr: 0.16, kpk: 0.3, apk: 0.3, C: 1.0, rough: 0.06 },
+    asphalt: { name: 'Asphalt', mu: 1.05, crr: 0.012, kpk: 0.12, apk: 0.14, C: 1.4, rough: 0 },
+    wet: { name: 'Wet asphalt', mu: 0.88, crr: 0.014, kpk: 0.11, apk: 0.13, C: 1.4, rough: 0 },
+    gravel: { name: 'Gravel', mu: 0.85, crr: 0.03, kpk: 0.16, apk: 0.18, C: 1.3, rough: 0.015 },
+    // off the road: nearly a dirt road's grip (it holds its line), but rolling drag that grows with speed
+    verge: { name: 'Verge', mu: 0.9, crr: 0.05, crrV: 18, kpk: 0.15, apk: 0.17, C: 1.35, rough: 0.025 },
+    grass: { name: 'Grass', mu: 0.88, crr: 0.07, crrV: 14, kpk: 0.15, apk: 0.17, C: 1.35, rough: 0.05 },
+    crops: { name: 'Field', mu: 0.85, crr: 0.1, crrV: 11, kpk: 0.16, apk: 0.18, C: 1.35, rough: 0.07 },
+    bare: { name: 'Dirt', mu: 0.88, crr: 0.05, crrV: 16, kpk: 0.15, apk: 0.17, C: 1.35, rough: 0.04 },
+    town: { name: 'Lawns and lots', mu: 0.92, crr: 0.03, crrV: 20, kpk: 0.14, apk: 0.16, C: 1.35, rough: 0.02 },
+    wood: { name: 'Woods', mu: 0.85, crr: 0.15, crrV: 8, kpk: 0.16, apk: 0.18, C: 1.35, rough: 0.1 },
+    marsh: { name: 'Marsh', mu: 0.8, crr: 0.25, crrV: 6, kpk: 0.17, apk: 0.19, C: 1.3, rough: 0.06 },
+    water: { name: 'Water', mu: 0.75, crr: 0.5, crrV: 4, kpk: 0.18, apk: 0.2, C: 1.3, rough: 0.0 },
+    mud: { name: 'Mud', mu: 0.8, crr: 0.18, crrV: 7, kpk: 0.17, apk: 0.19, C: 1.3, rough: 0.06 },
   };
   const LC = { 10: 'wood', 20: 'grass', 30: 'grass', 40: 'crops', 50: 'town', 60: 'bare', 70: 'bare', 80: 'water', 90: 'marsh', 95: 'marsh', 100: 'grass' };
   const CAMS = ['chase', 'hood', 'driver'];
   // the look (the 3-D view's cloud-mode settings, plus quality): the menu's Settings tab, kept in this browser
   const VIS0 = { density: 0.5, rain: 1, detail: 0.7, relief: 0.6, haze: 180, sunMode: 'model', sunAz: 235, sunH: 30,
                  base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3, trees: 'full',
-                 mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small' };
+                 contrast: 1.3, mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small' };
   const QUICK = ['cref', 'REF', 'VEL', 'SRV', 'RHO', 'none'];          // K steps through these
   const TREE_BUDGET = { off: 0, light: 25000, full: 70000 };
 
@@ -343,7 +344,7 @@ const Chase = (() => {
     const q = st.vis;
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
     if (st.extraCars) cars.push(...st.extraCars());
-    const fr = Render.frame({ ...view, sun: sunDir(), scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64 }, cars);
+    const fr = Render.frame({ ...view, sun: sunDir(), scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64 }, cars);
     hud(fr, view);
     requestAnimationFrame(tick);
   }
@@ -600,7 +601,7 @@ const Chase = (() => {
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
     if (st.extraCars) cars.push(...st.extraCars());
     Render.frame({ ...view, sun: sunDir(), scale: 1, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief,
-                   haze: q.haze, base: q.base, wet: st.wet, quality: 1, blend: 0, seed: 0 }, cars);
+                   haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, quality: 1, blend: 0, seed: 0 }, cars);
     Object.assign(q, keep);
     const v = $('view'), out = document.createElement('canvas');
     out.width = v.width; out.height = v.height;

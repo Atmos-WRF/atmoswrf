@@ -145,6 +145,22 @@ const Render = (() => {
     return { data: new Float32Array(V), near, far: V.length / 7 - near };
   }
 
+  // the 3-D view's cloud shader with a contrast control on the cloud alone (the ground and sky as they are):
+  // dark bases darker, sunlit towers brighter, around a mid grey in log light
+  function cloudSource() {
+    let src = L().FS_CLOUD;
+    const head = 'in vec2 ndc; out vec4 frag;', tail = 'vec3 c = col + T * bg;';
+    if (!src.includes(head) || !src.includes(tail)) return src;
+    src = src.replace(head, head + '\n  uniform float cloudContrast;');
+    src = src.replace(tail, `if (cloudContrast != 1.0 && T < 0.995) {
+      vec3 Lc = col / (1.0 - T);
+      float l = max(dot(Lc, vec3(0.2126, 0.7152, 0.0722)), 1e-4), piv = 0.55;
+      col *= pow(l / piv, cloudContrast - 1.0);
+    }
+    ${tail}`);
+    return src;
+  }
+
   function compile(type, src) {
     const s = gl.createShader(type);
     gl.shaderSource(s, src); gl.compileShader(s);
@@ -173,7 +189,7 @@ const Render = (() => {
     if (!gl) return false;
     if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('this browser cannot render to float textures (EXT_color_buffer_float)');
     floatLinear = !!gl.getExtension('OES_texture_float_linear');
-    cloudProg = program(L().VS, L().FS_CLOUD);
+    cloudProg = program(L().VS, cloudSource());
     lightProg = program(L().VS, L().FS_LIGHT);
     roadProg = program(ROAD_VS, ROAD_FS);
     meshProg = program(MESH_VS, MESH_FS);
@@ -507,6 +523,7 @@ const Render = (() => {
     gl.uniform3f(u.sunDir, ...view.sun);
     gl.uniform1f(u.density, view.density); gl.uniform1f(u.rain, view.rain);
     gl.uniform1f(u.relief, view.relief);
+    gl.uniform1f(u.cloudContrast, view.contrast || 1);
     gl.uniform3f(u.texel, 1 / head.nx, 1 / head.ny, 1 / head.nz);
     // the nests
     const ins = head.insets || [], cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;

@@ -20,21 +20,21 @@
       wheelR: 0.38, wheelI: 1.9, rest: 0.34, travel: 0.17, k: [56000, 52000], zeta: 0.32, arb: [30000, 13000],
       maxSteer: 0.58, steerRate: 2.6, idle: 750, redline: 5900, peakT: 560, peakRpm: 4000, engI: 0.22,
       gears: [4.03, 2.36, 1.53, 1.15, 0.85, 0.67], final: 3.42, rev: 3.6, split: 0.4, lsd: 60,
-      brake: 2900, brakeBias: 0.64, cdA: 1.2, cyA: 6.5, clA: 2.2, ground: 0.24, tire: 1.0,
+      brake: 2900, brakeBias: 0.64, cdA: 1.2, cyA: 6.5, clA: 2.2, ground: 0.24, tire: 1.15,
     },
     sedan: {
       name: 'Sedan', mass: 1480, dims: [4.75, 1.84, 1.45], cgH: 0.53, wheelbase: 2.78, cgFront: 1.10, track: 1.58,
       wheelR: 0.33, wheelI: 1.2, rest: 0.30, travel: 0.13, k: [40000, 34000], zeta: 0.34, arb: [22000, 9000],
       maxSteer: 0.62, steerRate: 2.9, idle: 700, redline: 6600, peakT: 340, peakRpm: 4600, engI: 0.15,
       gears: [3.54, 2.06, 1.40, 1.03, 0.84, 0.69], final: 3.62, rev: 3.3, split: 1.0, lsd: 0,
-      brake: 2100, brakeBias: 0.68, cdA: 0.68, cyA: 4.6, clA: 1.4, ground: 0.15, tire: 1.0,
+      brake: 2100, brakeBias: 0.68, cdA: 0.68, cyA: 4.6, clA: 1.4, ground: 0.15, tire: 1.15,
     },
     truck: {
       name: 'Intercept truck', mass: 5200, dims: [5.9, 2.25, 2.55], cgH: 0.95, wheelbase: 3.6, cgFront: 1.7, track: 1.9,
       wheelR: 0.46, wheelI: 4.5, rest: 0.40, travel: 0.22, k: [130000, 150000], zeta: 0.38, arb: [80000, 60000],
       maxSteer: 0.55, steerRate: 2.0, idle: 650, redline: 4200, peakT: 1350, peakRpm: 2400, engI: 0.6,
       gears: [4.7, 2.21, 1.53, 1.0, 0.76, 0.67], final: 4.1, rev: 4.3, split: 0.35, lsd: 250,
-      brake: 7500, brakeBias: 0.6, cdA: 2.9, cyA: 13, clA: 1.5, ground: 0.34, tire: 0.95,
+      brake: 7500, brakeBias: 0.6, cdA: 2.9, cyA: 13, clA: 1.5, ground: 0.34, tire: 1.1,
     },
   };
 
@@ -265,7 +265,7 @@
           const ff = force(wn);
           fx = ff[0]; fy = ff[1]; wh.kappa = ff[2];
           // rolling resistance of the surface, smooth through zero
-          fx -= Math.tanh(vx / 0.6) * sf_.crr * Fz;
+          fx -= Math.tanh(vx / 0.6) * sf_.crr * Fz * (sf_.crrV ? 1 + Math.abs(vx) / sf_.crrV : 1);
           wh.alpha = Math.atan2(-vy, Math.max(Math.abs(vx), 0.5));
           wh.slip = Math.hypot(wh.kappa / kpk, sy / apk);
         } else {

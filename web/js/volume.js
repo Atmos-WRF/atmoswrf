@@ -569,7 +569,8 @@ const Vol = (() => {
   }
 
   // a tileable 3-D noise, 64^3, two channels: r billowy (inverted Worley fBm over value noise), g value-noise fBm
-  function makeNoise() {
+  function makeNoise(g) {
+    const gl = g || glNow();
     const N = 64, out = new Uint8Array(N * N * N * 2);
     let seed = 1234567;
     const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
@@ -611,6 +612,8 @@ const Vol = (() => {
       gl.texParameteri(gl.TEXTURE_3D, k, v);
     return t;
   }
+
+  const glNow = () => gl;
 
   // ---------------------------------------------------------------- data
   const field = () => $('volField').value;
@@ -1748,6 +1751,8 @@ const Vol = (() => {
 
   const state = () => ({ box, replayT, follow: { on: follow.on, id: follow.id, label: follow.label, track: follow.tr && follow.tr.id },
     cam: { mode: cam.mode, dist: cam.dist, speed: cam.speed, fp: cam.fp && { ...cam.fp } } });
-  return { init, open, close, drawBox, openTornado, closeTornado, followTime, state };
+  // for other pages that draw the same cloud (web/js/chase): the shaders and the detail noise, made in their own context
+  const lib = { VS, FS_CLOUD, FS_LIGHT, makeNoise, perspective, lookAt, invert, mul };
+  return { init, open, close, drawBox, openTornado, closeTornado, followTime, state, lib };
 })();
 window.Vol = Vol;

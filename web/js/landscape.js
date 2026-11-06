@@ -22,7 +22,7 @@ const Land = (() => {
   // road class (landscape.ROAD_CLASSES order) -> width m
   const ROAD_W = [24, 18, 12, 9, 7, 6, 6, 3.5];
 
-  let gl = null, onReady = null;
+  let gl = null, onReady = null, treesOn = true;
   const coarse = { key: '', tex: null, ok: false, busy: false };
   const detail = { key: '', box: null, tex: null, ok: false, busy: false, lc: null, roads: null, base: null, poll: 0 };
   const trees = { buf: null, vao: null, n: 0, prog: null, fbo: null, colTex: null, tTex: null, depth: null, w: 0, h: 0 };
@@ -159,7 +159,7 @@ const Land = (() => {
       if (!detail.tex) detail.tex = gl.createTexture();
       tex2D(detail.tex, compose(rd));
       Object.assign(detail, { key, box: b, ok: true, lc });
-      buildTrees(lc, cx, cy, groundKm);
+      if (treesOn) buildTrees(lc, cx, cy, groundKm); else trees.n = 0;
       detail.busy = false; done = true;   // the camera can move on (re-centre) while the roads below still come in
       if (onReady) onReady();
       const poll = ++detail.poll;
@@ -374,13 +374,21 @@ const Land = (() => {
     return null;
   }
 
+  // the close-up land cover's class under x, y (world km); 0 where there is none yet
+  function coverAt(x, y) {
+    const lc = detail.lc;
+    if (!lc) return 0;
+    const i = Math.floor((x - lc.box[0]) / (lc.box[2] - lc.box[0]) * lc.W), j = Math.floor((lc.box[3] - y) / (lc.box[3] - lc.box[1]) * lc.H);
+    return i < 0 || j < 0 || i >= lc.W || j >= lc.H ? 0 : lc.a[j * lc.W + i];
+  }
+
   function reset() {
     coarse.key = ''; coarse.ok = false; detail.key = ''; detail.box = null; detail.ok = false; detail.poll++;
     trees.n = 0;
   }
 
   return {
-    init, want, reset, drawTrees, standNear,
+    init, want, reset, drawTrees, standNear, coverAt, setTrees: on => { treesOn = !!on; if (!on) trees.n = 0; },
     coarse: () => (coarse.ok ? coarse.tex : null),
     detail: () => (detail.ok ? { tex: detail.tex, box: detail.box } : null),
     trees: () => trees,

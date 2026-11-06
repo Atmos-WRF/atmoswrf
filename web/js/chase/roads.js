@@ -163,7 +163,7 @@ const Roads = (() => {
       const r = await fetch(`/api/volume/roads?x0=${b[0]}&y0=${b[1]}&x1=${b[2]}&y1=${b[3]}&major=0`, { headers: authHeaders() });
       if (!r.ok) throw new Error(await r.text());
       const d = await r.json();
-      st.pending = d.pending;
+      st.pending = d.pending; st.osmBusy = !!d.busy;
       if (far || d.roads.length !== st.n || terrain !== st.terrain) {
         const origin = [Math.round(x), Math.round(y)];
         const out = build(d.roads, origin, terrain);

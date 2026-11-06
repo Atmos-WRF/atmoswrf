@@ -172,7 +172,7 @@ const Scenery = (() => {
       const r = await fetch(`/api/volume/buildings?x0=${b[0]}&y0=${b[1]}&x1=${b[2]}&y1=${b[3]}`, { headers: window.ChaseAuth ? window.ChaseAuth() : {} });
       if (!r.ok) throw new Error(r.status === 404 ? 'buildings need the viewer restarted (new in this version)' : await r.text());
       const d = await r.json();
-      st.bPending = d.pending;
+      st.bPending = d.pending; st.bOsmBusy = !!d.busy;
       if (far || d.b.length !== st.bN) {
         const origin = [Math.round(x), Math.round(y)];
         const out = buildBuildings(d.b, origin, terrain);

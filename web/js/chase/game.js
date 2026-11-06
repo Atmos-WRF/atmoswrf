@@ -421,9 +421,11 @@ const Chase = (() => {
     else if (!Net.local) lines.push(`Joined the host · ${ns.others.size + 1} chasers · ${Math.round(ns.rtt)} ms`);
     else if (ns.others.size) lines.push(`${ns.others.size} other chaser${ns.others.size > 1 ? 's' : ''} on this PC`);
     if (ns.err) lines.push(`Multiplayer: ${ns.err}`);
-    if (Scenery.state.bPending) lines.push(`Fetching buildings from OpenStreetMap (${Scenery.state.bPending} area${Scenery.state.bPending > 1 ? 's' : ''} to go)…`);
+    const osmBusy = (Roads.state.pending && Roads.state.osmBusy) || (Scenery.state.bPending && Scenery.state.bOsmBusy);
+    if (osmBusy) lines.push(`OpenStreetMap (Overpass) is busy: ${Roads.state.pending + Scenery.state.bPending} area${Roads.state.pending + Scenery.state.bPending > 1 ? 's' : ''} of roads / buildings fill in when it answers`);
+    else if (Scenery.state.bPending) lines.push(`Fetching buildings from OpenStreetMap (${Scenery.state.bPending} area${Scenery.state.bPending > 1 ? 's' : ''} to go)…`);
     if (Scenery.state.bErr) lines.push(`Buildings: ${Scenery.state.bErr}`);
-    if (Roads.state.pending) lines.push(`Fetching roads from OpenStreetMap (${Roads.state.pending} area${Roads.state.pending > 1 ? 's' : ''} to go)…`);
+    if (Roads.state.pending && !osmBusy) lines.push(`Fetching roads from OpenStreetMap (${Roads.state.pending} area${Roads.state.pending > 1 ? 's' : ''} to go)…`);
     if (st.volErr) lines.push(`Storm volume: ${st.volErr}`);
     g.fillStyle = 'rgba(8,12,18,.5)'; roundRect(g, 14, 14, Math.max(...lines.map(l => g.measureText(l).width), 10) + 24, 12 + lines.length * 20, 8); g.fill();
     lines.forEach((l, i) => { g.fillStyle = l.includes('TORNADO WARNING') ? '#ff6b6b' : '#e6edf3'; g.fillText(l, 26, 34 + i * 20); });

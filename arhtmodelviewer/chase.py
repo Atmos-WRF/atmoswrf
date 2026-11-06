@@ -27,8 +27,8 @@ import urllib.request
 
 import numpy as np
 
-from .landscape import OSM_CACHE, OVERPASS
-from .tiles import UA
+from . import osmfetch
+from .landscape import OSM_CACHE
 
 # ---------------------------------------------------------------- buildings
 BUILDING_CELL = 0.05             # degrees
@@ -44,11 +44,6 @@ _KIND = {"house": 0, "detached": 0, "residential": 0, "semidetached_house": 0, "
          "church": 5, "school": 5, "public": 5, "civic": 5, "government": 5, "university": 5, "college": 5,
          "fire_station": 5, "sports_hall": 5}
 _HEIGHT = {0: 5.5, 1: 6.5, 2: 7.0, 3: 12.0, 4: 3.2, 5: 9.0}
-_B_PENDING: set = set()
-_B_FAILED: dict = {}
-_B_GUARD = threading.Lock()
-_B_QUEUE: list = []
-_B_WORKER = None
 
 
 def _num(s) -> float | None:
@@ -63,18 +58,7 @@ def _b_file(la: float, lo: float):
 def _b_fetch(la: float, lo: float) -> None:
     q = (f'[out:json][timeout:150];way["building"]({la:.4f},{lo:.4f},{la + BUILDING_CELL:.4f},'
          f'{lo + BUILDING_CELL:.4f});out geom tags;')
-    err = None
-    for url in OVERPASS:
-        try:
-            req = urllib.request.Request(url, data=urllib.parse.urlencode({"data": q}).encode(),
-                                         headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=180) as r:
-                d = json.load(r)
-            break
-        except Exception as e:                   # busy or down: the next server
-            err = e
-    else:
-        raise RuntimeError(f"Overpass: {err}")
+    d = osmfetch.overpass(q)
     out = []
     for w in d.get("elements", []):
         g, tags = w.get("geometry"), w.get("tags", {})
@@ -96,27 +80,12 @@ def _b_fetch(la: float, lo: float) -> None:
     part.replace(f)
 
 
-def _b_work():
-    global _B_WORKER
-    while True:
-        with _B_GUARD:
-            if not _B_QUEUE:
-                _B_WORKER = None
-                return
-            job = _B_QUEUE.pop(0)
-        try:
-            _b_fetch(*job)
-        except Exception:
-            with _B_GUARD:
-                _B_FAILED[job] = time.time()
-        with _B_GUARD:
-            _B_PENDING.discard(job)
+_BUILDINGS = osmfetch.CellQueue("buildings", _b_fetch)
 
 
 def buildings(proj, box_km) -> dict:
     """The buildings in the box (world km): {"b": [[height m, kind, [x, y, x, y, ...] km], ...], "pending": n}; cells
     not fetched yet are queued (nearest the box's middle first) and counted."""
-    global _B_WORKER
     x0, y0, x1, y1 = (float(v) for v in box_km)
     xs = np.array([x0, x1, x0, x1, (x0 + x1) / 2, (x0 + x1) / 2, x0, x1]) * 1000.0
     ys = np.array([y0, y0, y1, y1, y0, y1, (y0 + y1) / 2, (y0 + y1) / 2]) * 1000.0
@@ -133,14 +102,7 @@ def buildings(proj, box_km) -> dict:
     for c in cells:
         f = _b_file(*c)
         if not f.is_file():
-            with _B_GUARD:
-                if c not in _B_PENDING and time.time() - _B_FAILED.get(c, 0.0) > 60.0:
-                    _B_PENDING.add(c)
-                    _B_QUEUE.append(c)
-                    if _B_WORKER is None:
-                        _B_WORKER = threading.Thread(target=_b_work, name="osm-buildings", daemon=True)
-                        _B_WORKER.start()
-                pending += c in _B_PENDING
+            pending += _BUILDINGS.want(c)
             continue
         items = json.loads(f.read_text())
         if not items:
@@ -160,7 +122,7 @@ def buildings(proj, box_km) -> dict:
             xy = np.empty(2 * m)
             xy[0::2], xy[1::2] = bx, by
             out.append([it[0], it[1], np.round(xy, 5).tolist()])
-    return {"b": out, "pending": pending}
+    return {"b": out, "pending": pending, "busy": bool(pending) and osmfetch.busy()}
 
 
 # ---------------------------------------------------------------- multiplayer

@@ -26,6 +26,7 @@ import zlib
 import numpy as np
 
 from . import PROJECT
+from . import osmfetch
 from .tiles import UA
 
 LC_CACHE = PROJECT / "output" / "cache" / "landcover"
@@ -177,13 +178,6 @@ MAJOR = 4                        # classes below this one are the main roads (dr
 ROAD_CELL = 0.1                  # degrees: the cells of every road
 MAJOR_CELL = 1.0                 # degrees: the cells of the main roads
 UNPAVED = {"unpaved", "gravel", "dirt", "ground", "compacted", "fine_gravel", "grass", "sand", "earth", "mud"}
-_PENDING: set = set()
-_FAILED: dict = {}               # cell -> when it last failed (tried again after a minute)
-_ROAD_GUARD = threading.Lock()
-_QUEUE: list = []
-_WORKER = None
-
-
 def _cell_file(major: bool, la: float, lo: float):
     return OSM_CACHE / ("major" if major else "all") / f"{la:+08.2f}_{lo:+08.2f}.json"
 
@@ -193,18 +187,7 @@ def _fetch_cell(major: bool, la: float, lo: float) -> None:
     cls = ROAD_CLASSES[:MAJOR] if major else ROAD_CLASSES
     q = (f'[out:json][timeout:120];way["highway"~"^({"|".join(cls)})(_link)?$"]'
          f'({la:.4f},{lo:.4f},{la + step:.4f},{lo + step:.4f});out geom tags;')
-    err = None
-    for url in OVERPASS:
-        try:
-            req = urllib.request.Request(url, data=urllib.parse.urlencode({"data": q}).encode(),
-                                         headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=150) as r:
-                d = json.load(r)
-            break
-        except Exception as e:                   # busy or down: the next server
-            err = e
-    else:
-        raise RuntimeError(f"Overpass: {err}")
+    d = osmfetch.overpass(q)
     ways = []
     for w in d.get("elements", []):
         g, tags = w.get("geometry"), w.get("tags", {})
@@ -224,27 +207,13 @@ def _fetch_cell(major: bool, la: float, lo: float) -> None:
     part.replace(f)
 
 
-def _work():
-    global _WORKER
-    while True:
-        with _ROAD_GUARD:
-            if not _QUEUE:
-                _WORKER = None
-                return
-            job = _QUEUE.pop(0)
-        try:
-            _fetch_cell(*job)
-        except Exception:
-            with _ROAD_GUARD:
-                _FAILED[job] = time.time()
-        with _ROAD_GUARD:
-            _PENDING.discard(job)
+_ROADS = osmfetch.CellQueue("roads", _fetch_cell)
 
 
 def roads(proj, box_km, major: bool) -> dict:
-    """The roads in the box (world km): {"roads": [[class, paved, [x, y, x, y, ...] km], ...], "pending": n} --
-    every road (major False) or the main ones (True); cells not fetched yet are queued and counted."""
-    global _WORKER
+    """The roads in the box (world km): {"roads": [[class, paved, [x, y, x, y, ...] km], ...], "pending": n,
+    "busy": Overpass not answering} -- every road (major False) or the main ones (True); cells not fetched yet are
+    queued (osmfetch: the newest asked for first) and counted."""
     x0, y0, x1, y1 = (float(v) for v in box_km)
     xs = np.array([x0, x1, x0, x1, (x0 + x1) / 2, (x0 + x1) / 2, x0, x1]) * 1000.0
     ys = np.array([y0, y0, y1, y1, y0, y1, (y0 + y1) / 2, (y0 + y1) / 2]) * 1000.0
@@ -260,14 +229,7 @@ def roads(proj, box_km, major: bool) -> dict:
     for c in cells:
         f = _cell_file(*c)
         if not f.is_file():
-            with _ROAD_GUARD:
-                if c not in _PENDING and time.time() - _FAILED.get(c, 0.0) > 60.0:
-                    _PENDING.add(c)
-                    _QUEUE.append(c)
-                    if _WORKER is None:
-                        _WORKER = threading.Thread(target=_work, name="osm-roads", daemon=True)
-                        _WORKER.start()
-                pending += c in _PENDING
+            pending += _ROADS.want(c)
             continue
         for k, paved, la, lo in json.loads(f.read_text()):
             x, y = proj.fwd(np.asarray(la), np.asarray(lo))
@@ -276,4 +238,4 @@ def roads(proj, box_km, major: bool) -> dict:
             if xy[0::2].max() < x0 or xy[0::2].min() > x1 or xy[1::2].max() < y0 or xy[1::2].min() > y1:
                 continue
             out.append([k, paved, np.round(xy, 4).tolist()])
-    return {"roads": out, "pending": pending, "classes": ROAD_CLASSES}
+    return {"roads": out, "pending": pending, "busy": bool(pending) and osmfetch.busy(), "classes": ROAD_CLASSES}

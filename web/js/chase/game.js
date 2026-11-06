@@ -50,7 +50,9 @@ const Chase = (() => {
   const CAMS = ['chase', 'hood', 'driver'];
   // the look (the 3-D view's cloud-mode settings, plus quality): the menu's Settings tab, kept in this browser
   const VIS0 = { density: 0.5, rain: 1, detail: 0.7, relief: 0.6, haze: 180, sunMode: 'model', sunAz: 235, sunH: 30,
-                 base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3, trees: 'full' };
+                 base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3, trees: 'full',
+                 mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small' };
+  const QUICK = ['cref', 'REF', 'VEL', 'SRV', 'RHO', 'none'];          // K steps through these
   const TREE_BUDGET = { off: 0, light: 25000, full: 70000 };
 
   const st = {
@@ -450,14 +452,18 @@ const Chase = (() => {
   }
 
   function minimap(g, W, H, tors) {
-    const S = Math.min(240, W * 0.28), x0 = W - S - 16, y0 = H - S - 16, c = st.car;
+    const v = st.vis, big = v.mmBig === 'big';
+    const S = big ? Math.min(H - 140, W * 0.5) : Math.min(260, W * 0.3), x0 = W - S - 16, y0 = H - S - 16, c = st.car;
     const R = st.mapKm * 1000 / 2, sc = S / (2 * R), cx = c.p[0], cy = c.p[1];
     const P = (x, y) => [x0 + S / 2 + (x - cx) * sc, y0 + S / 2 - (y - cy) * sc];
     g.save();
-    g.fillStyle = 'rgba(14,20,16,.78)'; roundRect(g, x0, y0, S, S, 10); g.fill(); g.clip();
-    // the roads
+    g.fillStyle = 'rgba(14,20,16,.85)'; roundRect(g, x0, y0, S, S, 10); g.fill(); g.clip();
+    // the real map and the radar under everything (minimap.js)
+    MiniMap.draw(g, x0, y0, S, cx / 1000, cy / 1000, st.mapKm / 2,
+                 { base: v.mmBase, product: v.mmProduct, site: v.mmSite, opacity: v.mmOpacity, dim: v.mmDim });
+    // the roads (drawn ourselves when there is no map under them; else only the ones the car can be on, faintly)
     g.lineCap = 'round';
-    for (const { k, pv, pts } of Roads.state.polys || []) {
+    for (const { k, pv, pts } of v.mmBase === 'none' ? Roads.state.polys || [] : []) {
       if (st.mapKm > 12 && k > 4) continue;
       g.strokeStyle = !pv ? 'rgba(170,150,120,.7)' : k <= 1 ? 'rgba(255,210,120,.95)' : k <= 3 ? 'rgba(240,240,240,.9)' : 'rgba(170,175,180,.75)';
       g.lineWidth = k <= 1 ? 2.4 : k <= 3 ? 1.8 : 1;
@@ -491,7 +497,10 @@ const Chase = (() => {
     g.beginPath(); g.moveTo(9, 0); g.lineTo(-6, 6); g.lineTo(-3, 0); g.lineTo(-6, -6); g.closePath(); g.fill(); g.stroke();
     g.restore();
     g.font = '11px Segoe UI'; g.fillStyle = 'rgba(220,230,240,.8)'; g.textAlign = 'left';
-    g.fillText(`N ↑  ${st.mapKm} km (M)`, x0 + 8, y0 + 16);
+    const lab = `N ↑  ${st.mapKm} km (M)  ${MiniMap.label(v.mmProduct)}${v.mmProduct !== 'none' ? ' (K)' : ''}`;
+    g.fillStyle = 'rgba(8,12,18,.6)'; roundRect(g, x0 + 4, y0 + 4, g.measureText(lab).width + 10, 17, 5); g.fill();
+    g.fillStyle = 'rgba(230,236,242,.95)';
+    g.fillText(lab, x0 + 9, y0 + 16);
   }
 
   function dash(g, W, H) {
@@ -562,6 +571,7 @@ const Chase = (() => {
   }
 
   // a photo: the view at full size and quality (Shift+P: with the HUD), saved as a PNG
+  let showVis = () => {};
   function photo(withHud) {
     const q = st.vis, keep = { scale: q.scale, blend: q.blend };
     Object.assign(q, { scale: 1, blend: 0 });
@@ -616,7 +626,13 @@ const Chase = (() => {
       if (e.code === 'KeyT' && st.car) { st.car.tc = !st.car.tc; say(`Traction control ${st.car.tc ? 'on' : 'off'}`, 1200); }
       if (e.code === 'KeyB' && st.car) { st.car.abs = !st.car.abs; say(`ABS ${st.car.abs ? 'on' : 'off'}`, 1200); }
       if (e.code === 'KeyP') photo(e.shiftKey);
-      if (e.code === 'KeyM') st.mapKm = st.mapKm === 6 ? 20 : st.mapKm === 20 ? 60 : 6;
+      if (e.code === 'KeyM' && e.shiftKey) { st.vis.mmBig = st.vis.mmBig === 'big' ? 'small' : 'big'; showVis(); }
+      else if (e.code === 'KeyM') st.mapKm = st.mapKm === 6 ? 20 : st.mapKm === 20 ? 60 : st.mapKm === 60 ? 150 : 6;
+      if (e.code === 'KeyK') {
+        const i = QUICK.indexOf(st.vis.mmProduct);
+        st.vis.mmProduct = QUICK[(i + 1) % QUICK.length]; showVis();
+        say(`Minimap: ${st.vis.mmProduct === 'none' ? 'no radar' : (MiniMap.GRID.concat(MiniMap.RADAR).find(p => p[0] === st.vis.mmProduct) || [0, ''])[1]}`, 1200);
+      }
     });
     window.addEventListener('keyup', e => st.keys.delete(e.code));
     window.addEventListener('blur', () => st.keys.clear());
@@ -633,13 +649,23 @@ const Chase = (() => {
     // the menu: Controls / Settings tabs, the settings bound to st.vis by their data-k
     st.vis = { ...VIS0 };
     try { Object.assign(st.vis, JSON.parse(localStorage.getItem('chase.vis') || '{}')); } catch (e) { /* private */ }
+    const prodSel = document.querySelector('[data-k=mmProduct]');
+    prodSel.innerHTML = '<option value="none">None</option>' +
+      `<optgroup label="Map products">${MiniMap.GRID.map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</optgroup>` +
+      `<optgroup label="Radar (nearest or picked site)">${MiniMap.RADAR.map(([k, l]) => `<option value="${k}">${l}</option>`).join('')}</optgroup>`;
     const els = [...document.querySelectorAll('#tabSettings [data-k]')];
-    const show = () => {
+    const show = showVis = () => {
+      const site = document.querySelector('[data-k=mmSite]'), list = MiniMap.radars();
+      const want = ['nearest', ...list].join(',');
+      if (site.dataset.list !== want) {
+        site.dataset.list = want;
+        site.innerHTML = '<option value="nearest">Nearest to me</option>' + list.map(r => `<option value="${r}">${r}</option>`).join('');
+      }
       for (const el of els) {
         const k = el.dataset.k;
         el.value = String(st.vis[k]);
         const o = el.nextElementSibling;
-        if (o && o.tagName === 'OUTPUT') o.textContent = k === 'sunAz' ? `${st.vis[k]}°` : k === 'sunH' ? `${st.vis[k]}°` : k === 'haze' ? `${st.vis[k]} km` : String(st.vis[k]);
+        if (o && o.tagName === 'OUTPUT') o.textContent = k === 'mmOpacity' || k === 'mmDim' ? `${Math.round(st.vis[k] * 100)} %` : k === 'sunAz' ? `${st.vis[k]}°` : k === 'sunH' ? `${st.vis[k]}°` : k === 'haze' ? `${st.vis[k]} km` : String(st.vis[k]);
         if (k === 'sunAz' || k === 'sunH') el.disabled = st.vis.sunMode !== 'manual';
       }
     };
@@ -655,6 +681,7 @@ const Chase = (() => {
     for (const b of document.querySelectorAll('.tabs button')) b.onclick = () => {
       for (const o of document.querySelectorAll('.tabs button')) { o.classList.toggle('on', o === b); $(o.dataset.tab).classList.toggle('hidden', o !== b); }
       if (b.dataset.tab === 'tabMulti') fillMulti();
+      if (b.dataset.tab === 'tabSettings') showVis();
     };
     setInterval(() => {
       if (st.started && !$('tabMulti').classList.contains('hidden') && !$('help').classList.contains('hidden') &&

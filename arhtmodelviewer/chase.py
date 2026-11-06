@@ -168,8 +168,8 @@ _NEXT = [1]
 STALE = 6.0                                     # s without a sync: gone from the others' lists
 # what a joined page on another computer may read (GET) with its token while hosting is on
 READ = ("/api/state", "/api/pmw/targets", "/api/volume", "/api/volume/times", "/api/volume/roads",
-        "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings")
-STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape)\.js|static/js/chase/[a-z0-9_]+\.js)$")
+        "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/frames", "/api/frame", "/api/ppi")
+STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|colors)\.js|static/js/chase/[a-z0-9_]+\.js)$")
 
 
 def host(on: bool | None = None, new_code: bool = False) -> dict:

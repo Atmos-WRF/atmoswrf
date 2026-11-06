@@ -58,6 +58,13 @@ def _b_file(la: float, lo: float):
 def _b_fetch(la: float, lo: float) -> None:
     q = (f'[out:json][timeout:150];way["building"]({la:.4f},{lo:.4f},{la + BUILDING_CELL:.4f},'
          f'{lo + BUILDING_CELL:.4f});out geom tags;')
+    try:                                         # OpenFreeMap's tiles first (fast, a CDN), Overpass if it fails
+        out = osmfetch.ofm_buildings(la, lo, BUILDING_CELL, _kind_by_size)
+    except Exception:
+        out = None
+    if out is not None:
+        _b_write(la, lo, out)
+        return
     d = osmfetch.overpass(q)
     out = []
     for w in d.get("elements", []):
@@ -73,11 +80,28 @@ def _b_fetch(la: float, lo: float) -> None:
             h = 3.1 * _num(tags["building:levels"]) + (1.5 if k == 0 else 0.5)
         h = min(max(h if h is not None else _HEIGHT[k], 2.5), 300.0)
         out.append([round(h, 1), k, [round(p["lat"], 6) for p in g], [round(p["lon"], 6) for p in g]])
+    _b_write(la, lo, out)
+
+
+def _b_write(la: float, lo: float, out: list) -> None:
     f = _b_file(la, lo)
     f.parent.mkdir(parents=True, exist_ok=True)
     part = f.with_name(f.name + ".part")
     part.write_text(json.dumps(out))
     part.replace(f)
+
+
+def _kind_by_size(area: float, h: float) -> int:
+    """A building's kind from its footprint (m^2) and height when the map has no type (OpenFreeMap)."""
+    if h >= 12.0:
+        return 3
+    if area < 30.0:
+        return 4
+    if area <= 450.0:
+        return 0
+    if area >= 1500.0:
+        return 2 if h <= 9.0 else 1
+    return 1
 
 
 _BUILDINGS = osmfetch.CellQueue("buildings", _b_fetch)

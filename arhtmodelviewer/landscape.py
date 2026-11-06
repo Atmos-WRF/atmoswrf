@@ -13,6 +13,7 @@ are still on their way, and the page asks again."""
 from __future__ import annotations
 
 import io
+import logging
 import json
 import math
 import struct
@@ -29,6 +30,7 @@ from . import PROJECT
 from . import osmfetch
 from .tiles import UA
 
+log = logging.getLogger(__name__)
 LC_CACHE = PROJECT / "output" / "cache" / "landcover"
 OSM_CACHE = PROJECT / "output" / "cache" / "osm"
 WC_URL = ("https://esa-worldcover.s3.eu-central-1.amazonaws.com/v200/2021/map/"
@@ -187,6 +189,18 @@ def _fetch_cell(major: bool, la: float, lo: float) -> None:
     cls = ROAD_CLASSES[:MAJOR] if major else ROAD_CLASSES
     q = (f'[out:json][timeout:120];way["highway"~"^({"|".join(cls)})(_link)?$"]'
          f'({la:.4f},{lo:.4f},{la + step:.4f},{lo + step:.4f});out geom tags;')
+    try:                                         # OpenFreeMap's tiles first (fast, a CDN), Overpass if it fails
+        ways = osmfetch.ofm_roads(la, lo, step, len(cls))
+    except Exception as e:
+        log.warning("OpenFreeMap roads %s %s: %s -- trying Overpass", la, lo, e)
+        ways = None
+    if ways is not None:
+        f = _cell_file(major, la, lo)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        part = f.with_name(f.name + ".part")
+        part.write_text(json.dumps(ways))
+        part.replace(f)
+        return
     d = osmfetch.overpass(q)
     ways = []
     for w in d.get("elements", []):

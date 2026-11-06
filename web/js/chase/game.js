@@ -52,7 +52,7 @@ const Chase = (() => {
   // the look (the 3-D view's cloud-mode settings, plus quality): the menu's Settings tab, kept in this browser
   const VIS0 = { density: 0.5, rain: 1, detail: 0.7, relief: 0.6, haze: 180, sunMode: 'model', sunAz: 235, sunH: 30,
                  base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3, trees: 'full',
-                 contrast: 1.3, mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small' };
+                 contrast: 1.3, funnel: 2, mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small' };
   const QUICK = ['cref', 'REF', 'VEL', 'SRV', 'RHO', 'none'];          // K steps through these
   const TREE_BUDGET = { off: 0, light: 25000, full: 70000 };
 
@@ -158,6 +158,19 @@ const Chase = (() => {
       if (o) { o.x = t.x; o.y = t.y; if (t.wind) o.wind = t.wind; } else out.push({ id: t.id, x: t.x, y: t.y, wind: t.wind, ef: efOf(t.wind), pts: [] });
     }
     return out;
+  }
+  // the tornadoes on the ground near the car, for the funnels: strength from their wind, the cloud base over
+  // them from the model (its own lowest cloud there; 900 m when it has none), the core from the wind
+  function funnelList() {
+    const c = st.car, out = [];
+    if (!c) return out;
+    for (const t of tornadoes()) {
+      if (Math.hypot(t.x - c.p[0], t.y - c.p[1]) > 45000) continue;
+      const V = Math.max(25, Math.min(110, t.wind || [32, 43, 55, 67, 80, 95][Math.max(0, t.ef || 0)]));
+      const cb = Render.cloudBase(t.x, t.y);
+      out.push({ x: t.x, y: t.y, V, R: 25 + 1.8 * V, base: Math.max(250, Math.min(2000, cb === null ? 900 : cb)), ground: Render.terrain(t.x, t.y) });
+    }
+    return out.sort((a, b) => Math.hypot(a.x - c.p[0], a.y - c.p[1]) - Math.hypot(b.x - c.p[0], b.y - c.p[1])).slice(0, 4);
   }
   const efOf = w => (w === null || w === undefined ? null : w < 38 ? 0 : w < 50 ? 1 : w < 61 ? 2 : w < 74 ? 3 : w < 89 ? 4 : 5);
 
@@ -353,7 +366,7 @@ const Chase = (() => {
     const q = st.vis;
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
     if (st.extraCars) cars.push(...st.extraCars());
-    const fr = Render.frame({ ...view, sun: sunDir(), scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64 }, cars);
+    const fr = Render.frame({ ...view, sun: sunDir(), scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, funnel: q.funnel, tornadoes: funnelList(), quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64 }, cars);
     hud(fr, view);
     requestAnimationFrame(tick);
   }
@@ -612,7 +625,7 @@ const Chase = (() => {
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
     if (st.extraCars) cars.push(...st.extraCars());
     Render.frame({ ...view, sun: sunDir(), scale: 1, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief,
-                   haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, quality: 1, blend: 0, seed: 0 }, cars);
+                   haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, funnel: q.funnel, tornadoes: funnelList(), quality: 1, blend: 0, seed: 0 }, cars);
     Object.assign(q, keep);
     const v = $('view'), out = document.createElement('canvas');
     out.width = v.width; out.height = v.height;
@@ -706,7 +719,7 @@ const Chase = (() => {
         const k = el.dataset.k;
         el.value = String(st.vis[k]);
         const o = el.nextElementSibling;
-        if (o && o.tagName === 'OUTPUT') o.textContent = k === 'mmOpacity' || k === 'mmDim' ? `${Math.round(st.vis[k] * 100)} %` : k === 'sunAz' ? `${st.vis[k]}°` : k === 'sunH' ? `${st.vis[k]}°` : k === 'haze' ? `${st.vis[k]} km` : String(st.vis[k]);
+        if (o && o.tagName === 'OUTPUT') o.textContent = k === 'funnel' ? (st.vis[k] ? `×${st.vis[k]}` : 'off') : k === 'mmOpacity' || k === 'mmDim' ? `${Math.round(st.vis[k] * 100)} %` : k === 'sunAz' ? `${st.vis[k]}°` : k === 'sunH' ? `${st.vis[k]}°` : k === 'haze' ? `${st.vis[k]} km` : String(st.vis[k]);
         if (k === 'sunAz' || k === 'sunH') el.disabled = st.vis.sunMode !== 'manual';
       }
     };

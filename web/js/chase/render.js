@@ -145,13 +145,64 @@ const Render = (() => {
     return { data: new Float32Array(V), near, far: V.length / 7 - near };
   }
 
+  // A tornado's condensation funnel, which the model's grid cannot condense by itself: the vortex's pressure drop
+  // (Rankine: rho V^2 in the core, half that at the core's edge, falling as 1/r^2 outside) cools the air drawn
+  // into it, and the cloud comes down to where that drop equals the pressure difference to the cloud base
+  // (rho g dz, ~0.12 hPa a metre).  So: a wide lowering under the base, narrowing to a funnel V^2/g x funnelK
+  // below it (down to the ground for strong ones), its edge torn by a noise that turns with the vortex and rises;
+  // and near the ground, for winds over ~35 m/s, a debris cloud.  torA: x, y (box units), core radius m, wind m/s;
+  // torB: cloud base m above the ground, the ground m, -, -.
+  const FUNNEL_GLSL = `
+  float gDebris = 0.0;                                         // the debris' share of the extinction here
+  vec2 funnels(vec3 p) {
+    gDebris = 0.0;
+    vec2 out2 = vec2(0.0);
+    for (int i = 0; i < 4; i++) {
+      if (i >= torN) break;
+      vec4 A = torA[i], B = torB[i];
+      vec2 dxy = (p.xy - A.xy) * toKm.xy * 1000.0;
+      float d = length(dxy), z = p.z * toKm.z * 1000.0 - B.y, R = A.z, V = A.w, zb = B.x;
+      if (d > 6.0 * R || z > zb + 60.0 || z < -5.0) continue;
+      float dp0 = 1.2 * V * V * funnelK;                       // Pa: the drop in the core
+      float q = 11.8 * max(zb - z, 0.0);                        // Pa: what it takes to condense at this height
+      float rf = q < 0.5 * dp0 ? R * sqrt(dp0 / (2.0 * max(q, 1.0))) : R * sqrt(max(2.0 * (1.0 - q / dp0), 0.0));
+      rf = min(rf, 5.0 * R);
+      if (q < dp0) rf = max(rf, 0.3 * R);                     // the tip: a rope down to the depth, not a fade
+      // turning with the vortex, rising: the funnel's striations
+      float om = 0.6 * V / max(R, 20.0), a = -uTime * om;
+      vec2 rx = mat2(cos(a), sin(a), -sin(a), cos(a)) * dxy;
+      float n = texture(noiseTex, vec3(rx / 160.0, z / 260.0 - uTime * 0.03)).r;
+      float n2 = texture(noiseTex, vec3(rx / 45.0, z / 70.0 - uTime * 0.08) + 0.37).g;
+      float edge = d * (1.0 + 0.35 * (n - 0.5) + 0.2 * (n2 - 0.5));
+      float f = smoothstep(rf * 1.12, rf * 0.6, edge) * smoothstep(-5.0, 15.0, zb + 60.0 - z);
+      out2.x += 34.0 * f * smoothstep(0.0, 0.3 * R, rf);         // per km: a thick, milky funnel
+      // the debris cloud: dust and debris lifted where the winds at the ground pass ~35 m/s
+      if (V > 35.0) {
+        float hd = 25.0 + 6.0 * (V - 35.0), rd = R * (1.0 + 0.9 * clamp(z / hd, 0.0, 1.0));
+        float dd = smoothstep(rd, rd * 0.45, d * (1.0 + 0.5 * (n2 - 0.5))) * (1.0 - smoothstep(0.2 * hd, hd, z)) * smoothstep(0.3, 0.7, n + 0.3);
+        float de = 9.0 * dd * clamp((V - 35.0) / 25.0, 0.2, 1.0);
+        out2.y += de; gDebris += de;
+      }
+    }
+    return out2;
+  }`;
+
   // the 3-D view's cloud shader with a contrast control on the cloud alone (the ground and sky as they are):
   // dark bases darker, sunlit towers brighter, around a mid grey in log light
   function cloudSource() {
     let src = L().FS_CLOUD;
     const head = 'in vec2 ndc; out vec4 frag;', tail = 'vec3 c = col + T * bg;';
     if (!src.includes(head) || !src.includes(tail)) return src;
-    src = src.replace(head, head + '\n  uniform float cloudContrast;');
+    src = src.replace(head, head + '\n  uniform float cloudContrast;\n  uniform int torN; uniform vec4 torA[4]; uniform vec4 torB[4]; uniform float uTime, funnelK;');
+    // the condensation funnels and debris clouds (funnelGLSL), added to the cloud wherever it is read
+    const media = 'vec2 media(vec3 p, int mode) {', ret = '    return s;\n  }\n  float sig(vec2 s)';
+    if (!src.includes('float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));')) console.warn('chase: debris colour hook not found');
+    if (src.includes(media) && src.includes(ret)) {
+      src = src.replace(media, FUNNEL_GLSL + '\n  ' + media);
+      src = src.replace(ret, '    if (torN > 0 && funnelK > 0.0) s += funnels(p) * density;\n' + ret);
+    }
+    src = src.replace('float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));',
+                      'float albedo = mix(mix(0.98, 0.78, s.y / (sg + 1e-6)), 0.3, clamp(gDebris * density / (sg + 1e-6), 0.0, 1.0));');
     src = src.replace(tail, `if (cloudContrast != 1.0 && T < 0.995) {
       vec3 Lc = col / (1.0 - T);
       float l = max(dot(Lc, vec3(0.2126, 0.7152, 0.0722)), 1e-4), piv = 0.55;
@@ -276,6 +327,20 @@ const Render = (() => {
       if (c) m = Math.max(m, Math.pow(10, (c - 1) / 40 - 3));
     }
     return m;
+  }
+
+  function cloudBase(x, y) {
+    if (!volData || !head || head.channels !== 2) return null;
+    const ci = Math.floor((x / 1000 - box[0]) / (box[2] - box[0]) * head.nx), cj = Math.floor((y / 1000 - box[1]) / (box[3] - box[1]) * head.ny);
+    const dz = head.ztop / head.nz, c0 = Math.round((Math.log10(0.08) + 3) * 40 + 1);   // 0.08 g/kg
+    let best = null;
+    for (let j = cj - 2; j <= cj + 2; j++) for (let i = ci - 2; i <= ci + 2; i++) {
+      if (i < 0 || j < 0 || i >= head.nx || j >= head.ny) continue;
+      for (let k = 0; k < head.nz; k++) {
+        if (volData[((k * head.ny + j) * head.nx + i) * 2] >= c0) { const z = (k + 0.5) * dz; if (best === null || z < best) best = z; break; }
+      }
+    }
+    return best === null ? null : best - terrain(x, y);
   }
 
   function geometry() {
@@ -524,6 +589,14 @@ const Render = (() => {
     gl.uniform1f(u.density, view.density); gl.uniform1f(u.rain, view.rain);
     gl.uniform1f(u.relief, view.relief);
     gl.uniform1f(u.cloudContrast, view.contrast || 1);
+    // the tornadoes' funnels: [{x, y (world m), R m, V m/s, base m above the ground, ground m}]
+    const tors = (view.tornadoes || []).slice(0, 4), TA = new Float32Array(16), TB = new Float32Array(16);
+    tors.forEach((t, i) => {
+      const b = toBox(G, [t.x, t.y, 0]);
+      TA.set([b[0], b[1], t.R, t.V], 4 * i); TB.set([t.base, t.ground, 0, 0], 4 * i);
+    });
+    gl.uniform1i(u.torN, tors.length); gl.uniform4fv(u.torA, TA); gl.uniform4fv(u.torB, TB);
+    gl.uniform1f(u.uTime, performance.now() / 1000 % 10000); gl.uniform1f(u.funnelK, view.funnel === undefined ? 2 : view.funnel);
     gl.uniform3f(u.texel, 1 / head.nx, 1 / head.ny, 1 / head.nz);
     // the nests
     const ins = head.insets || [], cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
@@ -559,6 +632,6 @@ const Render = (() => {
     return [(o[0] / o[3] * 0.5 + 0.5) * cv.clientWidth, (1 - (o[1] / o[3] * 0.5 + 0.5)) * cv.clientHeight];
   }
 
-  return { init, setVolume, setRoads, setTrees, setBuildings, frame, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
+  return { init, setVolume, setRoads, setTrees, setBuildings, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
 })();
 window.Render = Render;

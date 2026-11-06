@@ -12,10 +12,14 @@ car to /api/c/sync, which answers with everyone else's -- nothing that changes t
 are slowed down per address."""
 from __future__ import annotations
 
+import atexit
 import json
 import math
+import os
 import re
 import secrets
+import shutil
+import subprocess
 import threading
 import time
 import urllib.parse
@@ -173,6 +177,8 @@ STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|co
 
 
 def host(on: bool | None = None, new_code: bool = False) -> dict:
+    if on is False:
+        tunnel(False)
     with _LOCK:
         if on is not None:
             _HOST["on"] = bool(on)
@@ -287,3 +293,93 @@ def allowed(path: str, method: str, token: str | None) -> bool:
     if method == "POST":
         return path in ("/api/c/sync", "/api/c/leave")
     return method == "GET" and path in READ
+
+
+# ---------------------------------------------------------------- the internet link
+# A free Cloudflare quick tunnel (no account): https://<words>.trycloudflare.com reaches this viewer, so friends
+# need only a browser.  Its requests reach the server from this PC's own address, so the server spots them
+# (server._tunneled: the forwarding headers and the Host) and lets them have chase mode only, like any other
+# computer.  cloudflared is found on the PATH or fetched once (GitHub, ~60 MB) into output/cache/tools.
+CLOUDFLARED_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+_TUN = {"proc": None, "url": "", "state": "off", "error": ""}
+_TUN_LOCK = threading.Lock()
+_TUN_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+
+def _cloudflared() -> str:
+    found = shutil.which("cloudflared")
+    if found:
+        return found
+    exe = OSM_CACHE.parent / "tools" / "cloudflared.exe"
+    if not exe.is_file():
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        part = exe.with_suffix(".part")
+        with urllib.request.urlopen(CLOUDFLARED_URL, timeout=180) as r, open(part, "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(part, exe)
+    return str(exe)
+
+
+def _tunnel_run(port: int) -> None:
+    try:
+        exe = _cloudflared()
+        flags = 0x08000000 if os.name == "nt" else 0              # no console window
+        # HTTP/2 over TCP 443: QUIC needs UDP, which some networks block
+        proc = subprocess.Popen([exe, "tunnel", "--no-autoupdate", "--protocol", "http2", "--url", f"http://127.0.0.1:{port}"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, creationflags=flags)
+        with _TUN_LOCK:
+            if _TUN["state"] != "starting":                         # switched off while it started
+                proc.terminate()
+                return
+            _TUN["proc"] = proc
+        t0 = time.time()
+        for line in proc.stdout:
+            m = _TUN_RE.search(line)
+            if m:
+                with _TUN_LOCK:
+                    _TUN.update(url=m.group(0), state="on", error="")
+                for _ in proc.stdout:                               # keep its output drained while it runs
+                    pass
+                break
+            if time.time() - t0 > 90:
+                raise RuntimeError("the tunnel did not start (no internet, or cloudflared was blocked)")
+        with _TUN_LOCK:
+            if _TUN["proc"] is proc and _TUN["state"] != "off":
+                _TUN.update(state="error", error=_TUN["error"] or "the tunnel closed", url="")
+    except Exception as e:
+        with _TUN_LOCK:
+            _TUN.update(state="error", error=str(e), url="")
+
+
+def tunnel(on: bool, port: int | None = None) -> dict:
+    """Start (needs hosting on) or stop the internet link; its state."""
+    with _TUN_LOCK:
+        proc = _TUN["proc"]
+        if not on:
+            _TUN.update(proc=None, url="", state="off", error="")
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+            return dict(_tunnel_view())
+        if _TUN["state"] in ("starting", "on") and (proc is None or proc.poll() is None):
+            return dict(_tunnel_view())
+        if not _HOST["on"]:
+            raise PermissionError("switch on Let friends join first")
+        _TUN.update(proc=None, url="", state="starting", error="")
+    threading.Thread(target=_tunnel_run, args=(int(port or 8830),), name="chase-tunnel", daemon=True).start()
+    return tunnel_state()
+
+
+def _tunnel_view() -> dict:
+    return {"state": _TUN["state"], "url": _TUN["url"], "error": _TUN["error"]}
+
+
+def tunnel_state() -> dict:
+    with _TUN_LOCK:
+        return _tunnel_view()
+
+
+@atexit.register
+def _tunnel_close() -> None:
+    p = _TUN.get("proc")
+    if p is not None and p.poll() is None:
+        p.terminate()

@@ -250,18 +250,47 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    _FORWARDED = ("CF-Connecting-IP", "X-Forwarded-For", "Forwarded", "X-Real-IP")
+    _LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+
+    def _tunneled(self) -> bool:
+        """A request that came in through a tunnel or proxy on this PC (chase mode's internet link, or anything
+        else forwarding to us): from this PC's own address, but someone else's request -- it carries a forwarding
+        header, or a Host that is not this PC's own name."""
+        if any(self.headers.get(h) for h in self._FORWARDED):
+            return True
+        host = (self.headers.get("Host") or "127.0.0.1").rsplit(":", 1)[0].lower()
+        if host.startswith("[") and "]" in (self.headers.get("Host") or ""):
+            host = (self.headers.get("Host") or "").split("]")[0].lower() + "]"
+        return not (host in self._LOCAL_HOSTS or host.endswith(".localhost"))
+
+    def _is_local(self) -> bool:
+        """This PC's own browser (or program): may use everything."""
+        try:
+            loop = ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            loop = False
+        return loop and not self._tunneled()
+
+    def _client_ip(self) -> str:
+        """Who is asking: through a tunnel, the address it forwards for (for the join code's slow-down)."""
+        for h in ("CF-Connecting-IP", "X-Real-IP"):
+            if self.headers.get(h):
+                return self.headers[h].strip()[:64]
+        xf = self.headers.get("X-Forwarded-For")
+        return xf.split(",")[0].strip()[:64] if xf else self.client_address[0]
+
     def _remote_refused(self, path: str) -> bool:
         """With --lan other computers get the polling feed only: the page and its API can change
-        runs and files on this PC."""
-        try:
-            local = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            local = False
-        if local or path.startswith("/poll"):
+        runs and files on this PC.  Through a tunnel (chase mode's internet link) only chase mode."""
+        if self._is_local():
             return False
-        if path == "/remote" or path.startswith("/api/r/"):
-            return False                          # the phone remote: its API checks its own PIN tokens (remote.py)
         from . import chase
+        tunneled = self._tunneled()
+        if not tunneled and path.startswith("/poll"):
+            return False
+        if not tunneled and (path == "/remote" or path.startswith("/api/r/")):
+            return False                          # the phone remote: its API checks its own PIN tokens (remote.py)
         if chase.allowed(path, self.command, self.headers.get("X-Chase-Token")):
             return False                          # chase mode's friends, while hosting is on (chase.py)
         self._send(403, b"Only the GR2Analyst polling feed (/poll/) is shared with other computers.\n",
@@ -363,7 +392,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(400, str(e))
             if path == "/api/c/host":
                 from . import chase
-                return self._json(dict(chase.host(), urls=self._chase_urls()))
+                if not self._is_local():
+                    return self._error(403, "only the host's own PC")
+                return self._json(dict(chase.host(), urls=self._chase_urls(), tunnel=chase.tunnel_state()))
             if path.startswith("/api/r/"):
                 return self._remote_get(path[len("/api/r/"):], q)
             if path == "/api/remote/config":
@@ -550,18 +581,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _chase_post(self, what: str, body: dict):
         from . import chase
-        try:
-            local = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            local = False
+        local = self._is_local()
         tok = self.headers.get("X-Chase-Token")
         try:
+            if what in ("host", "tunnel") and not local:
+                return self._error(403, "only the host's own PC switches hosting")
             if what == "host":
-                if not local:
-                    return self._error(403, "only the host's own PC switches hosting")
                 return self._json(dict(chase.host(body.get("on"), bool(body.get("new_code"))), urls=self._chase_urls()))
+            if what == "tunnel":
+                return self._json(chase.tunnel(bool(body.get("on")), _NET["port"]))
             if what == "join":
-                return self._json(chase.join(body, self.client_address[0], local))
+                return self._json(chase.join(body, self._client_ip(), local))
             if what == "sync":
                 return self._json(chase.sync(tok, body))
             if what == "leave":

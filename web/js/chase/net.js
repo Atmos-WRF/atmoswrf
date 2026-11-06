@@ -38,7 +38,7 @@ const Net = (() => {
   async function hostStatus() {
     try {
       const r = await fetch('/api/c/host');
-      if (r.ok) { const d = await r.json(); st.hosting = d.on; st.code = d.code; st.urls = d.urls || []; st.roster = d.players; }
+      if (r.ok) { const d = await r.json(); st.hosting = d.on; st.code = d.code; st.urls = d.urls || []; st.roster = d.players; st.tunnel = d.tunnel; }
     } catch (e) { /* not this PC */ }
   }
 
@@ -105,6 +105,9 @@ const Net = (() => {
     return out;
   }
 
-  return { st, local, join, host, hostStatus, tick, others };
+  // the internet link (a Cloudflare quick tunnel on the host): friends need only a browser
+  async function tunnel(on) { st.tunnel = await post('/api/c/tunnel', { on }); return st.tunnel; }
+
+  return { st, local, join, host, hostStatus, tunnel, tick, others };
 })();
 window.Net = Net;

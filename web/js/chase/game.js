@@ -540,6 +540,18 @@ const Chase = (() => {
       g.font = '600 10px Segoe UI'; g.fillStyle = '#fff'; g.textAlign = 'left'; g.fillText(o.name, s[0] + 7, s[1] + 3);
     }
   }
+  // the internet link's part of the Multiplayer tab
+  function tunnelHtml(ns) {
+    const t = ns.tunnel || { state: 'off' }, on = t.state === 'on', busy = t.state === 'starting';
+    const link = on ? `${t.url}/chase` : '';
+    return `<h3>Internet link (friends need only a browser)</h3>` +
+      (on ? `<p>Send friends this link and the code: <b>${esc(link)}</b></p>` +
+            `<button data-copy="${esc(link)}">Copy link</button> <button data-copy="${esc(link + '?code=' + ns.code)}">Copy link with the code in it</button>` +
+            `<p>Anyone with the link still needs the code (unless you send the one with the code in it). A new link each time you start it.</p>`
+          : busy ? '<p>Starting a free Cloudflare tunnel… (the first time it downloads Cloudflare’s cloudflared, ~60 MB, once)</p>'
+          : `<p>A free Cloudflare quick tunnel gives you an https link to chase mode only: the rest of the viewer stays private.${t.state === 'error' ? ` <span style="color:#ffb347">Last try: ${esc(t.error)}</span>` : ''}</p>`) +
+      `<button id="tunBtn">${on || busy ? 'Stop the internet link' : 'Start the internet link'}</button>`;
+  }
   const esc = t => String(t).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
   // the Multiplayer tab
   async function fillMulti() {
@@ -552,13 +564,22 @@ const Chase = (() => {
       : '<b>http://&lt;this PC address&gt;:8830/chase</b> (the viewer needs --lan, which Atmos-WRF.cmd gives it)';
     el.innerHTML = Net.local
       ? `<label class="chk"><input id="hostOn" type="checkbox" ${ns.hosting ? 'checked' : ''}> Let friends join (LAN or Tailscale)</label>` +
-        (ns.hosting ? `<div class="code">${ns.code}</div><p>Friends open ${where} and type this code. Friends away from home use the Tailscale address (100.x.x.x).</p>` +
-                      '<button id="newCode">New code (kicks everyone)</button>'
+        (ns.hosting ? `<div class="code">${ns.code}</div><p>On your network (or a VPN such as Tailscale) friends open ${where} and type this code.</p>` +
+                      '<button id="newCode">New code (kicks everyone)</button>' + tunnelHtml(ns)
                     : '<p>Off: nobody else can reach chase mode or the run.</p>')
       : `<p>Joined the host as <b>${esc(st.name)}</b>.</p>`;
     el.innerHTML += `<h3>Chasers</h3><ul class="plist"><li>● ${esc(st.name)} (you)</li>${rows}</ul>`;
     const on = $('hostOn');
     if (on) on.onchange = async () => { try { await Net.host(on.checked); } catch (e) { say(e.message, 3000); } fillMulti(); };
+    const tb = $('tunBtn');
+    if (tb) tb.onclick = async () => {
+      tb.disabled = true;
+      try { await Net.tunnel(!(ns.tunnel && ['on', 'starting'].includes(ns.tunnel.state))); } catch (e) { say(e.message, 3000); }
+      fillMulti();
+    };
+    for (const b of el.querySelectorAll('[data-copy]')) b.onclick = async () => {
+      try { await navigator.clipboard.writeText(b.dataset.copy); say('Copied', 1000); } catch (e) { prompt('Copy this:', b.dataset.copy); }
+    };
     const nc = $('newCode');
     if (nc) nc.onclick = async () => { await Net.host(true, true); fillMulti(); };
     for (const b of el.querySelectorAll('[data-go]')) b.onclick = () => {
@@ -684,8 +705,7 @@ const Chase = (() => {
       if (b.dataset.tab === 'tabSettings') showVis();
     };
     setInterval(() => {
-      if (st.started && !$('tabMulti').classList.contains('hidden') && !$('help').classList.contains('hidden') &&
-          !(document.activeElement && document.activeElement.closest && document.activeElement.closest('#multi'))) fillMulti();
+      if (st.started && !$('tabMulti').classList.contains('hidden') && !$('help').classList.contains('hidden')) fillMulti();
     }, 3000);
     if (!Net.local) {
       $('codeRow').classList.remove('hidden');

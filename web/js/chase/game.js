@@ -639,7 +639,11 @@ const Chase = (() => {
     catch (e) { $('startMsg').textContent = 'WebGL: ' + e.message; return; }
     $('go').onclick = start;
     window.addEventListener('keydown', e => {
-      if (!st.started || (e.target.tagName === 'INPUT' && e.target.type !== 'range') || e.target.tagName === 'SELECT') return;
+      // driving keys always reach the car, unless a text box is being typed in: a menu control that still has
+      // the keyboard (a dropdown, a slider, a button) lets go of it instead of eating W A S D and the arrows
+      const t = e.target, tag = t && t.tagName;
+      if (!st.started || (tag === 'INPUT' && ['text', 'number', 'search', 'password'].includes(t.type)) || tag === 'TEXTAREA') return;
+      if (tag === 'SELECT' || tag === 'INPUT' || tag === 'BUTTON') { t.blur(); e.preventDefault(); }
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
       if (e.repeat) return;
       st.keys.add(e.code);
@@ -659,6 +663,10 @@ const Chase = (() => {
       }
     });
     window.addEventListener('keyup', e => st.keys.delete(e.code));
+    // a dropdown picked: give the keyboard back to the car
+    document.addEventListener('change', e => { if (e.target && e.target.tagName === 'SELECT') e.target.blur(); });
+    // clicking the view gives the keyboard back too
+    $('hud').addEventListener('mousedown', () => { if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); });
     window.addEventListener('blur', () => st.keys.clear());
     const hudEl = $('hud');
     let drag = null;

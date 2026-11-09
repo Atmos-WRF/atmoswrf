@@ -33,7 +33,74 @@ const CarMesh = (() => {
 
   const srgb = c => c.map(v => v / 255);
 
+  // ---------------------------------------------------------------- model cars (web/models/cars/<kind>.json)
+  // Baked from glTF models by tools/cars/bake_cars.py (the defaults: Kenney's Car Kit, CC0): the body's triangles
+  // in the model's axes (x left, y up, z forward, ground at y 0) with their colours and which are paint, and one wheel.
+  // Fitted to the car's physics here: its length and width from the car's, its height so the wheels are the
+  // physics' wheels; the wheels drawn where the model has them (wheelVis), at the physics' suspension height.
+  const models = {};
+  let loading = null;
+  function load() {
+    if (loading) return loading;
+    loading = Promise.all(['suv', 'sedan', 'truck'].map(k => fetch(`/static/models/cars/${k}.json`)
+      .then(r => (r.ok ? r.json() : null)).then(d => { if (d) models[k] = d; }).catch(() => {})));
+    return loading;
+  }
+  function fromModel(S, kind, color, M) {
+    const B = M.body, Pm = B.p, n = Pm.length / 3;
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity, ytop = 0;
+    for (let i = 0; i < n; i++) {
+      x0 = Math.min(x0, Pm[3 * i]); x1 = Math.max(x1, Pm[3 * i]);
+      z0 = Math.min(z0, Pm[3 * i + 2]); z1 = Math.max(z1, Pm[3 * i + 2]); ytop = Math.max(ytop, Pm[3 * i + 1]);
+    }
+    const [Ld, Wd] = S.dims, cg = S.cgH, a = S.cgFront, b = S.wheelbase - a;
+    const sx = Ld / (z1 - z0), sy = Wd / (x1 - x0), sz = S.wheelR / M.wheelR;
+    const zmid = (M.axle[0] + M.axle[1]) / 2, xoff = (a - b) / 2;
+    const toBody = (mx, my, mz) => [(mz - zmid) * sx + xoff, mx * sy, my * sz - cg];
+    // the paint: the player's colour, each vertex as much lighter or darker as the model's shading of its paint
+    const C = srgb(color), P0 = (M.paintRGB || [128, 128, 128]).map(v => v / 255);
+    const lum = c => 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2], l0 = Math.max(lum(P0), 0.02);
+    const body = new Float32Array(n * 9);
+    for (let i = 0; i < n; i++) {
+      const p = toBody(Pm[3 * i], Pm[3 * i + 1], Pm[3 * i + 2]);
+      // normals through the inverse of the stretch
+      let nx = B.n[3 * i + 2] / sx, ny = B.n[3 * i] / sy, nz = B.n[3 * i + 1] / sz;
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      let c = [B.c[3 * i], B.c[3 * i + 1], B.c[3 * i + 2]];
+      if (B.paint[i]) { const k = Math.min(1.6, lum(c) / l0); c = C.map(v => Math.min(1, v * k)); }
+      body.set([...p, nx / nl, ny / nl, nz / nl, ...c], 9 * i);
+    }
+    const extra = [];
+    if (kind === 'suv') {
+      // the chaser's roof: rack bars, a light bar, an anemometer mast and a dome camera (the model's roof: its top)
+      let rx0 = Infinity, rx1 = -Infinity, ry = 0;
+      for (let i = 0; i < n; i++) if (Pm[3 * i + 1] > ytop - 0.03) {
+        const q = toBody(Pm[3 * i], Pm[3 * i + 1], Pm[3 * i + 2]);
+        rx0 = Math.min(rx0, q[0]); rx1 = Math.max(rx1, q[0]); ry = Math.max(ry, Math.abs(q[1]));
+      }
+      const top = ytop * sz - cg, black = [0.04, 0.04, 0.045], amber = [0.85, 0.55, 0.12], dark = [0.06, 0.06, 0.07], chrome = [0.55, 0.56, 0.58];
+      const yw = Math.max(0.45, ry - 0.05);
+      for (const xx of [rx0 + 0.2, rx1 - 0.2]) box(extra, xx - 0.04, xx + 0.04, -yw, yw, top, top + 0.07, black);
+      box(extra, rx1 - 0.3, rx1 - 0.16, -yw + 0.08, yw - 0.08, top + 0.07, top + 0.15, amber);
+      box(extra, rx0 + 0.15, rx0 + 0.21, 0.3, 0.36, top + 0.07, top + 0.85, dark);
+      box(extra, rx0 + 0.07, rx0 + 0.29, 0.22, 0.44, top + 0.85, top + 0.9, chrome);
+      box(extra, rx0 + 0.4, rx0 + 0.7, -0.15, 0.15, top + 0.07, top + 0.27, black, [0.08, 0.08, 0.08]);
+    }
+    // the wheel: the model's, its axle along y (the model's x), sized to the physics' wheel
+    const W = M.wheel, wn = W.p.length / 3, sw = sy, wheel = new Float32Array(wn * 9);
+    for (let i = 0; i < wn; i++) {
+      let nx = W.n[3 * i + 2] / sz, ny = W.n[3 * i] / sw, nz = W.n[3 * i + 1] / sz;
+      const nl = Math.hypot(nx, ny, nz) || 1;
+      wheel.set([W.p[3 * i + 2] * sz, W.p[3 * i] * sw, W.p[3 * i + 1] * sz, nx / nl, ny / nl, nz / nl, W.c[3 * i], W.c[3 * i + 1], W.c[3 * i + 2]], 9 * i);
+    }
+    const half = (M.wheelX !== undefined ? M.wheelX : 0.425) * sy;
+    const all = new Float32Array(body.length + extra.length);
+    all.set(body); all.set(extra, body.length);
+    return { body: all, wheel, wheelVis: { xf: (M.axle[1] - zmid) * sx + xoff, xr: (M.axle[0] - zmid) * sx + xoff, half } };
+  }
+
   function build(S, kind, color) {
+    if (models[kind]) return fromModel(S, kind, color, models[kind]);
     const body = [];
     const [Ld, Wd, Hd] = S.dims, cg = S.cgH, a = S.cgFront, b = S.wheelbase - a;
     const xF = a + (Ld - S.wheelbase) / 2, xR = -b - (Ld - S.wheelbase) / 2;
@@ -126,6 +193,6 @@ const CarMesh = (() => {
     return { body: new Float32Array(body), wheel: new Float32Array(wheel) };
   }
 
-  return { build };
+  return { build, load, ready: kind => !!models[kind], models, box, hexa };
 })();
 window.CarMesh = CarMesh;

@@ -1,8 +1,13 @@
 """Chase mode (web/chase.html at /chase): driving under the run's storms, alone or with friends.
 
-The buildings: OpenStreetMap's building footprints, fetched from Overpass in cells (BUILDING_CELL degrees) by a
-background thread and kept in output/cache/osm/buildings, like landscape.py's roads; a request returns the
-footprints there are (world km) with a height and a kind, and how many cells are still on their way.
+The buildings: FEMA's USA Structures footprints (ArcGIS Online), or OpenStreetMap's (OpenFreeMap, Overpass) where
+FEMA has none (outside the US), fetched in cells (BUILDING_CELL degrees) by a background thread and kept in
+output/cache/osm/structures, like landscape.py's roads; a request returns the footprints there are (world km) with
+a height and a kind, and how many cells are still on their way.
+
+The air at the cars (air()): the model's lowest-level wind (ground-relative, at 10 m), gust, temperature and
+moisture at each point, from the finest grid holding it (the tornado zoom where it is), for the wind's sound and the
+rain or snow.
 
 Multiplayer: the PC running the viewer hosts.  Hosting is off until switched on from the chase page on this PC;
 then a six-digit join code lets friends on the network (or over a VPN such as Tailscale) open /chase, join and
@@ -32,7 +37,10 @@ from .landscape import OSM_CACHE
 
 # ---------------------------------------------------------------- buildings
 BUILDING_CELL = 0.05             # degrees
-BUILDING_DIR = OSM_CACHE / "buildings"
+BUILDING_DIR = OSM_CACHE / "structures"          # FEMA's (OpenStreetMap's outside the US); "buildings": OSM's only
+FEMA_URL = ("https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/USA_Structures_View/"
+            "FeatureServer/0/query")
+FEMA_PAGE, FEMA_THREADS, FEMA_TIMEOUT = 2000, 4, 60.0
 # kinds: 0 house, 1 shop / office, 2 farm / industrial, 3 tall (flats, hotel), 4 shed / garage, 5 civic (church, school)
 _KIND = {"house": 0, "detached": 0, "residential": 0, "semidetached_house": 0, "bungalow": 0, "terrace": 0,
          "static_caravan": 0, "cabin": 0, "farm": 0, "yes": 0,
@@ -55,7 +63,86 @@ def _b_file(la: float, lo: float):
     return BUILDING_DIR / f"{la:+08.2f}_{lo:+08.3f}.json"
 
 
+def _fema_get(params: dict) -> dict:
+    url = FEMA_URL + "?" + urllib.parse.urlencode(params)
+    err = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Atmos-WRF chase mode"})
+            with urllib.request.urlopen(req, timeout=FEMA_TIMEOUT) as r:
+                d = json.load(r)
+            if "error" in d:
+                raise RuntimeError(str(d["error"])[:200])
+            return d
+        except Exception as e:                   # a busy moment on ArcGIS Online: again, a little later
+            err = e
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"FEMA USA Structures: {err}")
+
+
+def _fema_kind(a: dict, area: float, h: float) -> int:
+    """A kind (see _KIND) from the structure's FEMA occupancy class and type."""
+    occ, prim = (a.get("OCC_CLS") or "").lower(), (a.get("PRIM_OCC") or "").lower()
+    if a.get("OUTBLDG") not in (None, "", 0, "0", "N", "No", "NO"):
+        return 4
+    if occ == "residential":
+        if "multi" in prim or "lodging" in prim or "dormitor" in prim or "nursing" in prim:
+            return 3 if h >= 9.0 or area > 1200.0 else 0
+        return 4 if area < 30.0 else 0
+    if occ == "commercial":
+        return 3 if h >= 12.0 else 1
+    if occ in ("industrial", "agriculture"):
+        return 2
+    if occ in ("education", "government", "religious", "assembly"):
+        return 5
+    return _kind_by_size(area, h)
+
+
+def fema_buildings(la: float, lo: float, step: float) -> list:
+    """The buildings of a cell from FEMA's USA Structures (every structure over 450 sq ft in the US and its
+    territories, footprints from imagery and lidar, with an occupancy class and a height), as chase's files have
+    them: [[height m, kind, [lat ...], [lon ...]], ...].  Pages of FEMA_PAGE, several at a time."""
+    from concurrent.futures import ThreadPoolExecutor
+    base = {"where": "1=1", "geometry": f"{lo:.5f},{la:.5f},{lo + step:.5f},{la + step:.5f}",
+            "geometryType": "esriGeometryEnvelope", "inSR": "4326", "spatialRel": "esriSpatialRelIntersects",
+            "f": "json"}
+    n = int(_fema_get({**base, "returnCountOnly": "true"}).get("count") or 0)
+    if n == 0:
+        return []
+    q = {**base, "outFields": "OCC_CLS,PRIM_OCC,HEIGHT,OUTBLDG,SQMETERS", "returnGeometry": "true", "outSR": "4326",
+         "geometryPrecision": "6", "orderByFields": "OBJECTID", "resultRecordCount": str(FEMA_PAGE)}
+    offsets = list(range(0, n, FEMA_PAGE))
+    with ThreadPoolExecutor(max_workers=FEMA_THREADS) as ex:
+        pages = list(ex.map(lambda o: _fema_get({**q, "resultOffset": str(o)}), offsets))
+    out = []
+    for d in pages:
+        for f in d.get("features", []):
+            g, a = f.get("geometry") or {}, f.get("attributes") or {}
+            rings = g.get("rings") or []
+            if not rings or len(rings[0]) < 4:
+                continue
+            ring = rings[0]                         # the outline (inner rings: courtyards, left out)
+            area = float(a.get("SQMETERS") or 0.0)
+            h0 = a.get("HEIGHT")
+            h = float(h0) if h0 not in (None, "") and float(h0) >= 2.5 else None
+            k = _fema_kind(a, area, h or 0.0)
+            if h is None:
+                h = _HEIGHT[k]
+            elif k == 0:
+                h = max(h, 4.5)                     # room for the gable roof over the walls
+            h = min(h, 300.0)
+            out.append([round(h, 1), k, [round(p[1], 6) for p in ring], [round(p[0], 6) for p in ring]])
+    return out
+
+
 def _b_fetch(la: float, lo: float) -> None:
+    try:                                         # FEMA's USA Structures first (the US); OpenStreetMap elsewhere
+        out = fema_buildings(la, lo, BUILDING_CELL)
+    except Exception:
+        out = None
+    if out:
+        _b_write(la, lo, out)
+        return
     q = (f'[out:json][timeout:150];way["building"]({la:.4f},{lo:.4f},{la + BUILDING_CELL:.4f},'
          f'{lo + BUILDING_CELL:.4f});out geom tags;')
     try:                                         # OpenFreeMap's tiles first (fast, a CDN), Overpass if it fails
@@ -149,6 +236,68 @@ def buildings(proj, box_km) -> dict:
     return {"b": out, "pending": pending, "busy": bool(pending) and osmfetch.busy()}
 
 
+# ---------------------------------------------------------------- the air at the cars
+AIR_MAX = 16                     # points per request
+
+
+def air(sim, pts) -> list:
+    """The model's air at ground points pts [(x, y) world m]: per point {"u", "v" (m/s at 10 m, ground-relative),
+    "gust" (m/s), "t" (deg C), "td" (dew point, deg C), "inside" (a storm patch holds it)}, the finest grid holding
+    the point (the tornado zoom where it is), the environment's lowest level elsewhere.  Caller holds sim.lock."""
+    from .metars import GUST_MIN, GUST_SIGMA, _Station
+    net, env = sim.metars, sim.env
+    z0 = float(env.physics.z0)
+    sts = []
+    for k, (x, y) in enumerate(pts[:AIR_MAX]):
+        hg = 0.0
+        if getattr(env, "terrain", None) is not None:
+            try:
+                hg = float(np.asarray(env.terrain.height(np.array([x]), np.array([y])), float).ravel()[0])
+            except Exception:
+                pass
+        zz = z0
+        if env.roughness is not None:
+            try:
+                zz = float(np.asarray(env.roughness(np.array([x]), np.array([y])), float).ravel()[0])
+            except Exception:
+                pass
+        sts.append(_Station(k, f"car{k}", float(x), float(y), max(zz, 1e-4), hg))
+    if not sts:
+        return []
+    where = net._where(sts)
+    vals, by_patch = {}, {}
+    for s in sts:
+        if s.icao in where:
+            p, j, i = where[s.icao]
+            by_patch.setdefault(id(p), (p, []))[1].append((s, j, i))
+    for p, lst in by_patch.values():
+        a = net._gather(p, np.array([q[1] for q in lst]), np.array([q[2] for q in lst]), net._fields)
+        z1, zt = float(p.env.z_h[0]), float(p.env.z_w[-1])
+        for k, (s, _, _) in enumerate(lst):
+            vals[s.icao] = tuple(a[:6, k]) + (z1 * (1.0 - s.hg / zt), True)
+    rest = [s for s in sts if s.icao not in vals]
+    if rest:
+        u, v, th, qv, pp, tke = net._environment(rest)
+        z1 = float(env.z_h[0])
+        for k, s in enumerate(rest):
+            vals[s.icao] = (u[k], v[k], th[k], qv[k], pp[k], tke[k], z1, False)
+    out = []
+    for s in sts:
+        u, v, th, qv, pp, tke, z1, inside = (float(c) if not isinstance(c, bool) else c for c in vals[s.icao])
+        fac = 1.0 if z1 <= 10.0 else min(max(math.log(10.0 / s.z0) / math.log(z1 / s.z0), 0.4), 1.0)
+        u10, v10 = u * fac, v * fac
+        spd = math.hypot(u10, v10)
+        sig = math.sqrt(max(tke, 0.0) * 2.0 / 3.0) * fac if tke >= 0 else 0.0
+        gust = spd + max(GUST_SIGMA * sig, GUST_MIN * spd)
+        tk = th * (pp / 1e5) ** 0.2857
+        e = max(qv, 1e-7) * pp / (0.622 + max(qv, 1e-7)) / 100.0        # vapour pressure, hPa
+        td = 243.5 * math.log(e / 6.112) / (17.67 - math.log(e / 6.112))
+        ok = all(math.isfinite(c) for c in (u10, v10, gust, tk, td))
+        out.append({"u": round(u10, 2), "v": round(v10, 2), "gust": round(gust, 2), "t": round(tk - 273.15, 2),
+                    "td": round(min(td, tk - 273.15), 2), "inside": bool(inside)} if ok else None)
+    return out
+
+
 # ---------------------------------------------------------------- multiplayer
 _LOCK = threading.Lock()
 _HOST = {"on": False, "code": None}
@@ -157,9 +306,13 @@ _FAILS: dict[str, list[float]] = {}
 _NEXT = [1]
 STALE = 6.0                                     # s without a sync: gone from the others' lists
 # what a joined page on another computer may read (GET) with its token while hosting is on
-READ = ("/api/state", "/api/pmw/targets", "/api/volume", "/api/volume/times", "/api/volume/roads",
-        "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/frames", "/api/frame", "/api/ppi")
-STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|colors)\.js|static/js/chase/[a-z0-9_]+\.js)$")
+READ = ("/api/state", "/api/pmw/targets", "/api/c/air", "/api/volume", "/api/volume/times", "/api/volume/roads",
+        "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/frames", "/api/frame", "/api/ppi",
+        "/api/tornado3d")
+# (and the detailed map's module, tile worker and landmarks, and the cars' models)
+STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|colors)\.js|static/js/chase/[a-z0-9_]+\.js"
+                    r"|static/js/chase/world/(world|tileworker)\.js|static/js/chase/world/landmarks\.json"
+                    r"|static/models/cars/[a-z0-9_]+\.json)$")
 
 
 def host(on: bool | None = None, new_code: bool = False) -> dict:

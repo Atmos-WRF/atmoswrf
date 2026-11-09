@@ -28,7 +28,12 @@ function unpack(buf) {
 }
 
 const Chase = (() => {
-  const BOX_KM = 100, RECENTRE_KM = 18, VOL_EVERY = 8000;
+  // the storm is fetched about once a second (VOL_MIN) and blended into the picture over the time between fetches;
+  // a fetch that takes long (a slow model step, the CPU backend, a slow link) spaces the next ones out (VOL_LOAD x
+  // its time, up to VOL_MAX), so the page never holds the run's lock for more than a small share of its time
+  const BOX_KM = 100, RECENTRE_KM = 18, VOL_MIN = 1000, VOL_MAX = 8000, VOL_LOAD = 2.5;
+  const BLEND_MIN = 300, BLEND_MAX = 90000;          // ms: the blend into each new volume (the time they take to come)
+  const TARGETS_EVERY = 1000;                         // ms: the tornadoes' positions (cheap)
   const COLORS = { suv: [196, 30, 36], sedan: [235, 235, 232], truck: [70, 74, 66] };
   // what is under a wheel: grip (mu), rolling drag, the slip at the grip's peak (driving, cornering), the curve's
   // shape (lower: a flatter peak, looser), roughness m
@@ -52,7 +57,8 @@ const Chase = (() => {
   // the look (the 3-D view's cloud-mode settings, plus quality): the menu's Settings tab, kept in this browser
   const VIS0 = { density: 0.5, rain: 1, detail: 0.7, relief: 0.6, haze: 180, sunMode: 'model', sunAz: 235, sunH: 30,
                  base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3, trees: 'full',
-                 contrast: 1.3, funnel: 2, mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small' };
+                 contrast: 1.3, bounce: 1, mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small',
+                 vol: 0.7, precip: 'on', map: 'detailed', far: 'on', nestStep: '2', markers: 'off' };
   const QUICK = ['cref', 'REF', 'VEL', 'SRV', 'RHO', 'none'];          // K steps through these
   const TREE_BUDGET = { off: 0, light: 25000, full: 70000 };
 
@@ -69,7 +75,28 @@ const Chase = (() => {
     const i = Math.floor(x), j = Math.floor(y), fx = x - i, fy = y - j, sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
     return (h(i, j) * (1 - sx) + h(i + 1, j) * sx) * (1 - sy) + (h(i, j + 1) * (1 - sx) + h(i + 1, j + 1) * sx) * sy;
   }
+  // the detailed map's surfaces (worldlink.js: its road surfaces, its land classes) as chase mode's
+  const W_ROAD = { asphalt: 'asphalt', gravel: 'gravel', dirt: 'bare', grass: 'grass', mud: 'mud', water: 'water' };
+  const W_LAND = { grass: 'grass', 'crop field': 'crops', 'bare soil': 'bare', forest: 'wood', mud: 'mud',
+                   'gravel / rock': 'gravel', urban: 'town', water: 'water' };
+  function worldSurf(x, y) {
+    if (!detailed() || !WorldLink.ready()) return null;
+    const g = WorldLink.ground(x, y, st.car ? st.car.p[2] : undefined);
+    if (!g) return null;
+    let s;
+    if (g.road) s = SURF[W_ROAD[g.surface] || 'asphalt'];
+    else s = SURF[W_LAND[g.land] || 'grass'];
+    if (s === SURF.asphalt && st.wet > 0.3) s = SURF.wet;
+    if (!g.road && st.wet > 0.5 && [SURF.grass, SURF.crops, SURF.bare].includes(s)) s = SURF.mud;
+    if (g.water > 0.25) s = SURF.water;
+    let h = g.h;
+    if (s.rough) h += s.rough * (vnoise(x / 1.6, y / 1.6) + 0.5 * vnoise(x / 0.55 + 31, y / 0.55)) - s.rough * 0.6;
+    return { h, s };
+  }
+  const detailed = () => st.vis && st.vis.map !== 'basic';
   function surfAt(x, y) {
+    const w = worldSurf(x, y);
+    if (w) return w;
     const r = Roads.at(x, y);
     let s;
     if (r.seg >= 0) s = r.paved ? (st.wet > 0.3 ? SURF.wet : SURF.asphalt) : SURF.gravel;
@@ -120,7 +147,34 @@ const Chase = (() => {
     try {
       st.run = await getJSON('/api/state');
     } catch (e) { st.run = null; }
+    await pollTargets();
+  }
+  // the tornadoes' and storms' positions (pmw.targets: small, and quick to make), more often than the whole state
+  async function pollTargets() {
+    if (st.targetsBusy) return;
+    st.targetsBusy = true;
     try { st.targets = await getJSON('/api/pmw/targets'); } catch (e) { st.targets = null; }
+    st.targetsBusy = false;
+  }
+  // a tornado's position on the screen glides from where it was drawn to each new position over about the time
+  // between them, as the cloud blends between volumes, instead of jumping every update
+  const torGlide = new Map();                         // id -> { fx, fy, tx, ty, t0, dur, seen }
+  function glide(id, x, y) {
+    const now = performance.now();
+    let g = torGlide.get(id);
+    if (!g) { g = { fx: x, fy: y, tx: x, ty: y, t0: now, dur: 0, at: now }; torGlide.set(id, g); }
+    if (x !== g.tx || y !== g.ty) {
+      const k = g.dur > 0 ? Math.min(1, (now - g.t0) / g.dur) : 1;
+      g.fx += (g.tx - g.fx) * k; g.fy += (g.ty - g.fy) * k;          // from where it is drawn now
+      // a jump of kilometres is a different vortex (or the first fix): no glide
+      const far = Math.hypot(x - g.fx, y - g.fy) > 4000;
+      g.dur = far ? 0 : Math.max(BLEND_MIN, Math.min(BLEND_MAX, now - g.at));
+      if (far) { g.fx = x; g.fy = y; }
+      g.tx = x; g.ty = y; g.t0 = now; g.at = now;
+    }
+    g.seen = now;
+    const k = g.dur > 0 ? Math.min(1, (now - g.t0) / g.dur) : 1;
+    return [g.fx + (g.tx - g.fx) * k, g.fy + (g.ty - g.fy) * k];
   }
   // the storm to chase: the strongest tornado, else the tornado zoom, else the strongest storm cell (world m),
   // with its motion
@@ -157,21 +211,118 @@ const Chase = (() => {
       const o = out.find(o => o.id === t.id) || out.find(o => Math.hypot(o.x - t.x, o.y - t.y) < 3000);
       if (o) { o.x = t.x; o.y = t.y; if (t.wind) o.wind = t.wind; } else out.push({ id: t.id, x: t.x, y: t.y, wind: t.wind, ef: efOf(t.wind), pts: [] });
     }
+    for (const o of out) [o.x, o.y] = glide(o.id, o.x, o.y);
+    const now = performance.now();
+    for (const [id, g] of torGlide) if (now - g.seen > 30000) torGlide.delete(id);
     return out;
   }
-  // the tornadoes on the ground near the car, for the funnels: strength from their wind, the cloud base over
-  // them from the model (its own lowest cloud there; 900 m when it has none), the core from the wind
-  function funnelList() {
-    const c = st.car, out = [];
-    if (!c) return out;
-    for (const t of tornadoes()) {
-      if (Math.hypot(t.x - c.p[0], t.y - c.p[1]) > 45000) continue;
-      const V = Math.max(25, Math.min(110, t.wind || [32, 43, 55, 67, 80, 95][Math.max(0, t.ef || 0)]));
-      const cb = Render.cloudBase(t.x, t.y);
-      out.push({ x: t.x, y: t.y, V, R: 25 + 1.8 * V, base: Math.max(250, Math.min(2000, cb === null ? 900 : cb)), ground: Render.terrain(t.x, t.y) });
-    }
-    return out.sort((a, b) => Math.hypot(a.x - c.p[0], a.y - c.p[1]) - Math.hypot(b.x - c.p[0], b.y - c.p[1])).slice(0, 4);
+  // The tornado model's own tornado (the Unity LES through its Atmos bridge, /api/tornado3d): its condensation, dust,
+  // vortex tubes and wind in a box over the vortex, ~8 frames a second, each blended in over the time since the last.
+  // Between frames the box carries on at the vortex's motion (at the model's speed), so it never jumps.
+  const LES_EVERY = 100;                              // ms between asks (the server answers 204 when nothing is newer)
+  const les = { seq: 0, busy: false, head: null, at: 0 };
+  function unpackLes(buf) {
+    const dv = new DataView(buf);
+    if (buf.byteLength < 8 || dv.getUint32(0, true) !== 0x31524f54) throw new Error('not a tornado frame');   // "TOR1"
+    const hl = dv.getUint32(4, true);
+    const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hl)));
+    const [w, h, d] = header.tex, [vw, vh, vd] = header.vtex, o = 8 + hl, n = 4 * w * h * d;
+    return { header, media: new Uint8Array(buf, o, n), vel: new Uint8Array(buf, o + n, 4 * vw * vh * vd) };
   }
+  async function pollLes() {
+    if (les.busy || !Render.lesReady()) return;
+    les.busy = true;
+    try {
+      const r = await fetch(`/api/tornado3d?since=${les.seq}`, { headers: window.ChaseAuth ? window.ChaseAuth() : {} });
+      if (r.status === 200) {
+        const f = unpackLes(await r.arrayBuffer()), now = performance.now();
+        const gap = les.head ? Math.max(50, Math.min(1000, now - les.at)) : 0;
+        Render.setLes(f.header, f.media, f.vel, gap);
+        if (!les.head) say('The tornado model is live here', 2500);
+        les.head = f.header; les.at = now;
+        les.seq = +(r.headers.get('X-Tornado-Seq') || 0);
+      } else if (r.status === 204 && r.headers.get('X-Tornado-State') === 'off' && les.head) {
+        les.head = null; Render.setLes(null);
+      }
+    } catch (e) { /* keep the last frame; the next ask tries again */ }
+    les.busy = false;
+  }
+  // where the model's tornado stands now (world m) and the ground there, or null
+  function lesView() {
+    const h = les.head;
+    if (!h) return null;
+    const age = Math.min(3, (performance.now() - les.at) / 1000) * (h.speed || 1);
+    const x = h.x + h.vx * age, y = h.y + h.vy * age;
+    return { x, y, ground: Render.terrain(x, y) };
+  }
+
+  // The model's air at the car (chase.py air(): its 10 m wind, gust, temperature, dew point), twice a second; between
+  // answers the numbers glide.  st.fake overrides any of { wind [u, v] m/s, gust, t (deg C), rain (0..1 intensity),
+  // tornado (0..1 roar) } for testing, from the console: Chase.st.fake = { wind: [30, 5], gust: 45, t: -3, rain: 0.8 }.
+  const AIR_EVERY = 500;
+  const air = { busy: false, now: null, err: '' };
+  async function pollAir() {
+    const c = st.foot || st.car;                // the air where you are: on foot, round you
+    if (!c || air.busy) return;
+    air.busy = true;
+    try {
+      const d = await getJSON(`/api/c/air?p=${c.p[0].toFixed(1)},${c.p[1].toFixed(1)}`);
+      air.now = d.air && d.air[0] ? d.air[0] : air.now; air.err = '';
+    } catch (e) { air.err = e.message; }
+    air.busy = false;
+  }
+  // what the car is in now: { wind [u, v], W m/s, gust, t, td, rainI 0..1, snow 0..1, roar 0..1 } (smoothed per frame)
+  const wx = { u: 0, v: 0, gust: 0, t: null, td: null, rainI: 0, snow: 0, roar: 0, camV: [0, 0, 0], eye: null };
+  function weather(dt, view) {
+    const f = st.fake || {}, a = air.now, k = Math.min(1, dt * 2.5);
+    const u = f.wind ? f.wind[0] : a ? a.u : 0, v = f.wind ? f.wind[1] : a ? a.v : 0;
+    const W = Math.hypot(u, v), gust = f.gust !== undefined ? f.gust : a ? a.gust : W;
+    wx.u += (u - wx.u) * k; wx.v += (v - wx.v) * k; wx.gust += (Math.max(gust, W) - wx.gust) * k;
+    const T = f.t !== undefined ? f.t : a ? a.t : null;
+    wx.t = T === null ? null : wx.t === null ? T : wx.t + (T - wx.t) * k;
+    wx.td = f.td !== undefined ? f.td : a ? a.td : null;
+    // the model's rain at the car (g/kg a few hundred metres up) as an intensity: 0.03 g/kg nothing, 1 heavy, 3 extreme
+    const ri = f.rain !== undefined ? f.rain : st.rain > 0.03 ? Math.min(1, (Math.log10(st.rain) + 1.5) / 2) : 0;
+    wx.rainI += (ri - wx.rainI) * Math.min(1, dt * 0.8);
+    // snow below freezing, sleet and wet flakes just above, rain from 2 deg C (the wet bulb would be better)
+    const sn = wx.t === null ? 0 : Math.max(0, Math.min(1, (1.8 - wx.t) / 2.3));
+    wx.snow += (sn - wx.snow) * Math.min(1, dt * 0.5);
+    // a tornado's roar: closer than ~5 km, louder the stronger and nearer it is
+    let roar = 0;
+    const c = st.car;
+    for (const t of tornadoes()) {
+      const d = Math.hypot(t.x - c.p[0], t.y - c.p[1]), V = t.wind || [32, 43, 55, 67, 80, 95][Math.max(0, t.ef || 0)];
+      roar = Math.max(roar, Math.max(0, Math.min(1, (5000 - d) / 4600)) ** 1.5 * Math.min(1, Math.max(0.3, V / 70)));
+    }
+    if (f.tornado !== undefined) roar = f.tornado;
+    wx.roar += (roar - wx.roar) * k;
+    // the camera's own motion, for the streaks
+    if (wx.eye && dt > 0) {
+      const cv = view.eye.map((x, i) => (x - wx.eye[i]) / dt);
+      wx.camV = wx.camV.map((x, i) => x + (Math.max(-80, Math.min(80, cv[i])) - x) * Math.min(1, dt * 8));
+    }
+    wx.eye = view.eye.slice();
+    return wx;
+  }
+  // the rain and snow for Render.frame, and the sound
+  function precipView(view) {
+    const I = wx.rainI;
+    if (I < 0.01) return null;
+    const sun = sunDir(), inside = !st.foot && st.cam.mode !== 'chase';
+    const L = (0.32 + 0.5 * Math.min(1, Math.max(0, sun[2]) * 2.2)) * (1 - 0.35 * I);
+    return { n: I * (9000 * (1 - wx.snow) + 15000 * wx.snow), snow: wx.snow, cube: wx.snow > 0.5 ? 20 : 24,
+             minD: inside ? 1.4 : 0.4, wind: [wx.u, wx.v], camV: wx.camV,
+             col: [0.25 + 0.62 * L, 0.27 + 0.65 * L, 0.30 + 0.68 * L] };     // drops catch the light: brighter than the murk
+  }
+  function sound(dt) {
+    const c = st.car, cyl = { suv: 6, sedan: 4, truck: 8 }[c.kind] || 6;
+    const slip = Math.max(0, ...c.wheels.map(w => (w.contact ? w.slip || 0 : 0)));
+    const rough = Math.max(0, ...c.wheels.map(w => (w.surf && w.surf.rough ? w.surf.rough * 12 : 0)));
+    Sound.update({ rpm: c.rpm, idle: c.spec.idle, redline: c.spec.redline, thr: (c.in && c.in.thr) || 0, cyl, speed: c.speed, slip,
+                   rough: Math.min(1, rough), wind: Math.hypot(wx.u, wx.v), gust: wx.gust, tornado: wx.roar, rain: wx.rainI,
+                   snow: wx.snow, inside: !st.foot && st.cam.mode !== 'chase', vol: st.vis.vol === undefined ? 0.7 : st.vis.vol, dt });
+  }
+
   const efOf = w => (w === null || w === undefined ? null : w < 38 ? 0 : w < 50 ? 1 : w < 61 ? 2 : w < 74 ? 3 : w < 89 ? 4 : 5);
 
   async function loadVolume(force) {
@@ -179,14 +330,43 @@ const Chase = (() => {
     const x = st.car.p[0] / 1000, y = st.car.p[1] / 1000;
     let b = st.box;
     const far = !b || Math.hypot(x - (b[0] + b[2]) / 2, y - (b[1] + b[3]) / 2) > RECENTRE_KM;
-    if (!far && !force && performance.now() - st.volAt < VOL_EVERY) return;
+    if (!far && !force && performance.now() - st.volAt < (st.volGap || VOL_MIN)) return;
     if (far) { const h = BOX_KM / 2, cx = Math.round(x), cy = Math.round(y); b = [cx - h, cy - h, cx + h, cy + h]; }
-    st.volBusy = true; st.volAt = performance.now();
-    const q = `/api/volume?x0=${b[0]}&y0=${b[1]}&x1=${b[2]}&y1=${b[3]}&field=cloud`;
+    const t0 = performance.now();
+    st.volBusy = true; st.volAt = t0;
+    // wind=1: the model's wind and vortices too, so the blend carries the cloud along them (render.js MIX_FS)
+    const q = `/api/volume?x0=${b[0]}&y0=${b[1]}&x1=${b[2]}&y1=${b[3]}&field=cloud&wind=1`;
+    // the same box as the one shown: blend into the new volume over the time volumes take to come in (smoothed, and
+    // a little longer), so the picture plays about one volume behind the newest and never stops between them
+    // (render.js carries it on along the wind if the next is late)
+    const same = !far && !!st.box && Render.head();
+    const blendMs = () => {
+      if (!same || !st.volNewAt) return 0;
+      const gap = performance.now() - st.volNewAt;
+      st.volIv = st.volIv ? st.volIv + (gap - st.volIv) * 0.35 : gap;
+      return Math.max(BLEND_MIN, Math.min(BLEND_MAX, 1.15 * st.volIv));
+    };
     try {
       let r = null;
-      if (st.run && st.run.status === 'running') { try { r = await api(q); st.volT = null; } catch (e) { r = null; } }
+      if (st.run && st.run.status === 'running') {
+        try {
+          // since=: the server answers 204 while the model has not moved on from the volume shown
+          const since = same && st.volModelT !== null && st.volModelT !== undefined ? `&since=${st.volModelT}` : '';
+          r = await api(q + since);
+          st.volT = null;
+        } catch (e) { r = null; }
+        if (r && r.status === 204) {
+          st.volGap = Math.max(VOL_MIN, Math.min(VOL_MAX, VOL_LOAD * (performance.now() - t0)));
+          st.volBusy = false;
+          return;
+        }
+        if (r) {
+          const mt = parseFloat(r.headers.get('X-Model-Time'));
+          st.volModelT = Number.isFinite(mt) ? mt : null;
+        }
+      }
       if (!r) {
+        st.volModelT = null;
         // a stopped run (or none of its fields in the box yet): the newest 3-D snapshot it saved
         const tt = await getJSON('/api/volume/times');
         if (!tt.times || !tt.times.length) throw new Error('no 3-D snapshots saved in this run');
@@ -195,10 +375,76 @@ const Chase = (() => {
         r = await api(`${q}&t=${t}`);
         st.volT = t;
       }
-      Render.setVolume(b, await r.arrayBuffer());
-      st.box = b; st.volErr = '';
-    } catch (e) { st.volErr = e.message; }
+      const buf = await r.arrayBuffer();
+      Render.setVolume(b, buf, blendMs());
+      st.volNewAt = performance.now();
+      st.box = b; st.volErr = ''; st.noStorm = false;
+    } catch (e) {
+      st.volErr = st.noStorm && !far ? '' : e.message;
+      // no storm in the box (none in the run yet, or far from them): an empty sky over it, so the ground and the car
+      // are drawn anyway; the storm comes in when a fetch first finds it
+      if (!Render.head() || far) { Render.setVolume(b, emptyVolume(b), 0); st.box = b; st.volErr = ''; st.noStorm = true; }
+    }
+    st.volGap = Math.max(VOL_MIN, Math.min(VOL_MAX, VOL_LOAD * (performance.now() - t0)));
     st.volBusy = false;
+  }
+
+  // ---------------------------------------------------------------- the far cloud (render.js setFar)
+  // Past the box: two coarse volumes round the car out to where the haze has it all (3x the visibility, FAR_MAX_KM
+  // at most) -- the nearer out to FAR_NEAR_KM on a ~1.25 km grid, the wider beyond on a coarser one -- fetched one at
+  // a time every FAR_EVERY ms each, re-centred when the car has gone an eighth of one's width, each blended into
+  // over the time to the next
+  const FAR_EVERY = [15000, 30000], FAR_NEAR_KM = 160, FAR_MAX_KM = 600;
+  const FAR_BLEND = 3000;                      // ms: a far storm barely moves in 15 s; a short blend, then no more mixing
+  const farSt = [{ at: 0, box: null }, { at: 0, box: null }];
+  let farBusy = false;
+  function farTiers() {
+    const R = Math.min(FAR_MAX_KM, 3 * (st.vis.haze || 180));
+    // grids sized for a laptop's GPU too (the light pass and the blend run over every point): ~1.7 km and ~4-7 km cells
+    return [R > BOX_KM / 2 + 5 ? { half: Math.min(R, FAR_NEAR_KM), side: 192, nz: 36 } : null,
+            R > FAR_NEAR_KM + 10 ? { half: R, side: 160, nz: 24 } : null];
+  }
+  async function loadFar() {
+    if (farBusy || !st.car || !st.run) return;
+    const on = st.vis.far !== 'off', tiers = farTiers(), x = st.car.p[0] / 1000, y = st.car.p[1] / 1000;
+    for (let i = 0; i < 2; i++) {
+      const T = tiers[i], s = farSt[i];
+      if (!on || !T) {
+        if (s.box) { Render.setFar(i, null); s.box = null; }
+        continue;
+      }
+      const step = T.half / 8, cx = Math.round(x / step) * step, cy = Math.round(y / step) * step;
+      const b = [cx - T.half, cy - T.half, cx + T.half, cy + T.half];
+      const moved = !s.box || b.some((v, k) => Math.abs(v - s.box[k]) > 1e-6);
+      if (!moved && performance.now() - s.at < FAR_EVERY[i]) continue;
+      farBusy = true;
+      try {
+        let q = `/api/volume?x0=${b[0]}&y0=${b[1]}&x1=${b[2]}&y1=${b[3]}&field=cloud&far=1&side=${T.side}&nz=${T.nz}`;
+        if (st.run.status !== 'running') {
+          // a stopped run: its newest 3-D snapshot, as the box's
+          if (st.volT === null || st.volT === undefined) throw new Error('no snapshot');
+          q += `&t=${st.volT}`;
+        }
+        const r = await api(q);
+        Render.setFar(i, await r.arrayBuffer(), s.box ? FAR_BLEND : 0);
+      } catch (e) {
+        Render.setFar(i, null);                 // no storm patch out there (or none yet)
+      }
+      s.box = b; s.at = performance.now();
+      farBusy = false;
+      return;                                   // one a call
+    }
+  }
+
+  // a cloud volume with nothing in it over box b (km), in the server's format (volume.py extract)
+  function emptyVolume(b) {
+    const n = 4, head = new TextEncoder().encode(JSON.stringify({
+      field: 'cloud', units: 'log10 g/kg', nx: n, ny: n, nz: n, box: b.map(v => v * 1000), ztop: 18000, scale: 40, offset: 121,
+      channels: 2, ground: false, insets: [] }));
+    const buf = new Uint8Array(4 + head.length + n * n * n * 2);
+    new DataView(buf.buffer).setUint32(0, head.length, true);
+    buf.set(head, 4);
+    return buf.buffer;
   }
 
   // ---------------------------------------------------------------- the car
@@ -223,6 +469,7 @@ const Chase = (() => {
     st.color = hexRgb($('color').value);
     try { localStorage.setItem('chase.name', st.name); localStorage.setItem('chase.kind', st.kind); localStorage.setItem('chase.color', $('color').value); } catch (e) { /* private */ }
     $('go').disabled = true; $('startMsg').textContent = Net.local ? '' : 'Joining…';
+    try { Sound.start(); } catch (e) { console.warn('chase sound:', e); }       // on the click: browsers want a gesture
     try { await Net.join(st.name, st.kind, st.color, $('code').value.trim()); }
     catch (e) {
       // this PC on a viewer older than chase multiplayer: drive alone
@@ -234,23 +481,30 @@ const Chase = (() => {
     st.started = true;
     await poll();
     if (!st.run || st.run.status === 'none' || !st.run.run_id) { say('No run: start one in the viewer first.', 1e9); return; }
-    const s = storm();
-    if (!s) { say('No storm in the run yet.', 1e9); return; }
-    // ahead and to the right of the storm's motion: the inflow side, where chasers come from
-    const sp = Math.hypot(...s.v) || 1, ux = s.v[0] / sp, uy = s.v[1] / sp, a = -1.0;
-    const dx = ux * Math.cos(a) - uy * Math.sin(a), dy = ux * Math.sin(a) + uy * Math.cos(a);
-    const sx = s.x + dx * 12000, sy = s.y + dy * 12000;
+    // no storm yet: a drive anyway, from the middle of the run's map (or a spot picked on it)
+    const s = storm() || { x: 0, y: 0, v: [10, 5], what: 'the open road', none: true };
+    // where to start: ahead of the storm on its inflow side (12 km, or 4 km: close), or a spot picked on the map
+    const mode = $('spawn').value;
+    try { localStorage.setItem('chase.spawn', mode); } catch (e) { /* private */ }
+    let [sx, sy] = s.none ? [0, 0] : startNear(s, mode === 'close' ? 4000 : 12000);
+    if (mode === 'pick') {
+      const p = await openPicker('Click where you want to start · wheel: zoom · drag: pan');
+      if (Array.isArray(p)) [sx, sy] = p;
+    }
     st.car = new CarPhys.Car(st.kind, ground);
     st.car.solid = Scenery.solid;
     st.extraCars = remoteCars; st.extraMap = remoteMap;
     st.car.reset(sx, sy, 0);
     st.spawnHint = { x: sx, y: sy, yaw: Math.atan2(s.y - sy, s.x - sx), what: s.what };
-    say(`Heading for ${s.what}: loading the storm and the roads…`, 4000);
+    say(s.none ? 'No storm in the run yet: a drive anyway (the storm comes in when one forms)…' : `Heading for ${s.what}: loading the storm and the roads…`, 4000);
     await loadVolume(true);
     if (!Render.head()) { say(`No cloud volume: ${st.volErr || 'no storm fields yet'}`, 1e9); }
     st.last = performance.now();
     requestAnimationFrame(tick);
     setInterval(poll, 4000);
+    setInterval(pollTargets, TARGETS_EVERY);
+    setInterval(pollLes, LES_EVERY);
+    setInterval(pollAir, AIR_EVERY);
     // the streaming (network) on its own clock, not the frames'
     const stream = () => {
       const c = st.car;
@@ -260,12 +514,101 @@ const Chase = (() => {
     };
     stream();
     setInterval(stream, 500);
+    loadFar();
+    setInterval(loadFar, 1000);
     // the car to the others on its own clock: it keeps going while this tab is in the background
-    setInterval(() => { if (st.car) Net.tick(st.car, { name: st.name, kind: st.kind, color: st.color }); }, 40);
+    setInterval(() => {
+      if (!st.car) return;
+      const c = st.car, hg = c.p[2] - surfAt(c.p[0], c.p[1]).h;
+      Net.tick(c, { name: st.name, kind: st.kind, color: st.color, hg });
+    }, 40);
+  }
+
+  // ---------------------------------------------------------------- on foot (walker.js)
+  // F: out of the car by the driver's door (stopped or nearly), and back in when close to it
+  function toggleFoot() {
+    const c = st.car;
+    if (!c || !st.spawned) return;
+    if (!st.foot) {
+      if (c.speed > 2.5) { say('Stop the car to get out', 1500); return; }
+      const S = c.spec, a = S.cgFront, xF = a + (S.dims[0] - S.wheelbase) / 2;
+      const door = CarPhys.toWorld(c.matrix, [xF - 2.3, S.dims[1] / 2 + 0.6, 0]).map((v, i) => v + c.p[i]);
+      st.foot = new Walker.Person(door[0], door[1], ground(door[0], door[1]).h, c.yaw + Math.PI / 2);
+      st.footCtl = { dir: [0, 0], run: false, jump: false };
+      Object.assign(st.cam, { yaw: c.yaw, look: 0, pitch: 0, eye: null });
+      say('On foot: W A S D walk · Shift run · Space jump · drag or ← → to look · F back in the car', 6000);
+    } else {
+      const f = st.foot, d = Math.hypot(f.p[0] - c.p[0], f.p[1] - c.p[1]);
+      if (d > c.spec.dims[0] / 2 + 2) { say('Walk back to the car to get in', 1500); return; }
+      st.foot = null;
+      Object.assign(st.cam, { yaw: c.yaw, look: 0, pitch: 0, eye: null });
+      say('Back in the car', 1200);
+    }
+  }
+  // the keys (and a pad's left stick) on foot: where to go, relative to the camera
+  function footInput(dt) {
+    const k = st.keys, cam = st.cam;
+    let fwd = ((k.has('KeyW') || k.has('ArrowUp')) ? 1 : 0) - ((k.has('KeyS') || k.has('ArrowDown')) ? 1 : 0);
+    let side = (k.has('KeyA') ? 1 : 0) - (k.has('KeyD') ? 1 : 0);
+    cam.yaw += (((k.has('ArrowLeft')) ? 1 : 0) - (k.has('ArrowRight') ? 1 : 0)) * 1.8 * dt;
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    for (const g of pads) {
+      if (!g || !g.connected) continue;
+      const ax = g.axes[0] || 0, ay = g.axes[1] || 0;
+      if (Math.abs(ax) > 0.15) side = -ax;
+      if (Math.abs(ay) > 0.15) fwd = -ay;
+      const lx = g.axes[2] || 0;
+      if (Math.abs(lx) > 0.15) cam.yaw -= lx * 2 * dt;
+      break;
+    }
+    const yaw = cam.yaw + cam.look, l = Math.hypot(fwd, side) || 1, m = Math.min(1, Math.hypot(fwd, side));
+    const dir = [(Math.cos(yaw) * fwd - Math.sin(yaw) * side) / l * m, (Math.sin(yaw) * fwd + Math.cos(yaw) * side) / l * m];
+    const jump = k.has('Space') && !st.jumpHeld;
+    st.jumpHeld = k.has('Space');
+    st.footCtl = { dir, run: k.has('ShiftLeft') || k.has('ShiftRight'), jump };
+    st.car.control(0, 0, 0, true);                    // the car left in park: the handbrake on
+  }
+  // the wind on you: the model's at your spot, gusting between its mean and its gusts
+  function footWind(now) {
+    const W = Math.hypot(wx.u, wx.v) || 1, g = Math.max(1, wx.gust / W);
+    const t = now / 1000, k = 1 + (g - 1) * Math.max(0, Math.sin(t * 0.9) * Math.sin(t * 2.3 + 1) + 0.2 * Math.sin(t * 5.1));
+    return [wx.u * k, wx.v * k];
+  }
+  // a person against walls and trunks: the detailed map's, or chase mode's own buildings
+  function footPush(x, y, rad) {
+    if (detailed() && WorldLink.ready()) return WorldLink.pushOut(x, y, rad);
+    const z = st.foot ? st.foot.p[2] + 0.6 : 0;
+    let s = null;
+    for (const [ox, oy] of [[rad, 0], [-rad, 0], [0, rad], [0, -rad], [0, 0]]) {
+      s = Scenery.solid(x + ox, y + oy, z);
+      if (s) return [s.n[0] * (s.d + 0.02), s.n[1] * (s.d + 0.02)];
+    }
+    return null;
+  }
+  function footCamera(dt) {
+    const f = st.foot, cam = st.cam;
+    // a drag turns the camera for good once let go (on foot the view doesn't swing back behind anything)
+    if (!cam.lookHeld && cam.look) { cam.yaw += cam.look; cam.look = 0; }
+    const yaw = cam.yaw + cam.look, pitch = cam.pitch;
+    if (cam.mode !== 'chase') {
+      const eye = [f.p[0], f.p[1], f.p[2] + (f.down > 0 && !f.air ? 0.35 : 1.65)];
+      const dir = [Math.cos(yaw) * Math.cos(pitch), Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch)];
+      cam.eye = eye;
+      return { eye, target: eye.map((v, i) => v + dir[i] * 10), up: [0, 0, 1], fov: 1.2 };
+    }
+    const dist = 3.6 * cam.dist, hgt = 1.2 + 0.5 * cam.dist;
+    const tgt = [f.p[0], f.p[1], f.p[2] + 1.45];
+    let eye = [f.p[0] - Math.cos(yaw) * dist * Math.cos(pitch), f.p[1] - Math.sin(yaw) * dist * Math.cos(pitch), f.p[2] + hgt + dist * Math.sin(pitch)];
+    if (cam.eye) { const k = 1 - Math.exp(-dt * 14); eye = cam.eye.map((v, i) => v + (eye[i] - v) * k); }
+    const gz = surfAt(eye[0], eye[1]).h + 0.3;
+    if (eye[2] < gz) eye[2] = gz;
+    cam.eye = eye;
+    return { eye, target: tgt, up: [0, 0, 1], fov: 1.1 };
   }
 
   // ---------------------------------------------------------------- input
   function input(dt) {
+    if (st.foot) { footInput(dt); return; }
     const k = st.keys;
     let acc = (k.has('KeyW') || k.has('ArrowUp')) ? 1 : 0, brk = (k.has('KeyS') || k.has('ArrowDown')) ? 1 : 0;
     let steer = ((k.has('KeyA') || k.has('ArrowLeft')) ? 1 : 0) - ((k.has('KeyD') || k.has('ArrowRight')) ? 1 : 0);
@@ -300,6 +643,7 @@ const Chase = (() => {
   // ---------------------------------------------------------------- the camera
   const angd = (a, b) => Math.atan2(Math.sin(a - b), Math.cos(a - b));
   function camera(dt) {
+    if (st.foot) return footCamera(dt);
     const c = st.car, S = c.spec, M = c.matrix, cam = st.cam;
     if (!cam.lookHeld && performance.now() - cam.lookT > 1200) {
       const f = 1 - Math.exp(-dt * 3);
@@ -336,7 +680,9 @@ const Chase = (() => {
     st.last = now;
     st.fps += ((dt > 0 ? 1 / dt : 60) - st.fps) * 0.05;
     const c = st.car;
-    if (!st.spawned && Roads.state.segs && Roads.state.segs.n) {
+    // (the roads fetched round where the car was dropped, not the ones from before a jump)
+    const h0 = st.spawnHint, rc = Roads.state.centre;
+    if (!st.spawned && Roads.state.segs && Roads.state.segs.n && rc && h0 && Math.hypot(rc[0] - h0.x, rc[1] - h0.y) < 3000) {
       const h = st.spawnHint;
       if (place(h.x, h.y, h.yaw)) { st.spawned = true; say(`On the road, ${(Math.hypot(c.p[0] - h.x, c.p[1] - h.y) / 1000).toFixed(1)} km from where you were dropped. Chase ${h.what}!`, 5000); }
     }
@@ -357,6 +703,18 @@ const Chase = (() => {
     st.wet = Math.max(st.wet - dt / 600, Math.min(1, st.rain / 0.6));
     if (st.spawned) c.update(dt);
     if (!isFinite(c.p[0]) || c.p[2] < -50) resetCar();
+    // on foot: you, on the same ground, in the model's wind, against walls, trunks and the car
+    if (st.foot) {
+      st.foot.update(dt, st.footCtl, { ground, push: footPush, wind: footWind(now), car: c });
+      if (!isFinite(st.foot.p[0]) || st.foot.p[2] < -50) { st.foot = null; say('Back in the car', 1500); }
+    }
+    // the detailed map: loaded the first time it is wanted, streamed in round the car (round you, on foot), what the
+    // car runs into
+    if (detailed() && st.run && st.run.proj) {
+      WorldLink.start(Render.gl(), st.run.proj, c.p[0], c.p[1]);
+      WorldLink.update(st.foot || c, Render.terrain);
+      if (st.spawned) WorldLink.collide(c);
+    }
     if (Scenery.updateTrees(c.p[0], c.p[1], Render.terrain, TREE_BUDGET[st.vis.trees] || 0)) {
       const ss = Scenery.state;
       Render.setTrees(ss.trees, ss.treeN, ss.treeNear, ss.treeOrigin);
@@ -364,9 +722,15 @@ const Chase = (() => {
     if (st.box) Land.want(st.box, st.vis.base, { x: c.p[0] / 1000, y: c.p[1] / 1000 }, (x, y) => Render.terrain(x * 1000, y * 1000) / 1000);
     const view = camera(dt);
     const q = st.vis;
+    weather(dt, view);
+    if (st.fake && st.fake.rain !== undefined) st.wet = Math.max(st.wet, Math.min(1, st.fake.rain * 1.5));
+    sound(dt);
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
+    if (st.foot && !(st.cam.mode !== 'chase')) cars.push({ parts: st.foot.figure(st.color) });   // (first person: not yourself)
     if (st.extraCars) cars.push(...st.extraCars());
-    const fr = Render.frame({ ...view, sun: sunDir(), scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, funnel: q.funnel, tornadoes: funnelList(), quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64 }, cars);
+    const sun = sunDir();
+    const world = detailed() && WorldLink.ready() ? WorldLink.drawer(view, sun) : null;
+    const fr = Render.frame({ ...view, sun, world, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, les: lesView(), lesTubes: st.lesTubes, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view) }, cars);
     hud(fr, view);
     requestAnimationFrame(tick);
   }
@@ -384,8 +748,9 @@ const Chase = (() => {
     g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
     const c = st.car, now = performance.now();
     if (st.cam.mode === 'driver') dash(g, W, H);
-    // the tornadoes on the screen
-    const tors = tornadoes();
+    // the tornadoes on the screen (and on the minimap, and the nearest's distance in the HUD): only with Settings ->
+    // Tornado markers on; off, you find them as a chaser does, by the radar, the warnings and your own eyes
+    const marks = st.vis.markers === 'on', tors = marks ? tornadoes() : [];
     if (fr) for (const t of tors) {
       const s = Render.project(fr.VP, fr.G, [t.x, t.y, Render.terrain(t.x, t.y) + 250]);
       const d = Math.hypot(t.x - c.p[0], t.y - c.p[1]);
@@ -435,7 +800,15 @@ const Chase = (() => {
     let near = null;
     for (const t of tors) { const d = Math.hypot(t.x - c.p[0], t.y - c.p[1]); if (!near || d < near.d) near = { ...t, d }; }
     if (near) lines.push(`Tornado ${near.id}${near.wind ? ` · ${Math.round(near.wind * 2.23694)} mph` : ''}${near.ef !== null && near.ef !== undefined ? ` (EF${near.ef})` : ''} · ${(near.d / 1000).toFixed(1)} km ${bearing(near.x - c.p[0], near.y - c.p[1])}`);
-    else { const s = storm(); if (s) lines.push(`No tornado on the ground · ${s.what} ${(Math.hypot(s.x - c.p[0], s.y - c.p[1]) / 1000).toFixed(1)} km ${bearing(s.x - c.p[0], s.y - c.p[1])}`); }
+    else if (marks) { const s = storm(); if (s) lines.push(`No tornado on the ground · ${s.what} ${(Math.hypot(s.x - c.p[0], s.y - c.p[1]) / 1000).toFixed(1)} km ${bearing(s.x - c.p[0], s.y - c.p[1])}`); }
+    {
+      const W = Math.hypot(wx.u, wx.v), mph = st.units === 'mph', ws = x => Math.round(x * (mph ? 2.23694 : 3.6));
+      const from = W > 0.5 ? COMPASS[Math.round(((Math.atan2(-wx.u, -wx.v) * 180 / Math.PI + 360) % 360) / 22.5) % 16] + ' ' : '';
+      const T = wx.t === null ? '' : ` · ${mph ? Math.round(wx.t * 9 / 5 + 32) + ' °F' : wx.t.toFixed(1) + ' °C'}`;
+      const pr = wx.rainI < 0.05 ? '' : ` · ${wx.snow > 0.7 ? 'snow' : wx.snow > 0.3 ? 'sleet' : 'rain'} ${wx.rainI < 0.35 ? 'light' : wx.rainI < 0.7 ? 'moderate' : 'heavy'}`;
+      if (air.now || st.fake) lines.push(`Wind ${from}${ws(W)}${wx.gust > W + 2 ? ` gusting ${ws(wx.gust)}` : ''} ${mph ? 'mph' : 'km/h'}${T}${pr}${st.fake ? ' (test values)' : ''}`);
+      else if (air.err && !/no run/.test(air.err)) lines.push(`Wind at the car: ${/^404$|^unknown/.test(air.err) ? 'restart the viewer (new in this version)' : air.err}`);
+    }
     const wr = activeWarnings(c.p[0] / 1000, c.p[1] / 1000);
     if (wr.length) lines.push(`You are in a ${wr.map(w => w.kind === 'TOR' ? 'TORNADO WARNING' : w.kind === 'SVR' ? 'severe thunderstorm warning' : w.kind).join(' and a ')}`);
     const ns = Net.st;
@@ -445,14 +818,20 @@ const Chase = (() => {
     if (ns.err) lines.push(`Multiplayer: ${ns.err}`);
     const osmBusy = (Roads.state.pending && Roads.state.osmBusy) || (Scenery.state.bPending && Scenery.state.bOsmBusy);
     if (osmBusy) lines.push(`OpenStreetMap (Overpass) is busy: ${Roads.state.pending + Scenery.state.bPending} area${Roads.state.pending + Scenery.state.bPending > 1 ? 's' : ''} of roads / buildings fill in when it answers`);
-    else if (Scenery.state.bPending) lines.push(`Fetching buildings from OpenStreetMap (${Scenery.state.bPending} area${Scenery.state.bPending > 1 ? 's' : ''} to go)…`);
+    else if (Scenery.state.bPending) lines.push(`Fetching buildings from FEMA USA Structures (${Scenery.state.bPending} area${Scenery.state.bPending > 1 ? 's' : ''} to go)…`);
     if (Scenery.state.bErr) lines.push(`Buildings: ${Scenery.state.bErr}`);
     if (Roads.state.pending && !osmBusy) lines.push(`Fetching roads from OpenStreetMap (${Roads.state.pending} area${Roads.state.pending > 1 ? 's' : ''} to go)…`);
     if (st.volErr) lines.push(`Storm volume: ${st.volErr}`);
     g.fillStyle = 'rgba(8,12,18,.5)'; roundRect(g, 14, 14, Math.max(...lines.map(l => g.measureText(l).width), 10) + 24, 12 + lines.length * 20, 8); g.fill();
     lines.forEach((l, i) => { g.fillStyle = l.includes('TORNADO WARNING') ? '#ff6b6b' : '#e6edf3'; g.fillText(l, 26, 34 + i * 20); });
     g.textAlign = 'right'; g.font = '11px Segoe UI'; g.fillStyle = 'rgba(220,230,240,.7)';
-    g.fillText(`${Math.round(st.fps)} fps · ${st.cam.mode} camera (C) · H: help`, W - 16, 22);
+    // with the GPU the browser draws with (a laptop's browser is often on its integrated one) and at what size
+    if (st.gpu === undefined) {
+      const gl = Render.gl(), ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+      st.gpu = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)).replace(/^ANGLE \(|\)$/g, '').replace(/ Direct3D.*$/, '').replace(/^[^,]*, /, '').replace(/ \(0x[0-9a-f]+\)/i, '') : '';
+    }
+    const glc = Render.gl() && Render.gl().canvas;
+    g.fillText(`${Math.round(st.fps)} fps · ${st.gpu ? st.gpu + ' · ' : ''}${glc ? `${glc.width}×${glc.height} · ` : ''}${st.cam.mode} camera (C) · H: help`, W - 16, 22);
     if (st.msg && now < st.msgT) {
       g.font = '600 16px Segoe UI'; g.textAlign = 'center';
       const w = g.measureText(st.msg).width + 30;
@@ -476,25 +855,128 @@ const Chase = (() => {
     return out.sort((a, b) => (a.kind === 'TOR' ? -1 : 1));
   }
 
+  // ---------------------------------------------------------------- the minimap (a map you can zoom and drag)
+  // st.mapKm: the side shown (any, by the wheel; M steps through MAP_STEPS); st.mmPan: the centre (world m) when
+  // dragged away from the car, null while it follows the car.  The roads (the drivable ones, roads.js) and, close
+  // in, the buildings are drawn over the map picture like a road map: cased lines, sized by class and zoom.
+  const MAP_STEPS = [6, 20, 60, 150], MAP_MIN = 0.6, MAP_MAX = 300;
+  // road classes (roads.js k: 0 motorway, 1 trunk, 2 primary, 3 secondary, 4 tertiary, 5 residential, 6 service,
+  // 7 track): real width m, fill (dark map, light map), casing, the zoom (side km) above which it is left out
+  const ROAD_STYLE = [
+    { w: 24, dark: '#f0a52e', light: '#f6b74a', case: '#5a3a08', lcase: '#c48a22', max: 1e9 },
+    { w: 20, dark: '#f3c04c', light: '#fbd06a', case: '#5c4410', lcase: '#c9a23c', max: 1e9 },
+    { w: 15, dark: '#f6dc7a', light: '#fde89a', case: '#5f5326', lcase: '#c9b25a', max: 160 },
+    { w: 12, dark: '#ffffff', light: '#ffffff', case: '#3d434b', lcase: '#a8adb4', max: 70 },
+    { w: 10, dark: '#e8eaed', light: '#ffffff', case: '#3a4048', lcase: '#b4b9bf', max: 80 },
+    { w: 8, dark: '#d3d7dc', light: '#ffffff', case: '#353a42', lcase: '#c2c6cb', max: 30 },
+    // "minor": every residential, unclassified and service road (OpenFreeMap), most of the local network
+    { w: 7, dark: '#c9ced4', light: '#ffffff', case: '#30353c', lcase: '#c2c6cb', max: 30 },
+    { w: 4, dark: '#b39b74', light: '#d8c7a5', case: '#3a3226', lcase: '#a8977a', max: 10 },
+  ];
+  const mmCache = { roads: null, rPaths: null, rOrg: null, bGen: -1, bPath: null, bOrg: null };
+  function roadPaths() {
+    const polys = Roads.state.polys;
+    if (polys !== mmCache.roads) {
+      mmCache.roads = polys;
+      const org = polys && polys.length && polys[0].pts.length ? [Math.round(polys[0].pts[0][0]), Math.round(polys[0].pts[0][1])] : [0, 0];
+      const paths = ROAD_STYLE.map(() => ({ paved: new Path2D(), dirt: new Path2D(), n: 0 }));
+      for (const { k, pv, pts } of polys || []) {
+        const p = paths[Math.max(0, Math.min(7, k | 0))], path = pv ? p.paved : p.dirt;
+        pts.forEach((q, i) => (i ? path.lineTo(q[0] - org[0], q[1] - org[1]) : path.moveTo(q[0] - org[0], q[1] - org[1])));
+        p.n++;
+      }
+      mmCache.rPaths = paths; mmCache.rOrg = org;
+    }
+    return mmCache;
+  }
+  function buildingPath() {
+    const s = Scenery.state;
+    if (s.bGen !== mmCache.bGen) {
+      mmCache.bGen = s.bGen; mmCache.bOrg = s.bOrigin.slice();
+      const p = new Path2D();
+      for (const b of s.polys || []) {
+        const P = b.P;
+        p.moveTo(P[0], P[1]);
+        for (let i = 2; i < P.length; i += 2) p.lineTo(P[i], P[i + 1]);
+        p.closePath();
+      }
+      mmCache.bPath = p;
+    }
+    return mmCache;
+  }
+  function mapCentre() { const c = st.car; return st.mmPan || [c.p[0], c.p[1]]; }
+  function mapButtons() {
+    const r = st.mmRect;
+    if (!r) return [];
+    const b = 26, x = r.x0 + r.S - b - 8;
+    return [{ id: 'in', x, y: r.y0 + r.S - 3 * b - 18, b, label: '+' }, { id: 'out', x, y: r.y0 + r.S - 2 * b - 14, b, label: '−' },
+            { id: 'car', x, y: r.y0 + r.S - b - 8, b, label: '⌖' }];
+  }
+  function zoomMap(f, mx, my) {
+    const r = st.mmRect, km = Math.max(MAP_MIN, Math.min(MAP_MAX, st.mapKm * f));
+    if (r && st.mmPan && mx !== undefined) {
+      // the point under the pointer stays where it is
+      const [cx, cy] = mapCentre(), sc0 = r.S / (st.mapKm * 1000), sc1 = r.S / (km * 1000);
+      const ox = mx - (r.x0 + r.S / 2), oy = my - (r.y0 + r.S / 2);
+      st.mmPan = [cx + ox / sc0 - ox / sc1, cy - oy / sc0 + oy / sc1];
+    }
+    st.mapKm = km;
+  }
+  const inMap = (x, y) => { const r = st.mmRect; return r && x >= r.x0 && x <= r.x0 + r.S && y >= r.y0 && y <= r.y0 + r.S; };
+  const mapBtnAt = (x, y) => mapButtons().find(b => x >= b.x && x <= b.x + b.b && y >= b.y && y <= b.y + b.b);
+  function mapClick(id) {
+    if (id === 'in') zoomMap(1 / 1.6);
+    else if (id === 'out') zoomMap(1.6);
+    else if (id === 'car') st.mmPan = null;
+  }
+  const fmtKm = k => (k < 1 ? `${Math.round(k * 1000)} m` : k < 10 ? `${k.toFixed(1).replace(/\.0$/, '')} km` : `${Math.round(k)} km`);
+
   function minimap(g, W, H, tors) {
     const v = st.vis, big = v.mmBig === 'big';
     const S = big ? Math.min(H - 140, W * 0.5) : Math.min(260, W * 0.3), x0 = W - S - 16, y0 = H - S - 16, c = st.car;
-    const R = st.mapKm * 1000 / 2, sc = S / (2 * R), cx = c.p[0], cy = c.p[1];
+    st.mmRect = { x0, y0, S };
+    const [cx, cy] = mapCentre();
+    const R = st.mapKm * 1000 / 2, sc = S / (2 * R);
     const P = (x, y) => [x0 + S / 2 + (x - cx) * sc, y0 + S / 2 - (y - cy) * sc];
     g.save();
     g.fillStyle = 'rgba(14,20,16,.85)'; roundRect(g, x0, y0, S, S, 10); g.fill(); g.clip();
     // the real map and the radar under everything (minimap.js)
     MiniMap.draw(g, x0, y0, S, cx / 1000, cy / 1000, st.mapKm / 2,
                  { base: v.mmBase, product: v.mmProduct, site: v.mmSite, opacity: v.mmOpacity, dim: v.mmDim });
-    // the roads (drawn ourselves when there is no map under them; else only the ones the car can be on, faintly)
-    g.lineCap = 'round';
-    for (const { k, pv, pts } of v.mmBase === 'none' ? Roads.state.polys || [] : []) {
-      if (st.mapKm > 12 && k > 4) continue;
-      g.strokeStyle = !pv ? 'rgba(170,150,120,.7)' : k <= 1 ? 'rgba(255,210,120,.95)' : k <= 3 ? 'rgba(240,240,240,.9)' : 'rgba(170,175,180,.75)';
-      g.lineWidth = k <= 1 ? 2.4 : k <= 3 ? 1.8 : 1;
-      g.beginPath();
-      pts.forEach((p, i) => { const s = P(p[0], p[1]); if (i) g.lineTo(s[0], s[1]); else g.moveTo(s[0], s[1]); });
-      g.stroke();
+    const dark = v.mmBase === 'osmdark' || v.mmBase === 'none' || v.mmBase.startsWith('sat');
+    // the buildings, close in
+    if (st.mapKm <= 3 && Scenery.state.polys && Scenery.state.polys.length) {
+      const m = buildingPath();
+      g.save();
+      g.translate(...P(m.bOrg[0], m.bOrg[1])); g.scale(sc, -sc);
+      g.globalAlpha = Math.min(1, (3 - st.mapKm) / 1.2) * 0.9;
+      g.fillStyle = dark ? '#5d636b' : '#d6d1c6'; g.fill(m.bPath);
+      g.lineWidth = 1 / sc; g.strokeStyle = dark ? '#7a8088' : '#bdb6a8'; g.stroke(m.bPath);
+      g.restore();
+    }
+    // the roads: casings first, then the fills, the small roads under the big
+    if (Roads.state.polys && Roads.state.polys.length) {
+      const m = roadPaths();
+      g.save();
+      g.translate(...P(m.rOrg[0], m.rOrg[1])); g.scale(sc, -sc);
+      g.lineCap = 'round'; g.lineJoin = 'round';
+      const width = k => Math.max(k <= 1 ? 2.6 : k <= 3 ? 2 : 1.3, Math.min(22, ROAD_STYLE[k].w * sc)) / sc;
+      for (const pass of ['case', 'fill']) {
+        for (let k = 7; k >= 0; k--) {
+          const s = ROAD_STYLE[k], p = m.rPaths[k];
+          if (!p.n || st.mapKm > s.max) continue;
+          const w = width(k);
+          if (pass === 'case') {
+            g.strokeStyle = dark ? s.case : s.lcase; g.lineWidth = w + 1.6 / sc;
+            g.setLineDash([]); g.stroke(p.paved); g.stroke(p.dirt);
+          } else {
+            g.strokeStyle = dark ? s.dark : s.light; g.lineWidth = w;
+            g.setLineDash([]); g.stroke(p.paved);
+            g.strokeStyle = dark ? '#b39b74' : '#d8c7a5'; g.setLineDash([4 / sc, 3 / sc]); g.stroke(p.dirt); g.setLineDash([]);
+          }
+        }
+      }
+      g.restore();
     }
     // the warnings
     for (const w of (st.run && st.run.warnings) || []) {
@@ -515,17 +997,187 @@ const Chase = (() => {
       g.strokeStyle = '#fff'; g.lineWidth = 1.5; g.stroke();
     }
     if (st.extraMap) st.extraMap(g, P);
-    // the car
-    const s = P(cx, cy), yaw = c.yaw;
-    g.translate(s[0], s[1]); g.rotate(-yaw);
+    // the car (at the edge, pointing, when the map is dragged away from it)
+    let s = P(c.p[0], c.p[1]);
+    const away = s[0] < x0 || s[0] > x0 + S || s[1] < y0 || s[1] > y0 + S;
+    s = [Math.max(x0 + 10, Math.min(x0 + S - 10, s[0])), Math.max(y0 + 10, Math.min(y0 + S - 10, s[1]))];
+    g.save();
+    g.translate(s[0], s[1]); g.rotate(-c.yaw);
+    g.globalAlpha = away ? 0.6 : 1;
     g.fillStyle = '#4fc3ff'; g.strokeStyle = '#fff'; g.lineWidth = 1.5;
     g.beginPath(); g.moveTo(9, 0); g.lineTo(-6, 6); g.lineTo(-3, 0); g.lineTo(-6, -6); g.closePath(); g.fill(); g.stroke();
     g.restore();
+    // the zoom and back-to-the-car buttons
+    for (const b of mapButtons()) {
+      const hot = b.id === 'car' && st.mmPan;
+      g.fillStyle = hot ? 'rgba(79,195,255,.9)' : 'rgba(8,12,18,.72)'; roundRect(g, b.x, b.y, b.b, b.b, 6); g.fill();
+      g.strokeStyle = 'rgba(255,255,255,.25)'; g.lineWidth = 1; g.stroke();
+      g.fillStyle = hot ? '#04121c' : '#e8eef4'; g.font = '600 17px Segoe UI'; g.textAlign = 'center';
+      g.fillText(b.label, b.x + b.b / 2, b.y + b.b / 2 + 6);
+    }
+    // a scale bar
+    const nice = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000];
+    const len = nice.reduce((a, m) => (m * sc <= S * 0.3 ? m : a), nice[0]);
+    g.strokeStyle = 'rgba(240,244,248,.9)'; g.lineWidth = 2;
+    g.beginPath(); g.moveTo(x0 + 10, y0 + S - 12); g.lineTo(x0 + 10 + len * sc, y0 + S - 12); g.stroke();
+    g.font = '10px Segoe UI'; g.textAlign = 'left'; g.fillStyle = 'rgba(240,244,248,.95)';
+    g.fillText(len >= 1000 ? `${len / 1000} km` : `${len} m`, x0 + 12, y0 + S - 17);
+    g.restore();
     g.font = '11px Segoe UI'; g.fillStyle = 'rgba(220,230,240,.8)'; g.textAlign = 'left';
-    const lab = `N ↑  ${st.mapKm} km (M)  ${MiniMap.label(v.mmProduct)}${v.mmProduct !== 'none' ? ' (K)' : ''}`;
-    g.fillStyle = 'rgba(8,12,18,.6)'; roundRect(g, x0 + 4, y0 + 4, g.measureText(lab).width + 10, 17, 5); g.fill();
+    const lab = `N ↑  ${fmtKm(st.mapKm)} (M)  ${MiniMap.label(v.mmProduct)}${v.mmProduct !== 'none' ? ' (K)' : ''}${st.mmPan ? '  · dragged: ⌖ or double-click to follow' : ''}`;
+    g.fillStyle = 'rgba(8,12,18,.6)'; roundRect(g, x0 + 4, y0 + 4, Math.min(S - 8, g.measureText(lab).width + 10), 17, 5); g.fill();
     g.fillStyle = 'rgba(230,236,242,.95)';
+    g.save(); g.beginPath(); g.rect(x0 + 4, y0, S - 8, 30); g.clip();
     g.fillText(lab, x0 + 9, y0 + 16);
+    g.restore();
+  }
+
+  // ---------------------------------------------------------------- the big map: where to start, where to go
+  // A full-screen map (the minimap's picture and radar, minimap.js slot 'pick') with the warnings, the storm cells,
+  // the tornadoes, the other chasers and the suggested start; a click (not a drag) picks the spot (world m), and the
+  // car goes onto the nearest road there.  Resolves [x, y], 'auto' (ahead of the storm) or null (cancelled).
+  const pick = { open: false, cx: 0, cy: 0, km: 90, drag: null, hover: null, done: null, raf: 0 };
+  // a spot `dist` m ahead of the storm and to the right of its motion: the inflow side, where chasers come from
+  function startNear(s, dist) {
+    const sp = Math.hypot(...s.v) || 1, ux = s.v[0] / sp, uy = s.v[1] / sp, a = -1.0;
+    const dx = ux * Math.cos(a) - uy * Math.sin(a), dy = ux * Math.sin(a) + uy * Math.cos(a);
+    return [s.x + dx * dist, s.y + dy * dist];
+  }
+  function openPicker(msg) {
+    const c = st.car, s = storm(), driving = c && st.spawned;
+    const at = driving ? [c.p[0], c.p[1]] : s ? [s.x, s.y] : [0, 0];
+    Object.assign(pick, { open: true, cx: at[0], cy: at[1], km: driving ? 40 : 90, drag: null, hover: null });
+    $('pickMsg').textContent = msg;
+    $('picker').classList.remove('hidden');
+    return new Promise(res => { pick.done = res; drawPicker(); });
+  }
+  function closePicker(v) {
+    if (!pick.open) return;
+    pick.open = false; $('picker').classList.add('hidden');
+    cancelAnimationFrame(pick.raf);
+    const d = pick.done; pick.done = null;
+    if (d) d(v);
+  }
+  function pickGeom() {
+    const cv = $('pickCv'), W = cv.clientWidth, H = cv.clientHeight, S = Math.max(W, H);
+    return { W, H, S, x0: (W - S) / 2, y0: (H - S) / 2, sc: S / (pick.km * 1000) };
+  }
+  const pickToWorld = (mx, my) => { const G = pickGeom(); return [pick.cx + (mx - G.W / 2) / G.sc, pick.cy - (my - G.H / 2) / G.sc]; };
+  function drawPicker() {
+    if (!pick.open) return;
+    pick.raf = requestAnimationFrame(drawPicker);
+    const cv = $('pickCv'), dpr = Math.min(window.devicePixelRatio || 1, 2), G = pickGeom();
+    if (cv.width !== Math.round(G.W * dpr) || cv.height !== Math.round(G.H * dpr)) { cv.width = Math.round(G.W * dpr); cv.height = Math.round(G.H * dpr); }
+    const g = cv.getContext('2d'), v = st.vis;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.fillStyle = '#0e1410'; g.fillRect(0, 0, G.W, G.H);
+    MiniMap.draw(g, G.x0, G.y0, G.S, pick.cx / 1000, pick.cy / 1000, pick.km / 2,
+                 { base: v.mmBase === 'none' ? 'osmdark' : v.mmBase, product: v.mmProduct, site: v.mmSite, opacity: v.mmOpacity, dim: v.mmDim, slot: 'pick' });
+    const P = (x, y) => [G.W / 2 + (x - pick.cx) * G.sc, G.H / 2 - (y - pick.cy) * G.sc];
+    const label = (t, x, y, col) => {
+      g.font = '600 12px Segoe UI'; g.textAlign = 'left';
+      const w = g.measureText(t).width + 10;
+      g.fillStyle = 'rgba(8,12,18,.7)'; roundRect(g, x, y - 13, w, 18, 5); g.fill();
+      g.fillStyle = col; g.fillText(t, x + 5, y);
+    };
+    for (const w of (st.run && st.run.warnings) || []) {
+      if (!w.active || !w.poly) continue;
+      g.strokeStyle = w.kind === 'TOR' ? '#ff3030' : w.kind === 'SVR' ? '#ffd23a' : '#7fd0ff'; g.lineWidth = 2;
+      g.beginPath(); w.poly.forEach((p, i) => { const s = P(p[0] * 1000, p[1] * 1000); if (i) g.lineTo(s[0], s[1]); else g.moveTo(s[0], s[1]); }); g.closePath(); g.stroke();
+    }
+    // the storm cells: a ring, their motion, their name
+    for (const cl of ((st.run && st.run.tracks) || []).filter(c => c.ended === null || c.ended === undefined)) {
+      const s = P(cl.x, cl.y), sp = Math.hypot(cl.vx || 0, cl.vy || 0);
+      g.strokeStyle = 'rgba(255,255,255,.9)'; g.lineWidth = 2; g.beginPath(); g.arc(s[0], s[1], 8, 0, 7); g.stroke();
+      if (sp > 0.5) {
+        const ex = s[0] + cl.vx / sp * 26, ey = s[1] - cl.vy / sp * 26;
+        g.beginPath(); g.moveTo(s[0], s[1]); g.lineTo(ex, ey); g.stroke();
+      }
+      label(`storm ${cl.id}`, s[0] + 11, s[1] - 6, '#e6edf3');
+    }
+    for (const t of tornadoes()) {
+      const s = P(t.x, t.y);
+      g.fillStyle = '#ff3b3b'; g.strokeStyle = '#fff'; g.lineWidth = 1.5; g.beginPath(); g.arc(s[0], s[1], 7, 0, 7); g.fill(); g.stroke();
+      label(`tornado ${t.id}${t.ef !== null && t.ef !== undefined ? ' EF' + t.ef : ''}`, s[0] + 10, s[1] + 4, '#ffd0d0');
+    }
+    // the suggested starts
+    const s = storm();
+    if (s) for (const [d, nm] of [[12000, 'ahead of the storm'], [4000, 'close']]) {
+      const q = P(...startNear(s, d));
+      g.fillStyle = '#5ee08a'; g.strokeStyle = '#06210f'; g.lineWidth = 1.5; g.beginPath(); g.arc(q[0], q[1], 5, 0, 7); g.fill(); g.stroke();
+      label(nm, q[0] + 8, q[1] + 4, '#b8f5cc');
+    }
+    remoteMap(g, P);
+    if (st.car && st.spawned) {
+      const q = P(st.car.p[0], st.car.p[1]);
+      g.save(); g.translate(q[0], q[1]); g.rotate(-st.car.yaw);
+      g.fillStyle = '#4fc3ff'; g.strokeStyle = '#fff'; g.lineWidth = 1.5;
+      g.beginPath(); g.moveTo(10, 0); g.lineTo(-7, 7); g.lineTo(-3, 0); g.lineTo(-7, -7); g.closePath(); g.fill(); g.stroke();
+      g.restore();
+      label('you', q[0] + 12, q[1] + 4, '#bfe9ff');
+    }
+    // under the pointer: where that is from the storm
+    if (pick.hover && !pick.drag) {
+      const [mx, my] = pick.hover, [wx, wy] = pickToWorld(mx, my);
+      g.strokeStyle = 'rgba(255,255,255,.8)'; g.lineWidth = 1;
+      g.beginPath(); g.moveTo(mx - 12, my); g.lineTo(mx + 12, my); g.moveTo(mx, my - 12); g.lineTo(mx, my + 12); g.stroke();
+      if (s) {
+        const d = Math.hypot(wx - s.x, wy - s.y);
+        label(`${(d / 1000).toFixed(1)} km ${bearing(wx - s.x, wy - s.y)} of ${s.what} · click to go here`, mx + 14, my + 22, '#fff');
+      }
+    }
+    const nice = [100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000];
+    const len = nice.reduce((a, m) => (m * G.sc <= 160 ? m : a), nice[0]);
+    g.strokeStyle = '#fff'; g.lineWidth = 2; g.beginPath(); g.moveTo(20, G.H - 24); g.lineTo(20 + len * G.sc, G.H - 24); g.stroke();
+    label(len >= 1000 ? `${len / 1000} km` : `${len} m`, 20, G.H - 32, '#fff');
+  }
+  function bindPicker() {
+    const cv = $('pickCv');
+    const at = e => { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+    cv.addEventListener('mousedown', e => { pick.drag = { x: e.clientX, y: e.clientY, cx: pick.cx, cy: pick.cy, moved: false }; });
+    window.addEventListener('mousemove', e => {
+      if (!pick.open) return;
+      if (pick.drag) {
+        const dx = e.clientX - pick.drag.x, dy = e.clientY - pick.drag.y, sc = pickGeom().sc;
+        if (Math.abs(dx) + Math.abs(dy) > 4) pick.drag.moved = true;
+        if (pick.drag.moved) { pick.cx = pick.drag.cx - dx / sc; pick.cy = pick.drag.cy + dy / sc; }
+      }
+      pick.hover = e.target === cv ? at(e) : null;
+    });
+    window.addEventListener('mouseup', e => {
+      if (!pick.open || !pick.drag) return;
+      const d = pick.drag; pick.drag = null;
+      if (!d.moved && e.target === cv) closePicker(pickToWorld(...at(e)));
+    });
+    cv.addEventListener('wheel', e => {
+      e.preventDefault();
+      const [mx, my] = at(e), [wx, wy] = pickToWorld(mx, my);
+      pick.km = Math.max(2, Math.min(400, pick.km * Math.pow(1.0015, e.deltaY)));
+      const G = pickGeom();                             // the point under the pointer stays put
+      pick.cx = wx - (mx - G.W / 2) / G.sc; pick.cy = wy + (my - G.H / 2) / G.sc;
+    }, { passive: false });
+    $('pickAuto').onclick = () => closePicker('auto');
+    $('pickCancel').onclick = () => closePicker(null);
+  }
+  // the car to (x, y) world m, facing the storm: it waits there until the roads around have come in, then goes
+  // onto the nearest one (like the start)
+  function teleport(x, y) {
+    const c = st.car;
+    if (!c) return;
+    const s = storm(), yaw = s ? Math.atan2(s.y - y, s.x - x) : c.yaw;
+    c.reset(x, y, yaw);
+    WorldLink.moved();
+    st.cam.yaw = yaw; st.cam.eye = null;
+    Object.assign(st, { spawned: false, dropT: 0, offroadStart: null, mmPan: null,
+                        spawnHint: { x, y, yaw, what: s ? s.what : 'the storm' } });
+    say('Going there: loading the roads…', 4000);
+  }
+  async function goSomewhere() {
+    if (!st.car || pick.open) return;
+    const p = await openPicker('Click where you want to go · wheel: zoom · drag: pan · Esc: cancel');
+    const s = storm();
+    if (p === 'auto' && s) teleport(...startNear(s, 12000));
+    else if (Array.isArray(p)) teleport(p[0], p[1]);
   }
 
   function dash(g, W, H) {
@@ -549,12 +1201,16 @@ const Chase = (() => {
     st.lastOthers = list;
     return list.map(o => {
       const kind = CarPhys.SPECS[o.kind] ? o.kind : 'suv', M = CarPhys.qmat(o.q), up = M[2], m = wheelMounts(kind);
+      // set on our own ground at the height they are above theirs (older pages send no hg: as sent)
+      const z = Number.isFinite(o.hg) ? surfAt(o.p[0], o.p[1]).h + o.hg : o.p[2];
+      const p = [o.p[0], o.p[1], z];
+      o.p = p;                                          // the name tag over it (st.lastOthers) goes by this too
       const wheels = m.map((mt, i) => {
         const w = CarPhys.toWorld(M, mt);
-        return { c: [o.p[0] + w[0] - up[0] * o.L[i], o.p[1] + w[1] - up[1] * o.L[i], o.p[2] + w[2] - up[2] * o.L[i]],
+        return { c: [p[0] + w[0] - up[0] * o.L[i], p[1] + w[1] - up[1] * o.L[i], p[2] + w[2] - up[2] * o.L[i]],
                  steer: i < 2 ? o.st[i] : 0, spin: o.sp[i], left: i % 2 === 0 };
       });
-      return { kind, color: o.color, p: o.p, M, wheels, hidden: false };
+      return { kind, color: o.color, p, M, wheels, hidden: false };
     });
   }
   function remoteMap(g, P) {
@@ -625,7 +1281,7 @@ const Chase = (() => {
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
     if (st.extraCars) cars.push(...st.extraCars());
     Render.frame({ ...view, sun: sunDir(), scale: 1, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief,
-                   haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, funnel: q.funnel, tornadoes: funnelList(), quality: 1, blend: 0, seed: 0 }, cars);
+                   haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, les: lesView(), lesTubes: st.lesTubes, quality: 1, blend: 0, seed: 0 }, cars);
     Object.assign(q, keep);
     const v = $('view'), out = document.createElement('canvas');
     out.width = v.width; out.height = v.height;
@@ -650,6 +1306,8 @@ const Chase = (() => {
   // ---------------------------------------------------------------- the page
   function init() {
     st.mapKm = 6;
+    CarMesh.load();                  // the cars' models (web/models/cars): until they come in, the cars made from code
+    Walker.setSay(m => say(m, 2500));
     try {
       $('name').value = localStorage.getItem('chase.name') || 'Chaser';
       $('vehicle').value = localStorage.getItem('chase.kind') || 'suv';
@@ -665,6 +1323,9 @@ const Chase = (() => {
       // the keyboard (a dropdown, a slider, a button) lets go of it instead of eating W A S D and the arrows
       const t = e.target, tag = t && t.tagName;
       if (!st.started || (tag === 'INPUT' && ['text', 'number', 'search', 'password'].includes(t.type)) || tag === 'TEXTAREA') return;
+      if (pick.open) { if (e.code === 'Escape') closePicker(null); return; }       // the big map has the keys
+      if (e.code === 'KeyG' && !e.repeat) { goSomewhere(); return; }
+      if (e.code === 'KeyF' && !e.repeat) { toggleFoot(); return; }
       if (tag === 'SELECT' || tag === 'INPUT' || tag === 'BUTTON') { t.blur(); e.preventDefault(); }
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
       if (e.repeat) return;
@@ -676,8 +1337,10 @@ const Chase = (() => {
       if (e.code === 'KeyT' && st.car) { st.car.tc = !st.car.tc; say(`Traction control ${st.car.tc ? 'on' : 'off'}`, 1200); }
       if (e.code === 'KeyB' && st.car) { st.car.abs = !st.car.abs; say(`ABS ${st.car.abs ? 'on' : 'off'}`, 1200); }
       if (e.code === 'KeyP') photo(e.shiftKey);
+      if (e.code === 'KeyN') { let on = true; if (!Sound.ctx()) Sound.start(); else on = Sound.toggle(); say(`Sound ${on ? 'on' : 'off'}`, 1200); }
+      if (e.code === 'KeyV') { st.lesTubes = !st.lesTubes; say(les.head ? `Vortex tubes ${st.lesTubes ? 'shown' : 'hidden'}` : 'Vortex tubes: no tornado model running', 1500); }
       if (e.code === 'KeyM' && e.shiftKey) { st.vis.mmBig = st.vis.mmBig === 'big' ? 'small' : 'big'; showVis(); }
-      else if (e.code === 'KeyM') st.mapKm = st.mapKm === 6 ? 20 : st.mapKm === 20 ? 60 : st.mapKm === 60 ? 150 : 6;
+      else if (e.code === 'KeyM') st.mapKm = MAP_STEPS.find(k => k > st.mapKm + 0.01) || MAP_STEPS[0];
       if (e.code === 'KeyK') {
         const i = QUICK.indexOf(st.vis.mmProduct);
         st.vis.mmProduct = QUICK[(i + 1) % QUICK.length]; showVis();
@@ -691,15 +1354,53 @@ const Chase = (() => {
     $('hud').addEventListener('mousedown', () => { if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur(); });
     window.addEventListener('blur', () => st.keys.clear());
     const hudEl = $('hud');
-    let drag = null;
-    hudEl.addEventListener('mousedown', e => { drag = { x: e.clientX, y: e.clientY, look: st.cam.look, pitch: st.cam.pitch }; st.cam.lookHeld = true; });
+    let drag = null, mapDrag = null;
+    const local = e => { const r = hudEl.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+    hudEl.addEventListener('mousedown', e => {
+      const [x, y] = local(e);
+      if (st.car && inMap(x, y)) {                    // the minimap: its buttons, or a drag of the map
+        const b = mapBtnAt(x, y);
+        if (b) mapClick(b.id);
+        else mapDrag = { x: e.clientX, y: e.clientY, c: mapCentre().slice(), moved: false };
+        e.preventDefault();
+        return;
+      }
+      drag = { x: e.clientX, y: e.clientY, look: st.cam.look, pitch: st.cam.pitch }; st.cam.lookHeld = true;
+    });
+    hudEl.addEventListener('dblclick', e => { const [x, y] = local(e); if (inMap(x, y) && !mapBtnAt(x, y)) st.mmPan = null; });
+    // right-click on the minimap: go there
+    hudEl.addEventListener('contextmenu', e => {
+      const [x, y] = local(e);
+      if (!st.car || !inMap(x, y)) return;
+      e.preventDefault();
+      const r = st.mmRect, sc = r.S / (st.mapKm * 1000), [cx, cy] = mapCentre();
+      teleport(cx + (x - (r.x0 + r.S / 2)) / sc, cy - (y - (r.y0 + r.S / 2)) / sc);
+    });
+    bindPicker();
+    try { const sp = localStorage.getItem('chase.spawn'); if (sp) $('spawn').value = sp; } catch (e) { /* private */ }
     window.addEventListener('mousemove', e => {
+      if (mapDrag) {
+        const dx = e.clientX - mapDrag.x, dy = e.clientY - mapDrag.y, sc = st.mmRect.S / (st.mapKm * 1000);
+        if (Math.abs(dx) + Math.abs(dy) > 3) mapDrag.moved = true;
+        if (mapDrag.moved) st.mmPan = [mapDrag.c[0] - dx / sc, mapDrag.c[1] + dy / sc];
+        return;
+      }
+      const [x, y] = local(e);
+      hudEl.style.cursor = st.car && inMap(x, y) ? (mapBtnAt(x, y) ? 'pointer' : 'grab') : drag ? 'grabbing' : 'grab';
       if (!drag) return;
       st.cam.look = drag.look - (e.clientX - drag.x) * 0.006;
       st.cam.pitch = Math.max(-0.6, Math.min(0.9, drag.pitch + (e.clientY - drag.y) * 0.004));
     });
-    window.addEventListener('mouseup', () => { if (drag) { drag = null; st.cam.lookHeld = false; st.cam.lookT = performance.now(); } });
-    hudEl.addEventListener('wheel', e => { e.preventDefault(); st.cam.dist = Math.max(0.6, Math.min(3, st.cam.dist * (e.deltaY > 0 ? 1.1 : 0.9))); }, { passive: false });
+    window.addEventListener('mouseup', () => {
+      mapDrag = null;
+      if (drag) { drag = null; st.cam.lookHeld = false; st.cam.lookT = performance.now(); }
+    });
+    hudEl.addEventListener('wheel', e => {
+      e.preventDefault();
+      const [x, y] = local(e);
+      if (st.car && inMap(x, y)) { zoomMap(Math.pow(1.0015, e.deltaY), x, y); return; }
+      st.cam.dist = Math.max(0.6, Math.min(3, st.cam.dist * (e.deltaY > 0 ? 1.1 : 0.9)));
+    }, { passive: false });
     // the menu: Controls / Settings tabs, the settings bound to st.vis by their data-k
     st.vis = { ...VIS0 };
     try { Object.assign(st.vis, JSON.parse(localStorage.getItem('chase.vis') || '{}')); } catch (e) { /* private */ }
@@ -719,7 +1420,7 @@ const Chase = (() => {
         const k = el.dataset.k;
         el.value = String(st.vis[k]);
         const o = el.nextElementSibling;
-        if (o && o.tagName === 'OUTPUT') o.textContent = k === 'funnel' ? (st.vis[k] ? `×${st.vis[k]}` : 'off') : k === 'mmOpacity' || k === 'mmDim' ? `${Math.round(st.vis[k] * 100)} %` : k === 'sunAz' ? `${st.vis[k]}°` : k === 'sunH' ? `${st.vis[k]}°` : k === 'haze' ? `${st.vis[k]} km` : String(st.vis[k]);
+        if (o && o.tagName === 'OUTPUT') o.textContent = k === 'bounce' ? (st.vis[k] ? `×${st.vis[k]}` : 'off') : k === 'mmOpacity' || k === 'mmDim' || k === 'vol' ? `${Math.round(st.vis[k] * 100)} %` : k === 'sunAz' ? `${st.vis[k]}°` : k === 'sunH' ? `${st.vis[k]}°` : k === 'haze' ? `${st.vis[k]} km` : String(st.vis[k]);
         if (k === 'sunAz' || k === 'sunH') el.disabled = st.vis.sunMode !== 'manual';
       }
     };
@@ -750,6 +1451,7 @@ const Chase = (() => {
     $('menuX').onclick = () => $('help').classList.add('hidden');
   }
 
-  return { init, st, surfAt, tornadoes, say };
+  // goTo(x, y): the car to world x, y m (as the map's click does), from the console
+  return { init, st, surfAt, tornadoes, say, goTo: (x, y) => teleport(x, y) };
 })();
 window.addEventListener('DOMContentLoaded', Chase.init);

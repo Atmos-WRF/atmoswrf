@@ -30,7 +30,7 @@
       brake: 2100, brakeBias: 0.68, cdA: 0.68, cyA: 4.6, clA: 1.4, ground: 0.15, tire: 1.15,
     },
     truck: {
-      name: 'Intercept truck', mass: 5200, dims: [5.9, 2.25, 2.55], cgH: 0.95, wheelbase: 3.6, cgFront: 1.7, track: 1.9,
+      name: 'Heavy pickup', mass: 5200, dims: [5.9, 2.25, 2.55], cgH: 0.95, wheelbase: 3.6, cgFront: 1.7, track: 1.9,
       wheelR: 0.46, wheelI: 4.5, rest: 0.40, travel: 0.22, k: [130000, 150000], zeta: 0.38, arb: [80000, 60000],
       maxSteer: 0.55, steerRate: 2.0, idle: 650, redline: 4200, peakT: 1350, peakRpm: 2400, engI: 0.6,
       gears: [4.7, 2.21, 1.53, 1.0, 0.76, 0.67], final: 4.1, rev: 4.3, split: 0.35, lsd: 250,

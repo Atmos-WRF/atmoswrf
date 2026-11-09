@@ -17,19 +17,21 @@ const MiniMap = (() => {
                   vort: 'Vort', rain: 'Rain', uhtrack: 'UH tracks', windtrack: 'Wind swaths', ir: 'IR', REF: 'REF', VEL: 'VEL',
                   SRV: 'SRV', ZDR: 'ZDR', RHO: 'CC', SW: 'SW' };
   const st = {
-    base: { key: '', img: null, box: null, busy: false },
+    bases: {},                         // per map drawn (the minimap, the big map to pick a start): its own picture
     data: { key: '', busy: false, kind: null, ppi: null, patches: null, icao: null, at: 0, err: '' },
     frames: { n: 0, at: 0, radars: [] },
-    layer: { cv: null, key: '' },
+    layers: {},
   };
   const hdr = () => (window.ChaseAuth ? window.ChaseAuth() : {});
   const isRadar = p => RADAR.some(r => r[0] === p);
 
   // ---------------------------------------------------------------- the map picture
   // a box (world km) twice the range around the car, fetched again when the car nears its edge
-  function wantBase(base, cx, cy, rangeKm) {
-    const b = st.base;
+  function wantBase(base, cx, cy, rangeKm, slot = 'mini') {
+    const b = st.bases[slot] || (st.bases[slot] = { key: '', img: null, box: null, busy: false });
     if (base === 'none') return null;
+    // zoomed by hand to any range: fetched at the next power-of-two range up, so a zoom does not fetch every frame
+    rangeKm = Math.pow(2, Math.ceil(Math.log2(Math.max(0.25, rangeKm)) - 1e-9));
     const side = rangeKm * 2.2;
     const far = !b.box || Math.abs(cx - (b.box[0] + b.box[2]) / 2) > side * 0.27 || Math.abs(cy - (b.box[1] + b.box[3]) / 2) > side * 0.27 ||
                 Math.abs((b.box[2] - b.box[0]) - side) > 1e-6;
@@ -93,7 +95,7 @@ const MiniMap = (() => {
         });
         Object.assign(d, { kind: 'grid', patches, ppi: null, icao: null });
       }
-      d.key = k; d.err = ''; st.layer.key = '';
+      d.key = k; d.err = ''; for (const L of Object.values(st.layers)) L.key = '';
     } catch (e) { d.err = e.message; d.key = k; }
     d.busy = false;
   }
@@ -109,8 +111,8 @@ const MiniMap = (() => {
   }
 
   // a radar's sweep under the minimap (S px a side, range R km around cx, cy), at half the minimap's pixels
-  function ppiLayer(S, R, cx, cy) {
-    const P = st.data.ppi, m = P.m, L = st.layer;
+  function ppiLayer(S, R, cx, cy, slot = 'mini') {
+    const P = st.data.ppi, m = P.m, L = st.layers[slot] || (st.layers[slot] = { cv: null, key: '' });
     const step = 2, w = Math.ceil(S / step), key = `${st.data.key}/${S}/${R}/${cx.toFixed(2)}/${cy.toFixed(2)}`;
     if (L.key === key && L.cv) return L.cv;
     if (!L.cv || L.cv.width !== w) L.cv = Object.assign(document.createElement('canvas'), { width: w, height: w });
@@ -139,7 +141,7 @@ const MiniMap = (() => {
   // under the minimap: the map, the product (opacity a); P(x m, y m) -> screen
   function draw(g, x0, y0, S, cx, cy, R, opt) {
     const sc = S / (2 * R), Pk = (x, y) => [x0 + S / 2 + (x - cx) * sc, y0 + S / 2 - (y - cy) * sc];
-    const b = wantBase(opt.base, cx, cy, R);
+    const b = wantBase(opt.base, cx, cy, R, opt.slot);
     if (b && b.img) {
       const [ax, ay] = Pk(b.box[0], b.box[3]), [bx, by] = Pk(b.box[2], b.box[1]);
       g.save();
@@ -154,7 +156,7 @@ const MiniMap = (() => {
       g.save(); g.globalAlpha = opt.opacity;
       if (d.kind === 'ppi' && d.ppi) {
         g.imageSmoothingEnabled = true;
-        g.drawImage(ppiLayer(S, R, cx, cy), x0, y0, S, S);
+        g.drawImage(ppiLayer(S, R, cx, cy, opt.slot), x0, y0, S, S);
       } else if (d.kind === 'grid' && d.patches) {
         g.imageSmoothingEnabled = false;
         for (const p of d.patches) {

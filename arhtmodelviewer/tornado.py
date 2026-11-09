@@ -28,8 +28,13 @@ SEARCH_FRAC = 0.3      # x the finest level's side: how far from the last place 
 FOLLOW_ZETA = 0.01     # 1/s near the ground: weaker, and the box stays where it is
 NEAR = 1200.0          # m around the vorticity maximum where its pressure minimum and strongest wind are looked for
 DRIFT_REACH = 20000.0  # m: the followed updraft whose motion a box without a vortex drifts with
-SNAP_KM = 12.0         # km: a new box goes onto the strongest low-level mesocyclone this near its centre
-MESO_REACH = 4000.0    # m: how far a box without a vortex follows its mesocyclone between searches
+SNAP_KM = 4.0          # km: a new box goes onto the strongest near-ground rotation this near where it was put
+MESO_REACH = 4000.0    # m: how far a box without a vortex follows the near-ground rotation between searches
+# Near-ground rotation (low_vortex: vertical vorticity on the lowest two levels, a ~1 km mean), not the 0-3 km updraft
+# helicity, is what a box is put on and held on: UH is rotation x updraft, so its maximum sits in the rotating
+# updraft on the inflow side, km from the tornado under the rear flank -- a box put on a tornado was "aligned"
+# 7.8 km into the inflow, and one whose vortex weakened ran off there too.
+LOW_ZETA = 0.004       # 1/s (that mean): rotation worth going onto
 MESO_UH = 40.0         # m2/s2 of 0-3 km updraft helicity: a low-level mesocyclone (nest.INNER_UH03)
 TRACK_MAX = 2000       # points kept on the track
 SEED_EVERY = 20.0      # s between parcel releases
@@ -128,12 +133,15 @@ class TornadoZoom:
         self.pz = np.zeros(0)
         self.paths: list[list] = []
         self._rng = np.random.default_rng(7)
-        got = meso_near(list(eng.patches), self.x, self.y, max(SNAP_KM, self.size_km) * 1000.0)
+        # auto-align: onto the strongest near-ground rotation near where it was put (the finest grid there), else
+        # just where it was put
+        here = [n.patch for lvl in reversed(have) for n in lvl.items] + list(eng.patches)
+        got = low_vortex(here, self.x, self.y, SNAP_KM * 1000.0)
         on = ""
-        if got is not None:                      # auto-align: onto the low-level mesocyclone near the box
+        if got is not None:
             moved = math.hypot(got[0] - self.x, got[1] - self.y) / 1000.0
             self.x, self.y = got[0], got[1]
-            on = f", aligned {moved:.1f} km onto the low-level mesocyclone (0-3 km UH {got[2]:.0f} m2/s2)"
+            on = f", aligned {moved:.1f} km onto the rotation near the ground ({got[2]:.3f}/s)"
         self._pin(self.x, self.y)
         fe = self.chain[-1].env
         fine = fe.grid
@@ -314,11 +322,10 @@ class TornadoZoom:
             self._drift()
 
     def _drift(self) -> None:
-        """No vortex to hold on to (yet): the box goes onto its low-level mesocyclone (the 0-3 km updraft helicity
-        maximum near it, on the finest grid that holds it), else moves with its storm (the nearest followed
-        updraft's motion)."""
+        """No vortex to hold on to (yet): the box goes onto the strongest near-ground rotation near it (low_vortex,
+        on the finest grid that holds it), else moves with its storm (the nearest followed updraft's motion)."""
         eng = self.eng
-        got = meso_near(self.patches(), self.x, self.y, MESO_REACH)
+        got = low_vortex(self.patches(), self.x, self.y, MESO_REACH)
         if got is not None:
             self._pin(got[0], got[1])
             return
@@ -429,6 +436,38 @@ def vortex(patch, x: float, y: float, radius: float):
     speed = cp.sqrt((uc[0] + mx) ** 2 + (vc[0] + my) ** 2)
     vmax = float(cp.where(near, speed, 0.0).max())
     return zx, zy, zmax, float(X[j2, i2]), float(Y[j2, i2]), float(pp[j2, i2]) / 100.0, vmax
+
+
+def low_vortex(patches, x: float, y: float, reach: float):
+    """(x, y, zeta) of the strongest near-ground rotation -- vertical vorticity on the lowest two levels, a ~1 km mean
+    (at least 3 cells) -- within ``reach`` m of (x, y), on the first of ``patches`` (finest first) that holds (x, y)
+    with a state; None below LOW_ZETA."""
+    import cupy as cp
+    from cupyx.scipy import ndimage as cnd
+    for p in patches:
+        st, env = getattr(p, "state", None), p.env
+        if st is None:
+            continue
+        dx = env.grid.dx
+        x0, y0 = p.world_x0(), p.world_y0()
+        if not (x0 <= x <= x0 + p.rect.nx * dx and y0 <= y <= y0 + p.rect.ny * dx):
+            continue
+        uc = 0.5 * (st.u[:2, :, 1:] + st.u[:2, :, :-1])
+        vc = 0.5 * (st.v[:2, 1:, :] + st.v[:2, :-1, :])
+        zeta = (cp.gradient(vc, dx, axis=2) - cp.gradient(uc, dx, axis=1)).mean(axis=0)
+        zeta = cnd.uniform_filter(zeta, max(3, int(round(1000.0 / dx))) | 1, mode="nearest")
+        ny, nx = zeta.shape
+        jj, ii = cp.mgrid[0:ny, 0:nx]
+        X, Y = x0 + (ii + 0.5) * dx, y0 + (jj + 0.5) * dx
+        m = 4
+        look = (ii >= m) & (ii < nx - m) & (jj >= m) & (jj < ny - m) & ((X - x) ** 2 + (Y - y) ** 2 <= reach ** 2)
+        if not bool(look.any()):
+            return None
+        k = int(cp.argmax(cp.where(look, zeta, -cp.inf)))
+        j, i = divmod(k, nx)
+        val = float(zeta[j, i])
+        return (float(X[j, i]), float(Y[j, i]), val) if val >= LOW_ZETA else None
+    return None
 
 
 def meso_near(patches, x: float, y: float, reach: float):

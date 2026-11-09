@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Atmos-WRF Chase</title>
+<!-- Three.js for the detailed map (worldlink.js, world/world.js) -->
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js" } }
+</script>
 <style>
   :root { --bg: #0b0f14; --panel: rgba(12, 18, 26, .9); --line: #2a3644; --text: #e6edf3; --dim: #93a2b2; --accent: #4fc3ff; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px 'Segoe UI', system-ui, sans-serif; overflow: hidden; }
@@ -48,6 +52,12 @@
   .plist { list-style: none; padding: 0; margin: 4px 0; }
   .plist li { padding: 3px 0; display: flex; gap: 6px; align-items: center; }
   .plist button { margin-left: auto; padding: 2px 8px; font-size: 12px; cursor: pointer; }
+  #picker { position: fixed; inset: 0; z-index: 20; background: #0b0f14; }
+  #picker canvas { cursor: crosshair; }
+  #picker .pickBar { position: fixed; left: 50%; top: 16px; transform: translateX(-50%); display: flex; gap: 10px; align-items: center;
+                     background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; max-width: calc(100vw - 48px); flex-wrap: wrap; }
+  #picker .pickBar button { cursor: pointer; padding: 5px 12px; }
+  #pickMsg { color: var(--text); font-weight: 600; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -66,7 +76,7 @@
       <select id="vehicle">
         <option value="suv">Chase SUV (AWD)</option>
         <option value="sedan">Sedan (front-wheel drive)</option>
-        <option value="truck">Intercept truck (heavy, armoured)</option>
+        <option value="truck">Heavy pickup (big, heavy)</option>
       </select>
     </div>
     <div style="flex: 0 0 auto">
@@ -74,12 +84,27 @@
       <input id="color" type="color" value="#c41e24">
     </div>
   </div>
+  <label for="spawn">Where to start</label>
+  <select id="spawn">
+    <option value="ahead">Ahead of the storm (12 km, on its inflow side)</option>
+    <option value="close">Close to the tornado or storm (4 km)</option>
+    <option value="pick">Pick on the map</option>
+  </select>
   <div id="codeRow" class="hidden">
     <label for="code">Join code (from the host)</label>
     <input id="code" type="text" inputmode="numeric" maxlength="12" placeholder="6 digits">
   </div>
   <button id="go">Drive</button>
   <div id="startMsg"></div>
+</div>
+
+<div id="picker" class="hidden">
+  <canvas id="pickCv"></canvas>
+  <div class="pickBar">
+    <span id="pickMsg">Click where you want to start · wheel: zoom · drag: pan</span>
+    <button id="pickAuto">Ahead of the storm</button>
+    <button id="pickCancel">Cancel</button>
+  </div>
 </div>
 
 <button id="menuBtn" title="Controls and settings (H)">☰ Menu</button>
@@ -94,9 +119,14 @@
     <tr><td>A D / ← →</td><td>Steer</td></tr>
     <tr><td>Space</td><td>Handbrake</td></tr>
     <tr><td>C</td><td>Camera: chase, hood, driver</td></tr>
+    <tr><td>V</td><td>Vortex tubes of the tornado model (when it is running)</td></tr>
     <tr><td>Drag, wheel</td><td>Look around; chase-camera distance</td></tr>
     <tr><td>R</td><td>Back onto the nearest road</td></tr>
     <tr><td>M / Shift+M</td><td>Minimap range (6, 20, 60, 150 km) / big minimap</td></tr>
+    <tr><td>On the minimap</td><td>Wheel: zoom where you point · drag: pan · double-click or ⌖: back to the car</td></tr>
+    <tr><td>N</td><td>Sound on / off (volume in Settings)</td></tr>
+    <tr><td>G</td><td>Go somewhere else: pick a spot on the big map (or right-click the minimap)</td></tr>
+    <tr><td>F</td><td>Get out of the car (stopped) / back in (next to it). On foot: W A S D walk, Shift run, Space jump, drag or ← → to look, C: first person. Strong wind pushes you, knocks you down past ~40 m/s, and a tornado can lift you</td></tr>
     <tr><td>K</td><td>Minimap radar: CREF, REF, VEL, SRV, CC, off (all products in Settings)</td></tr>
     <tr><td>T / B</td><td>Traction control / ABS</td></tr>
     <tr><td>U</td><td>mph / km/h</td></tr>
@@ -112,9 +142,21 @@
       <span title="How thick the rain, graupel and hail look, times the model's (0: hidden)">Rain</span><span><input data-k="rain" type="range" min="0" max="5" step="0.1"><output></output></span>
       <span title="The cloud's small-scale structure the grid is too coarse for: ragged edges, billows, rain curtains">Detail</span><span><input data-k="detail" type="range" min="0" max="1" step="0.05"><output></output></span>
       <span title="Dark cloud bases darker and sunlit towers brighter (1 = the 3-D view's look)">Cloud contrast</span><span><input data-k="contrast" type="range" min="0.8" max="2" step="0.05"><output></output></span>
-      <span title="The tornadoes' condensation funnels and debris clouds, drawn from their winds and the model's cloud base (0: the model's cloud only). Higher: funnels reach further down (moister air under the storm)">Funnels</span><span><input data-k="funnel" type="range" min="0" max="3" step="0.1"><output></output></span>
+      <span title="Light the ground sends back up: sunlit fields round the storm lighting its base, the wall cloud and the funnel from below (0: none)">Ground bounce</span><span><input data-k="bounce" type="range" min="0" max="3" step="0.1"><output></output></span>
       <span title="Light the cloud's own lumps and towers">Relief</span><span><input data-k="relief" type="range" min="0" max="1" step="0.05"><output></output></span>
       <span title="How far you can see before the haze takes over">Visibility</span><span><input data-k="haze" type="range" min="30" max="600" step="10"><output></output></span>
+      <span title="How finely the picture steps through the tornado's nests (the model's finest grids, down to ~37 m): High shows a thin funnel best, Normal is lighter, Off steps at the box's ~340 m (fastest, but a funnel can vanish)">Tornado detail</span><select data-k="nestStep"><option value="1">High</option><option value="2">Normal</option><option value="0">Off</option></select>
+      <span title="Storms past the 100 km box round you, out to as far as the visibility lets you see (coarser the further they are; Off: the box's alone, lighter)">Far clouds</span><select data-k="far"><option value="on">On</option><option value="off">Off</option></select>
+    </div>
+    <h3>Ground</h3>
+    <div class="q">
+      <span title="Detailed: real terrain, aerial photos, roads with their lanes and markings, bridges, water, buildings, trees, grass and crops, roadside props and landmarks streamed in around you (Real Roads Drive's map; heavier). Basic: chase mode's own land cover, roads and buildings">Map</span><select data-k="map"><option value="detailed">Detailed</option><option value="basic">Basic</option></select>
+    </div>
+    <h3>Weather at the car</h3>
+    <div class="q">
+      <span title="The tornadoes marked: an arrow and label over each in the view, its dot and track on the minimap, the nearest one's distance and direction in the top-left. Off: find them by the radar, the warnings and your own eyes">Tornado markers</span><select data-k="markers"><option value="off">Off</option><option value="on">On</option></select>
+      <span title="Rain and snow falling round you, at the model's rain rate there; snow when the model's air at the ground is below about 1 °C, drifting in its wind">Rain and snow</span><select data-k="precip"><option value="on">On</option><option value="off">Off</option></select>
+      <span title="The engine, the tyres and road, the model's wind where you are, the rain (N: on / off)">Sound</span><span><input data-k="vol" type="range" min="0" max="1" step="0.05"><output></output></span>
     </div>
     <h3>Sun</h3>
     <div class="q">
@@ -157,11 +199,14 @@
 <script src="/static/js/landscape.js"></script>
 <script src="/static/js/chase/carphys.js"></script>
 <script src="/static/js/chase/carmesh.js"></script>
+<script src="/static/js/chase/walker.js"></script>
 <script src="/static/js/chase/roads.js"></script>
 <script src="/static/js/chase/scenery.js"></script>
 <script src="/static/js/chase/net.js"></script>
 <script src="/static/js/chase/minimap.js"></script>
 <script src="/static/js/chase/render.js"></script>
+<script src="/static/js/chase/worldlink.js"></script>
+<script src="/static/js/chase/sound.js"></script>
 <script src="/static/js/chase/game.js"></script>
 </body>
 </html>

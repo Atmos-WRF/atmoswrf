@@ -9,11 +9,38 @@ const Render = (() => {
   let gl = null, cv = null, cloudProg = null, lightProg = null, roadProg = null, meshProg = null, vao = null;
   let volTex = null, gndTex = null, noiseTex = null, lightTex = null, lightFbo = null, lightKey = '', loadSeq = 0;
   const insTex = [];
+  // Blending between volumes: volA / insA / lightA hold the picture shown when the newest volume came in (a blend
+  // under way included), volB / insB / lightB the newest; volTex / insTex / lightTex, which the cloud pass reads,
+  // are mixed from them (mixProg) as the blend runs, so the storm moves smoothly instead of jumping each fetch.
+  let volA = null, volB = null, lightA = null, lightB = null, mixProg = null, mixFbo = null;
+  const insA = [], insB = [];
+  const mixSt = { t0: 0, dur: 0, f: 1, at: 0, dirty: false, fMain: 1, atMain: 0, fIns: 1, atIns: 0, insBlend: [false, false, false, false], lightB: -1,
+                  tA: null, tB: null, warp: false, insWarp: [false, false, false, false], insBoxA: [null, null, null, null], vor: [] };
+  // a blend may run on past its end, carried along the wind, by this much (x its length) while the next volume is late
+  const OVERRUN = 1.75;
+  // the model's wind with each volume (header.wind): the box's and each nest's, for the start of the blend (A) and
+  // the newest (B); hasWind: the shown volume came with it
+  let windA = null, windB = null, hasWind = false, flowEpoch = 0;
+  const wInsA = [], wInsB = [];
+  const WARP_MAX = 240;                          // s of model time: a longer step between volumes just fades
+  const MIX_EVERY = 33;                          // ms between mixing passes (~30 a second at most): the tornado model's
+  const MIX_MAIN = 125, MIX_INS = 50;            // ms: the storm's box, its nests (advance)
+  // the tornado model's frames (setLes): media and wind, the one shown (lesM, lesVt) mixed from the previous (A) and
+  // the newest (B) over the time between frames, like the storm's volume
+  let lesShader = false, lesHead = null, lesM = null, lesMA = null, lesMB = null, lesVt = null, lesVA = null, lesVB = null;
+  const lesSt = { t0: 0, dur: 0, f: 1, at: 0, dirty: false };
   let head = null, box = null, gMap = null, floatLinear = false, volData = null;
-  const gb = { fbo: null, col: null, dist: null, depth: null, w: 0, h: 0 };
+  // the far cloud (setFar, FAR_GLSL): per tier the newest as it came (raw: the codes) and lit (B: the codes and their
+  // light, farLightSource), the one shown when it came (A, lit), and the one read (tex), mixed from A and B; head:
+  // the newest's header (box m), from: the older's box while blending into a moved one, key: what B was lit for
+  const farV = [0, 1].map(() => ({ tex: null, A: null, B: null, raw: null, head: null, from: null, key: '', litAt: 0, t0: 0, dur: 0, f: 1, at: 0, dirty: false }));
+  const FAR_MIX_EVERY = 250;                     // ms: they change slowly
+  const FAR_RELIGHT = 20000;                     // ms: at most this often for the sun's own motion
+  const gb ={ fbo: null, col: null, dist: null, depth: null, w: 0, h: 0 };
   const roads = { buf: null, vao: null, n: 0, origin: [0, 0] };
   const meshes = new Map();                      // car kind/colour -> { body, wheel }
-  let treeProg = null;
+  const partBufs = new WeakMap();                // a figure's part (its vertex data) -> its buffer
+  let treeProg = null, precipProg = null, mergeProg = null, farLightProg = null;
   const trees = { mesh: null, near: 0, far: 0, inst: null, count: 0, nearCount: 0, origin: [0, 0], vao: null };
   const blds = { buf: null, vao: null, n: 0, origin: [0, 0] };
 
@@ -92,6 +119,64 @@ const Render = (() => {
     o1 = vec4(length(wpos - eye), 0.0, 0.0, 1.0);
   }`;
 
+  // The rain and snow falling round the camera (setPrecip's amounts): drops and flakes fixed in the world, falling
+  // and blown with the model's wind at the car, in a cube of side `cube` m that wraps round the eye.  Each is a
+  // quad drawn from the vertex id: a rain drop is a streak along its motion past the camera during `expo` s (what
+  // the eye smears it to), a flake a soft dot.  Behind the roads, buildings, trees and cars (the geometry pass's
+  // distance), faded at the cube's edge and right at the eye.
+  const PRECIP_VS = `#version 300 es
+  uniform mat4 VP; uniform vec3 eye; uniform float s, t, cube, snow, minD, expo, focal;
+  uniform vec3 camV, wind; uniform vec2 res;
+  out float va; out vec2 vq; out float vd; flat out float vsn;
+  float h(float n) { return fract(sin(n) * 43758.5453); }
+  void main() {
+    float id = float(gl_InstanceID);
+    int c = gl_VertexID;
+    vec3 r = vec3(h(id * 1.13 + 0.1), h(id * 2.71 + 0.3), h(id * 3.97 + 0.7));
+    bool sn = h(id * 7.31 + 0.9) < snow;
+    float fall = sn ? 0.9 + 0.7 * r.x : 6.5 + 3.0 * r.y;
+    vec3 vel = vec3(wind.xy * (sn ? 1.0 : 0.9), -fall);
+    vec3 p0 = r * cube + vel * t;
+    if (sn) p0.xy += 0.35 * vec2(sin(t * (1.1 + r.z) + id), cos(t * (0.8 + r.x) + id * 1.7));
+    vec3 eyeM = eye / s;
+    vec3 rel = mod(p0 - eyeM, cube) - 0.5 * cube;
+    float d = length(rel);
+    // the streak's two ends (a flake: one point, made a dot)
+    vec3 dv = (vel - camV) * (sn ? 0.0 : expo);
+    vec4 c0 = VP * vec4(eye + rel * s, 1.0), c1 = VP * vec4(eye + (rel - dv) * s, 1.0);
+    if (c0.w < 0.3 * s || c1.w < 0.3 * s || d < minD) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); va = 0.0; return; }
+    vec2 a = c0.xy / c0.w * res * 0.5, b = c1.xy / c1.w * res * 0.5;    // pixels from the middle
+    vec2 dir = b - a; float L = length(dir);
+    dir = L > 0.01 ? dir / L : vec2(0.0, 1.0);
+    vec2 nrm = vec2(-dir.y, dir.x);
+    // size on the screen: drops ~1 px across, flakes their ~7 mm, never under 1.2 px (fainter instead)
+    float px = (sn ? 0.007 : 0.0016) * s * focal / max(c0.w, 1e-6);     // focal: pixels per unit at distance 1
+    float wpx = max(px, sn ? 1.4 : 0.9);
+    float cover = clamp(px / wpx, sn ? 0.45 : 0.7, 1.0);
+    int corner[6] = int[6](0, 1, 2, 2, 1, 3);
+    int k = corner[c];
+    float e = float(k / 2), side = float(k % 2) * 2.0 - 1.0;
+    vec2 P = mix(a, b, e) + nrm * side * wpx + dir * (e * 2.0 - 1.0) * (sn ? wpx : 0.5);
+    float w = mix(c0.w, c1.w, e);
+    gl_Position = vec4(P / (res * 0.5) * w, mix(c0.z, c1.z, e), w);
+    vq = vec2(e * 2.0 - 1.0, side);
+    vd = d * s; vsn = sn ? 1.0 : 0.0;
+    float edge = smoothstep(0.5 * cube, 0.32 * cube, max(abs(rel.x), max(abs(rel.y), abs(rel.z))));
+    va = edge * smoothstep(minD, minD + 0.6, d) * cover * (sn ? 0.9 : 0.5 * clamp(2.5 / max(L, 1.0) + 0.55, 0.45, 1.0));
+  }`;
+  const PRECIP_FS = `#version 300 es
+  precision highp float;
+  in float va; in vec2 vq; in float vd; flat in float vsn;
+  uniform sampler2D geoT; uniform vec2 res; uniform vec3 col;
+  out vec4 frag;
+  void main() {
+    float g = abs(texture(geoT, gl_FragCoord.xy / res).r);
+    if (g > 0.0 && g < vd) discard;
+    float a = vsn > 0.5 ? va * smoothstep(1.0, 0.25, length(vq)) : va * (1.0 - abs(vq.y)) * smoothstep(1.0, 0.6, abs(vq.x));
+    if (a < 0.004) discard;
+    frag = vec4(col * (vsn > 0.5 ? 1.15 : 1.0), a);
+  }`;
+
   // the trees (scenery.js): a hexagonal trunk and a lumpy low-poly crown, one instance per tree
   const TREE_VS = `#version 300 es
   layout(location = 0) in vec3 p; layout(location = 1) in vec3 n; layout(location = 2) in float part;
@@ -145,47 +230,392 @@ const Render = (() => {
     return { data: new Float32Array(V), near, far: V.length / 7 - near };
   }
 
-  // A tornado's condensation funnel, which the model's grid cannot condense by itself: the vortex's pressure drop
-  // (Rankine: rho V^2 in the core, half that at the core's edge, falling as 1/r^2 outside) cools the air drawn
-  // into it, and the cloud comes down to where that drop equals the pressure difference to the cloud base
-  // (rho g dz, ~0.12 hPa a metre).  So: a wide lowering under the base, narrowing to a funnel V^2/g x funnelK
-  // below it (down to the ground for strong ones), its edge torn by a noise that turns with the vortex and rises;
-  // and near the ground, for winds over ~35 m/s, a debris cloud.  torA: x, y (box units), core radius m, wind m/s;
-  // torB: cloud base m above the ground, the ground m, -, -.
-  const FUNNEL_GLSL = `
+  // The model's own cloud, alive: its small detail (volume.js's erosion and lumps) carried with the storm (drift m/s
+  // over the model's time flowT s), and round each of the model's vortices (vorA: centre now in box units, the
+  // model's peak tangential wind m/s, + counter-clockwise, and the radius of that peak m) turned at the vortex's own
+  // rate (Rankine: solid inside the peak, falling off as 1/r^2 outside) and rising, at its real speed (spinT: wall
+  // seconds) -- in two phases that take turns (flow noise), so the turning never winds the noise up.  Close in, a
+  // finer noise on the vortex's own scale: the funnel's striations.  The cloud's shape is the model's (the volume,
+  // carried along its wind between snapshots by the blend: WARP_FS).
+  const VORTEX_GLSL = `
+  uniform int vorN; uniform vec4 vorA[4]; uniform float flowT, spinT; uniform vec2 drift;
   float gDebris = 0.0;                                         // the debris' share of the extinction here
-  vec2 funnels(vec3 p) {
-    gDebris = 0.0;
-    vec2 out2 = vec2(0.0);
+  mat2 vrot2(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
+  // ka, kb: the detail's two phases (km), w the share of ka; fa, fb: the striations' (their own units), sv: how
+  // much of a vortex there is here
+  void flowK(vec3 p, out vec3 ka, out vec3 kb, out float w, out vec3 fa, out vec3 fb, out float sv) {
+    vec3 k = p * toKm + kmOrigin;
+    ka = k - vec3(drift * flowT / 1000.0, 0.0); kb = ka; w = 1.0; fa = vec3(0.0); fb = vec3(0.0); sv = 0.0;
     for (int i = 0; i < 4; i++) {
-      if (i >= torN) break;
-      vec4 A = torA[i], B = torB[i];
-      vec2 dxy = (p.xy - A.xy) * toKm.xy * 1000.0;
-      float d = length(dxy), z = p.z * toKm.z * 1000.0 - B.y, R = A.z, V = A.w, zb = B.x;
-      if (d > 6.0 * R || z > zb + 60.0 || z < -5.0) continue;
-      float dp0 = 1.2 * V * V * funnelK;                       // Pa: the drop in the core
-      float q = 11.8 * max(zb - z, 0.0);                        // Pa: what it takes to condense at this height
-      float rf = q < 0.5 * dp0 ? R * sqrt(dp0 / (2.0 * max(q, 1.0))) : R * sqrt(max(2.0 * (1.0 - q / dp0), 0.0));
-      rf = min(rf, 5.0 * R);
-      if (q < dp0) rf = max(rf, 0.3 * R);                     // the tip: a rope down to the depth, not a fade
-      // turning with the vortex, rising: the funnel's striations
-      float om = 0.6 * V / max(R, 20.0), a = -uTime * om;
-      vec2 rx = mat2(cos(a), sin(a), -sin(a), cos(a)) * dxy;
-      float n = texture(noiseTex, vec3(rx / 160.0, z / 260.0 - uTime * 0.03)).r;
-      float n2 = texture(noiseTex, vec3(rx / 45.0, z / 70.0 - uTime * 0.08) + 0.37).g;
-      float edge = d * (1.0 + 0.35 * (n - 0.5) + 0.2 * (n2 - 0.5));
-      float f = smoothstep(rf * 1.12, rf * 0.6, edge) * smoothstep(-5.0, 15.0, zb + 60.0 - z);
-      out2.x += 34.0 * f * smoothstep(0.0, 0.3 * R, rf);         // per km: a thick, milky funnel
-      // the debris cloud: dust and debris lifted where the winds at the ground pass ~35 m/s
-      if (V > 35.0) {
-        float hd = 25.0 + 6.0 * (V - 35.0), rd = R * (1.0 + 0.9 * clamp(z / hd, 0.0, 1.0));
-        float dd = smoothstep(rd, rd * 0.45, d * (1.0 + 0.5 * (n2 - 0.5))) * (1.0 - smoothstep(0.2 * hd, hd, z)) * smoothstep(0.3, 0.7, n + 0.3);
-        float de = 9.0 * dd * clamp((V - 35.0) / 25.0, 0.2, 1.0);
-        out2.y += de; gDebris += de;
+      if (i >= vorN) break;
+      vec2 d = (p.xy - vorA[i].xy) * toKm.xy * 1000.0;         // m from its centre
+      float r = length(d), V = vorA[i].z, R = vorA[i].w, zm = p.z * toKm.z * 1000.0;
+      float s = (1.0 - smoothstep(3.0 * R, 6.0 * R, r)) * (1.0 - smoothstep(3000.0, 5000.0, zm));
+      if (s <= 0.0) continue;
+      float om = r < R ? V / R : V * R / max(r * r, 1.0);      // rad/s
+      float P = clamp(2.5 / max(abs(V) / R, 0.05), 1.5, 8.0);  // s a phase lasts: about a third of a turn of the core
+      float ph = fract(spinT / P), ph2 = fract(ph + 0.5);
+      w = 1.0 - abs(2.0 * ph - 1.0);
+      vec3 o = vec3(17.3, 9.1, 0.0) * float(i + 1);
+      float up = 0.008;                                        // km/s: the air rising in it
+      vec3 va = vec3(vrot2(-om * ph * P) * d / 1000.0, k.z - up * ph * P) + o;
+      vec3 vb = vec3(vrot2(-om * ph2 * P) * d / 1000.0, k.z - up * ph2 * P) + o + vec3(0.37, 0.11, 0.53);
+      ka = mix(ka, va, s); kb = mix(kb, vb, s);
+      // the striations: stretched up the funnel, bands about a tenth of its core across (the noise repeats every
+      // 1.6 R; at 0.7 R its finest cells, ~R / 45, made a fine comb of lines), and only on the funnel and the wall
+      // cloud -- out to 2 R and 3.5 km up, not the whole low cloud 6 R round (a tail cloud km away got them)
+      // (at least 1.2 km x 3 km a repeat: a small vortex's would be features of ~10 m, which alias into a comb)
+      vec3 sc = vec3(max(1.6 * R, 1200.0), max(1.6 * R, 1200.0), max(4.0 * R, 3000.0)) / 1000.0;
+      fa = va / sc; fb = vb / sc;
+      sv = s * (1.0 - smoothstep(1.0 * R, 2.0 * R, r)) * (1.0 - smoothstep(2000.0, 3500.0, zm));
+      break;                                                    // one vortex at a time
+    }
+  }
+  // the detail's scale where media() is reading (km): the cell of the finest grid there -- a nest's own, not the
+  // box's, or the box's coarse cell would shift and erode a 37 m nest's funnel (100-200 m wide) into nothing
+  // and how much of it (the Detail slider's): it fades out on grids under ~150 m, which resolve the cloud's real
+  // structure -- the funnel and the wall cloud there are thin (volume.py _near_saturation, at most 0.25 g/kg) and
+  // made-up erosion and lumps break them into nothing
+  float gDkm = 1.0, gDet = 0.0;
+  // a nest's share of the detail's scale at p: 1 in its middle, down to 0 over its outer 30 % (and its top 15 %) --
+  // far wider than its data's own blend (insW, 8 %): the look changes with the scale, and over a narrow band that
+  // change showed as a hard line at the nest's edge
+  float insWd(vec3 p, int i) {
+    vec4 b = insBox[i];
+    vec3 u = vec3((p.x - b.x) / (b.z - b.x), (p.y - b.y) / (b.w - b.y), p.z / insTop[i]);
+    if (any(lessThan(u, vec3(0.0))) || any(greaterThan(u, vec3(1.0)))) return 0.0;
+    vec2 e = min(u.xy, 1.0 - u.xy);
+    return smoothstep(0.0, 1.0, clamp(min(min(e.x, e.y) / 0.3, (1.0 - u.z) / 0.15), 0.0, 1.0));
+  }
+  // the grid's cell at box point p (box units): the box's, each nest's blended in over it (log), coarsest to finest
+  // (the insets come finest first), so nests inside nests go over smoothly too
+  float cellAt(vec3 p) {
+    float lc = log(size.x * texel.x);
+    if (insN > 3) lc = mix(lc, log((insBox[3].z - insBox[3].x) / float(textureSize(ins3, 0).x)), insWd(p, 3));
+    if (insN > 2) lc = mix(lc, log((insBox[2].z - insBox[2].x) / float(textureSize(ins2, 0).x)), insWd(p, 2));
+    if (insN > 1) lc = mix(lc, log((insBox[1].z - insBox[1].x) / float(textureSize(ins1, 0).x)), insWd(p, 1));
+    if (insN > 0) lc = mix(lc, log((insBox[0].z - insBox[0].x) / float(textureSize(ins0, 0).x)), insWd(p, 0));
+    return exp(lc);
+  }
+  // the view's march step at p: in a nest at most k of its cell (the box's own step is ~1/420 of the box, ~340 m
+  // over chase's 100 km, which steps over a 200 m funnel), else dt.  Only the tornado's own nests (cells under
+  // 100-200 m, faded in between), and coarser with the distance from the eye (a 200 m funnel 6 km off is a few
+  // pixels): the step is k cells x nestStep x the km past 1.5 km over 1.5
+  uniform float nestStep;                                      // x the cell (0: off): the Settings' quality
+  float nestDt(vec3 p, float dt, float k) {
+    if (insN == 0 || nestStep <= 0.0) return dt;
+    float cell = cellAt(p), fade = smoothstep(0.1, 0.2, cell * toKm.x);
+    if (fade >= 1.0) return dt;
+    float dk = length((p - eye) * toKm);
+    return mix(min(dt, cell * k * nestStep * max(1.0, dk / 1.5)), dt, fade);
+  }
+  vec2 shapeDetail(vec3 k, vec2 s, vec3 kf, float sv) {
+    // the noise on the box's scale everywhere (detailKm): on a nest's (gDkm, down to 37 m) its ~20 m features
+    // aliased into streaks and a fine comb seen from km off; in the nests only its strength fades (gDet)
+    float n = texture(noiseTex, k / (detailKm * 20.0)).r * 0.55 + texture(noiseTex, k / (detailKm * 7.0) + 0.37).r * 0.45;
+    // erosion: thin cloud breaks into wisps and billows, the solid core keeps its shape
+    float cov = clamp(s.x / 30.0, 0.0, 1.0);
+    float thr = 0.8 * gDet * smoothstep(0.3, 0.7, n) * (1.0 - cov);
+    float kept = clamp((cov - thr) / max(1.0 - thr, 0.05), 0.0, 1.0);
+    s.x *= cov > 1e-4 ? kept / cov : 0.0;
+    s.x *= max(mix(1.0, 2.6 * n - 0.3, 0.55 * gDet), 0.0);     // lumps inside, the mean kept
+    // rain curtains: streaks that hang down, thicker and thinner side by side -- on the box's scale wherever they
+    // are (detailKm, ~140 m to a few km across): rain shafts are that size, and on a nest's (gDkm) the 10x vertical
+    // stretch made a fine comb of streaks tens of metres wide across the rain round a tornado
+    float r = texture(noiseTex, vec3(k.xy / (detailKm * 9.0), k.z / (detailKm * 90.0)) + 0.61).g;
+    s.y *= max(mix(1.0, 2.4 * r - 0.2, 0.8 * gDet), 0.0);
+    if (sv > 0.0) {                                             // the funnel's striations (flowK: its core, turning)
+      float nf = texture(noiseTex, kf).r * 0.75 + texture(noiseTex, kf * 2.3 + 0.17).g * 0.25;
+      s.x *= max(mix(1.0, 0.2 + 1.6 * nf, 0.75 * sv * min(detail * 1.5, 1.0)), 0.0);
+    }
+    return s;
+  }
+  // the light the ground sends up (bounce): the ground under and round about lit by the sun and the sky (the light
+  // volume's lowest layer), its share coming up through the cloud below (the light volume's third channel)
+  uniform float bounce;
+  vec3 bounceAt(vec3 p) {
+    if (bounce <= 0.0 || useLight == 0) return vec3(0.0);
+    vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
+    float td = texture(lightTex, uvw).b;
+    float z0 = 0.5 / float(textureSize(lightTex, 0).z), hk = p.z * toKm.z;
+    vec2 off = vec2(max(2.0, 2.0 * hk) / toKm.x) / size.xy;
+    vec2 g = 0.4 * exp(-vec2(1.0, 0.5) * texture(lightTex, vec3(uvw.xy, z0)).rg);
+    for (int j = 0; j < 4; j++) {
+      vec2 o = j == 0 ? vec2(off.x, 0.0) : j == 1 ? vec2(-off.x, 0.0) : j == 2 ? vec2(0.0, off.y) : vec2(0.0, -off.y);
+      g += 0.15 * exp(-vec2(1.0, 0.5) * texture(lightTex, vec3(uvw.xy + o, z0)).rg);
+    }
+    vec3 E = SUN * max(sunDir.z, 0.0) * g.x * 0.35 + vec3(0.40, 0.50, 0.68) * (0.10 + 0.30 * g.y);
+    return bounce * 0.6 * vec3(0.17, 0.19, 0.13) * E * exp(-0.35 * td);
+  }`;
+
+  // The rain's extinction per km from its g/kg (x the Rain slider): as the model's (1.2 a g/kg) for heavy rain, from
+  // RAIN_HEAVY g/kg up, and much less below it -- light rain is a thin veil, not a grey wall (0.3 g/kg: a quarter of
+  // the linear, 0.1 g/kg: a ninth)
+  const RAIN_GLSL = `
+  float rainExt(float q) { return 1.2 * q * min(1.0, pow(q / 1.5, 0.9)); }
+  // light that has diffused through the cloud: deep in a thick cloud the sun and the sky are scattered many times
+  // over and fall off about as 1 / optical depth (two-stream), not exponentially, which keeps a storm's base and the
+  // ground under it grey, not black -- the part of it the scattering octaves (exponential) leave out
+  float fdiff(float tau) { return 1.0 / (1.0 + 0.12 * tau) - exp(-0.12 * tau); }
+`;
+
+  // volume.js's media(): the cloud and rain at box point p (extinction per km), its detail (mode > 0) from flowK
+  const MEDIA_GLSL = `
+  vec2 media(vec3 p, int mode) {
+    vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
+    if (any(lessThan(uvw, vec3(-0.01))) || any(greaterThan(uvw, vec3(1.01)))) return vec2(0.0);
+    vec3 ka = vec3(0.0), kb = vec3(0.0), fa = vec3(0.0), fb = vec3(0.0); float w = 1.0, sv = 0.0;
+    gDkm = detailKm; gDet = detail;
+    if (mode > 0 && detail > 0.0) {
+      flowK(p, ka, kb, w, fa, fb, sv);
+      // the grid's cell here, as a share of the box's (1 outside the nests)
+      float rc = insN > 0 ? cellAt(p) / (size.x * texel.x) : 1.0;
+      gDkm = detailKm * rc;
+      gDet = detail * mix(0.1, 1.0, smoothstep(0.05, 0.2, gDkm));
+      // domain warp: the surface pushed in and out by about a box cell -- towers, billows, cauliflower; on the
+      // box's scale (see shapeDetail), weaker in the nests (gDet: a tenth in a tornado's, which it shredded)
+      vec3 wq = (p * toKm + kmOrigin - vec3(drift * flowT / 1000.0, 0.0)) / (detailKm * 5.0);
+      vec3 wv = vec3(texture(noiseTex, wq).rg, texture(noiseTex, wq.zxy + 0.41).r) - 0.5;
+      uvw += wv * texel * 2.2 * gDet;
+    }
+    vec2 raw = mode == 2 && quality > 0 ? cubic(uvw) : texture(vol, uvw).rg;
+    if (insN > 0) raw = nested(vec3((uvw.x - 0.5) * size.x, (uvw.y - 0.5) * size.y, uvw.z * size.z), vec4(raw, 0.0, 0.0)).rg;
+    vec2 m = gkg(raw);
+    vec2 s = vec2(25.0 * m.x, rain * rainExt(m.y)) * density;  // rain: the Rain slider (x the model's)
+    vec2 e = min(uvw.xy, 1.0 - uvw.xy) / 0.03;                 // the box's sides fade: no walls of cloud
+    s *= clamp(min(e.x, e.y), 0.0, 1.0);
+    if (mode > 0 && detail > 0.0 && s.x + s.y > 1e-3) {
+      vec2 sa = shapeDetail(ka, s, fa, sv);
+      s = w < 0.999 ? mix(shapeDetail(kb, s, fb, sv), sa, w) : sa;
+    }
+    return s;
+  }`;
+
+  // The tornado model's own volume (the Unity LES, streamed through Atmos: lestornado.py), marched in the same ray as
+  // the storm so the funnel, the wall cloud and the rain occlude and light each other.  Its shaping is the model's
+  // renderer's (VortexVolume.shader: shape_condensate, shape_dust, the shroud, the vortex-tube view), ported as is and
+  // with the model's own look settings, in the model's local axes (q: m east, up, north of the box's ground centre).
+  // Inside the box the march takes steps of a third of a model cell (lesDt), with a short shadow march of its own
+  // toward the sun (lesSunTau), so subvortices, striations and tubes show and shade one another.
+  const LES_GLSL = `
+  uniform sampler3D lesM, lesV; uniform int lesOn; uniform vec3 lesC, lesSize, lesWind; uniform float lesTime, lesStepM, lesTubes;
+  uniform float lesCloud, lesDust, lesSharp, lesThr, lesStri, lesStriScale, lesStriStretch, lesEro, lesEroScale;
+  uniform float lesDustEro, lesDustScale, lesDustClumps, lesDustGrain, lesDustStreaks, lesShroud, lesShroudW;
+  uniform vec4 lesCode;                                        // condMin, condMax, dustMax, velMax (tubes: condMin..condMax)
+  float lnoise(vec3 p) { return texture(noiseTex, p).r; }
+  float lflow(vec3 p, vec3 vel, float scale) {                 // flow_noise
+    float period = 3.0, ph = fract(lesTime / period), ph2 = fract(ph + 0.5), w = 1.0 - abs(2.0 * ph - 1.0);
+    vec3 drift = lesWind * lesTime;
+    vec3 a = (p - vel * (ph * period) - drift) / scale, b = (p - vel * (ph2 * period) - drift) / scale + vec3(0.37, 0.11, 0.53);
+    float na = lnoise(a * 0.33) * 0.55 + lnoise(a) * 0.45, nb = lnoise(b * 0.33) * 0.55 + lnoise(b) * 0.45;
+    return smoothstep(0.3, 0.7, mix(nb, na, w));
+  }
+  float laniso(vec3 q, vec3 dir) {                             // aniso_noise
+    float along = dot(q, dir);
+    vec3 qs = (q - dir * along) + dir * (along / lesStriStretch);
+    return lnoise(qs) * 0.6 + lnoise(qs * 2.3 + 0.17) * 0.4;
+  }
+  float lstri(vec3 p, vec3 vel) {                              // striations
+    float speed = length(vel);
+    vec3 dir = speed > 0.5 ? vel / speed : vec3(0.0, 1.0, 0.0);
+    float period = 2.0, ph = fract(lesTime / period), ph2 = fract(ph + 0.5), w = 1.0 - abs(2.0 * ph - 1.0);
+    float na = laniso((p - vel * (ph * period)) / lesStriScale, dir);
+    float nb = laniso((p - vel * (ph2 * period)) / lesStriScale + vec3(0.41, 0.23, 0.67), dir);
+    return mix(nb, na, w);
+  }
+  // the box (box units): its ground centre lesC, lesSize m (east, up, north)
+  void lesBox(out vec3 lo, out vec3 hi) {
+    vec3 hs = vec3(0.5 * lesSize.x, 0.5 * lesSize.z, lesSize.y) / (toKm * 1000.0);
+    lo = vec3(lesC.xy - hs.xy, lesC.z); hi = vec3(lesC.xy + hs.xy, lesC.z + hs.z);
+  }
+  // extinction per km (cloud, dust) of the model's tornado at box point p (mode 0: plain, for shadow rays)
+  vec2 lesTornado(vec3 p, int mode) {
+    if (lesOn == 0) return vec2(0.0);
+    vec3 m = vec3((p.xy - lesC.xy) * toKm.xy, (p.z - lesC.z) * toKm.z) * 1000.0;
+    vec3 q = vec3(m.x, m.z, m.y);                              // the model's axes: east, up, north
+    vec3 tu = vec3(q.x / lesSize.x + 0.5, q.y / lesSize.y, q.z / lesSize.z + 0.5);
+    if (any(lessThanEqual(tu, vec3(0.0))) || any(greaterThanEqual(tu, vec3(1.0)))) return vec2(0.0);
+    vec4 raw = textureLod(lesM, tu, 0.0);
+    float span = lesCode.y - lesCode.x;
+    float cond = lesCode.x + raw.r * span, dust = raw.g * lesCode.z, tube = lesCode.x + raw.b * span;
+    bool detail = mode > 0;
+    vec3 vel = vec3(0.0);
+    if (detail && (cond > lesThr - 1.0 || dust > 0.0 || (lesShroud > 0.0 && cond > -lesShroudW)))
+      vel = (textureLod(lesV, tu, 0.0).rgb * 2.0 - 1.0) * lesCode.w;
+    // shape_condensate: streaks displace the iso-surface, the edge is sharpened, thin parts erode
+    float rc = cond - lesThr, streak = 0.5;
+    if (detail && lesStri > 0.0 && rc > -1.0) { streak = lstri(q, vel); rc += lesStri * (streak - 0.5); }
+    float c = clamp(rc * lesSharp, 0.0, 1.0);
+    if (detail) {
+      if (lesEro > 0.0 && c > 0.0 && c < 1.0) {
+        float thr = lesEro * lflow(q, vel, lesEroScale) * (1.0 - c);
+        c = clamp((c - thr) / max(1.0 - thr, 0.05), 0.0, 1.0);
+      }
+      c *= mix(1.0, 0.3 + 1.4 * streak, clamp(0.55 * lesStri, 0.0, 1.0));
+    }
+    // shape_dust: wind-carried billows, clumps, grain and streaks
+    float d = clamp(dust, 0.0, 1.0);
+    if (detail && d > 0.0) {
+      if (lesDustEro > 0.0 && d < 1.0) {
+        float thr = lesDustEro * lflow(q + vec3(31.0, 0.0, 17.0), vel, lesDustScale) * (1.0 - d);
+        d = clamp((d - thr) / max(1.0 - thr, 0.05), 0.0, 1.0);
+      }
+      if (lesDustClumps > 0.0 && d > 0.0) {
+        float cl = lflow(q * vec3(1.0, 1.6, 1.0) + vec3(-53.0, 0.0, 29.0), vel, 2.2 * lesDustScale);
+        d *= mix(1.0, clamp(1.9 * cl * cl, 0.0, 1.0), lesDustClumps);
+      }
+      if (lesDustGrain > 0.0 && d > 0.0) {
+        float g = lnoise(q / 9.0 + vec3(0.0, 0.03 * lesTime, 0.0)) * 0.6 + lnoise(q / 4.3 + 0.71) * 0.4;
+        d *= mix(1.0, clamp(2.2 * g * g, 0.0, 1.0), lesDustGrain);
+      }
+      if (lesDustStreaks > 0.0 && d > 0.0) {
+        float sp = length(vel);
+        float st = laniso((q - lesWind * lesTime) / (2.5 * lesStriScale), sp > 0.5 ? vel / sp : vec3(0.0, 1.0, 0.0));
+        d *= mix(1.0, clamp(0.1 + 1.8 * st * st, 0.0, 1.0), lesDustStreaks);
       }
     }
-    return out2;
+    // the shroud: ragged mist in the nearly saturated air round the funnel
+    if (lesShroud > 0.0 && cond > -lesShroudW) {
+      float mist = clamp(1.0 + cond / lesShroudW, 0.0, 1.0);
+      if (detail) mist *= clamp(1.6 * lflow(q + vec3(7.0, 0.0, -11.0), vel, 2.0 * lesEroScale), 0.0, 1.0);
+      c = max(c, lesShroud * mist * mist);
+    }
+    vec2 e = min(tu.xz, 1.0 - tu.xz) / 0.04;                   // the box's sides fade (edgeFade)
+    float ef = clamp(min(e.x, e.y), 0.0, 1.0);
+    vec2 s = vec2(c * lesCloud, d * lesDust) * 1000.0 * ef;   // 1/m -> per km
+    if (lesTubes > 0.0) s.x += clamp(tube, 0.0, 1.0) * 60.0 * ef;   // the vortex-tube view (Tubes: 0.06 per m)
+    return s * density;
+  }
+  // the next step along the ray: a third of a model cell inside the tornado's box (k x that), and never past its edge
+  float lesDt(vec3 p, vec3 rd, float dt, float k) {
+    if (lesOn == 0) return dt;
+    vec3 lo, hi; lesBox(lo, hi);
+    float fine = k * lesStepM / 1000.0 / length(rd * toKm);
+    if (all(greaterThanEqual(p, lo)) && all(lessThanEqual(p, hi))) return min(dt, fine);
+    vec3 t0 = (lo - p) / rd, t1 = (hi - p) / rd, tmn = min(t0, t1), tmx = max(t0, t1);
+    float te = max(max(tmn.x, tmn.y), tmn.z), tl = min(min(tmx.x, tmx.y), tmx.z);
+    if (te > 0.0 && te <= tl && te < dt) return te + 0.5 * fine;
+    return dt;
+  }
+  // optical depth (sun) through the tornado's own media from p: the model's shadow march
+  float lesSunTau(vec3 p, vec3 wd, float kmPerW) {
+    if (lesOn == 0) return 0.0;
+    vec3 lo, hi; lesBox(lo, hi);
+    if (any(lessThan(p, lo)) || any(greaterThan(p, hi))) return 0.0;
+    float tau = 0.0, sk = 4.0 * lesStepM / 1000.0;
+    vec3 pp = p;
+    for (int j = 0; j < 10; j++) {
+      pp += wd * (sk / kmPerW);
+      vec2 s = lesTornado(pp, 0);
+      tau += (s.x + s.y) * sk;
+      sk *= 1.35;
+    }
+    return tau;
   }`;
+
+  // The far cloud (setFar; game.js loadFar): two coarse volumes round the box out to the visibility, 0 the nearer and
+  // finer, 1 the wider and coarser, marched after the box's own march where the ray leaves the box's inner part
+  // (the box's cloud fades out over its sides as theirs fades in).  Each tier carries its own light (farLightSource:
+  // the codes, and the optical depth to the sun and to the sky, worked out when it comes).  The level of detail drops
+  // with the distance: the steps grow with it (1 % of it), the sub-grid warp stops past 250 km, and the wider,
+  // coarser grid takes over past the nearer's edge.
+  const FAR_GLSL = `
+  uniform sampler3D farT0, farT1; uniform ivec2 farHas; uniform vec4 farBox[2]; uniform vec2 farTop, farCell;
+  vec3 farU(vec3 p, int i) {
+    vec4 b = farBox[i];
+    return vec3((p.x - b.x) / (b.z - b.x), (p.y - b.y) / (b.w - b.y), p.z / farTop[i]);
+  }
+  float farEdge(vec3 u, float w) {
+    if (any(lessThan(u, vec3(0.0))) || any(greaterThan(u, vec3(1.0)))) return 0.0;
+    vec2 e = min(u.xy, 1.0 - u.xy) / w;
+    return clamp(min(e.x, e.y), 0.0, 1.0);
+  }
+  vec3 farWarp(vec3 k, float cell) {
+    vec3 q = k / (cell * 3.0);
+    return vec3(texture(noiseTex, q).rg, texture(noiseTex, q.zxy + 0.41).r) - 0.5;
+  }
+  // extinction per km (cloud, precipitation) of the far cloud at p, less the box's own share there (media() fades
+  // the box's sides over 3 %), and in lt its light (optical depth to the sun, to the sky: each tier's own light
+  // pass); warpK: the sub-grid warp, in cells
+  vec2 farMedia(vec3 p, float warpK, out vec2 lt) {
+    lt = vec2(0.0);
+    vec3 ub = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, 0.5);
+    float wb = p.z > size.z ? 0.0 : farEdge(ub, 0.03);
+    if (wb >= 0.999) return vec2(0.0);
+    vec3 k = p * toKm + kmOrigin;
+    vec4 c = vec4(0.0);
+    float w0 = 0.0;
+    if (farHas.x == 1) {
+      vec3 u = farU(p, 0);
+      w0 = farEdge(u, 0.08);
+      if (w0 > 0.0) {
+        if (warpK > 0.0) u += farWarp(k, farCell.x) * warpK / vec3(textureSize(farT0, 0));
+        c = textureLod(farT0, u, 0.0);
+      }
+    }
+    vec2 m = gkg(c.rg) * w0;
+    lt = c.ba;
+    if (farHas.y == 1 && w0 < 1.0) {
+      vec3 u = farU(p, 1);
+      float w1 = farEdge(u, 0.04);
+      if (w1 > 0.0) {
+        if (warpK > 0.0) u += farWarp(k, farCell.y) * warpK / vec3(textureSize(farT1, 0));
+        vec4 c1 = textureLod(farT1, u, 0.0);
+        m += gkg(c1.rg) * w1 * (1.0 - w0);
+        lt = w0 > 0.0 ? mix(c1.ba, c.ba, w0) : c1.ba;
+      }
+    }
+    return vec2(25.0 * m.x, rain * rainExt(m.y)) * density * (1.0 - wb);
+  }
+  vec3 farMarch(vec3 ro, vec3 rd, float tg, float jit, vec3 haze, vec3 amb, vec3 wd, float kmPerW, out float Tf) {
+    Tf = 1.0;
+    vec3 col = vec3(0.0);
+    if (farHas.x + farHas.y == 0) return col;
+    int o = farHas.y == 1 ? 1 : 0;
+    vec4 b = farBox[o];
+    vec3 t0 = (vec3(b.xy, 0.0) - ro) / rd, t1 = (vec3(b.zw, farTop[o]) - ro) / rd;
+    vec3 tmn = min(t0, t1), tmx = max(t0, t1);
+    float ta = max(max(tmn.x, tmn.y), max(tmn.z, 0.0)), tb = min(min(tmx.x, tmx.y), tmx.z);
+    // the box's inner part is its own cloud's alone: from where the ray leaves it
+    vec3 il = vec3(-size.x * 0.47, -size.y * 0.47, -1e3), ih = vec3(size.x * 0.47, size.y * 0.47, size.z);
+    if (all(greaterThan(ro, il)) && all(lessThan(ro, ih))) {
+      vec3 e = max((il - ro) / rd, (ih - ro) / rd);
+      ta = max(ta, min(min(e.x, e.y), e.z));
+    }
+    float kmPer = length(rd * toKm);
+    tb = min(min(tb, tg), 4.5 * hazeKm / kmPer);                // past this the haze has it all
+    if (tb <= ta) return col;
+    float cth = dot(rd, sunDir), cell = farHas.x == 1 ? farCell.x : farCell.y;
+    float t = ta + jit * clamp(ta * kmPer * 0.01, 0.3, 8.0) / kmPer;
+    for (int i = 0; i < 400; i++) {
+      if (t > tb || Tf < 0.01) break;
+      float dk = t * kmPer;
+      float sk = clamp(dk * 0.01, max(0.3, 0.35 * cell), 8.0);  // km: the step grows with the distance
+      vec3 p = ro + rd * t;
+      vec2 lt;
+      vec2 s = farMedia(p, dk < 250.0 ? 1.5 * detail : 0.0, lt);
+      float sg = sig(s);
+      if (sg <= 1e-3) { t += 2.0 * sk / kmPer; continue; }
+      float ts = lt.x, tu = lt.y;
+      float L = 0.0, aa = 1.0, bb = 1.0, cc = 1.0;
+      for (int q = 0; q < 3; q++) {
+        L += aa * exp(-bb * ts) * mix(hg(cth, 0.7 * cc), hg(cth, -0.25 * cc), 0.3);
+        aa *= 0.5; bb *= 0.4; cc *= 0.5;
+      }
+      float skyv = exp(-0.45 * tu);
+      float hgt = clamp(p.z / size.z * 2.0, 0.0, 1.0);
+      float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));
+      vec3 S = albedo * (SUN * max(sunDir.z, 0.0) * 1.1 * fdiff(ts) + amb * 0.9 * fdiff(tu) + SUN * L * 4.5 +
+                         amb * (0.18 + 0.42 * skyv) * (0.55 + 0.45 * hgt) * (0.45 + 0.55 * exp(-0.12 * ts)));
+      S = mix(S, haze * mix(0.5, 1.0, skyv), 1.0 - exp(-dk / hazeKm));
+      float al = 1.0 - exp(-sg * sk);
+      col += Tf * al * S;
+      Tf *= 1.0 - al;
+      t += sk / kmPer;
+    }
+    return col;
+  }
+`;
 
   // the 3-D view's cloud shader with a contrast control on the cloud alone (the ground and sky as they are):
   // dark bases darker, sunlit towers brighter, around a mid grey in log light
@@ -193,16 +623,81 @@ const Render = (() => {
     let src = L().FS_CLOUD;
     const head = 'in vec2 ndc; out vec4 frag;', tail = 'vec3 c = col + T * bg;';
     if (!src.includes(head) || !src.includes(tail)) return src;
-    src = src.replace(head, head + '\n  uniform float cloudContrast;\n  uniform int torN; uniform vec4 torA[4]; uniform vec4 torB[4]; uniform float uTime, funnelK;');
-    // the condensation funnels and debris clouds (funnelGLSL), added to the cloud wherever it is read
+    // geoWins: with the detailed map the geometry (the map, the cars on it) is never hidden by the model's coarser ground
+    src = src.replace(head, head + '\n  uniform float cloudContrast; uniform int geoWins;' + RAIN_GLSL);
+    // the cloud's detail carried with the air and turned round the vortices (VORTEX_GLSL): media() as volume.js's,
+    // its detail from flowK's coordinates
     const media = 'vec2 media(vec3 p, int mode) {', ret = '    return s;\n  }\n  float sig(vec2 s)';
+    const m0 = src.indexOf(media), m1 = src.indexOf('\n  float sig(vec2 s)');
+    if (m0 >= 0 && m1 > m0 && src.slice(m0, m1).includes('vec3 k = p * toKm + kmOrigin;')) {
+      src = src.slice(0, m0) + MEDIA_GLSL.trim() + src.slice(m1);
+    } else console.warn('chase: the cloud\'s media() not as expected; its detail stays put');
     if (!src.includes('float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));')) console.warn('chase: debris colour hook not found');
+    // the detailed map's pixels (distance stored negative): already lit as under a clear sky, taken wherever they
+    // are (the model's coarser ground would otherwise cut through them), then darkened by the cloud's shadow and
+    // the sky the cloud hides
+    const geoHooks = [
+      ['bool tree = false; vec4 ga = vec4(0.0);', 'bool tree = false; vec4 ga = vec4(0.0); bool prelit = false;'],
+      ['float tt = texture(geoT, su).r;', 'float tr = texture(geoT, su).r, tt = abs(tr);'],
+      ['if (tt > 0.0 && tt < tg) { tg = tt; tree = true; ga = texture(geoA, su); }',
+       'if (tt > 0.0 && (tt < tg || tr < 0.0 || geoWins == 1)) { tg = tt; tree = true; ga = texture(geoA, su); prelit = tr < 0.0; }'],
+      ['vec3 grd = alb * (SUN * sl * lit * 0.35 + amb * (0.10 + 0.30 * skyv) * (0.6 + 0.4 * n.z));',
+       'vec3 grd = alb * (SUN * sl * lit * 0.35 + amb * (0.10 + 0.30 * skyv) * (0.6 + 0.4 * n.z));\n' +
+       '      grd += alb * (SUN * max(sunDir.z, 0.0) * 0.35 * fdiff(lt.x) + amb * 0.3 * fdiff(lt.y));\n' +
+       '      if (prelit) grd = pow(ga.rgb, vec3(2.2)) * (0.68 * lit + 0.32 * (0.25 + 0.75 * skyv) + 0.7 * fdiff(lt.x));'],
+    ];
+    if (geoHooks.every(([a]) => src.includes(a))) for (const [a, b] of geoHooks) src = src.replace(a, b);
+    else console.warn('chase: geometry hooks not found; the detailed map is drawn as plain geometry');
+    // the light coming up off the ground
+    const sHook = 'vec3 S = albedo * (SUN * L * 4.5 + ';
+    // and the light diffused down through the cloud above (fdiff): the storm's base grey, not black
+    if (src.includes(sHook) && src.includes(media) && src.includes(ret)) {
+      src = src.replace(sHook, 'vec3 S = albedo * (bounceAt(p) + SUN * max(sunDir.z, 0.0) * 1.1 * fdiff(ts) + amb * 0.9 * fdiff(lt.y) + SUN * L * 4.5 + ');
+    } else console.warn('chase: ground bounce hook not found');
+    // the tornado model's volume: its hooks into the march (fine steps in its box, its own shadow)
+    const marchHooks = [
+      ['for (int i = 0; i < 900; i++) {', 'for (int i = 0; i < 2400; i++) {'],
+      ['if (sg <= 1e-3) { t += dt * 1.8; continue; }', 'if (sg <= 1e-3) { t += lesDt(p, rd, dt * 1.8, 2.5); continue; }'],
+      ['float ds = dt * kmPer;', 'float ds = lesDt(p, rd, dt, 1.0) * kmPer;'],
+      ['float ts = lt.x;', 'float ts = lt.x + lesSunTau(p, wd, kmPerW);'],
+      ['        t += dt;\n', '        t += lesDt(p, rd, dt, 1.0);\n'],
+    ];
+    const lesOk = src.includes(media) && src.includes(ret) && marchHooks.every(([a]) => src.includes(a));
+    if (!lesOk) console.warn('chase: tornado model hooks not found; its volume is off');
     if (src.includes(media) && src.includes(ret)) {
-      src = src.replace(media, FUNNEL_GLSL + '\n  ' + media);
-      src = src.replace(ret, '    if (torN > 0 && funnelK > 0.0) s += funnels(p) * density;\n' + ret);
+      src = src.replace(media, VORTEX_GLSL + (lesOk ? LES_GLSL : '') + '\n  ' + media);
+      src = src.replace(ret, '    gDebris = 0.0;\n' +
+        (lesOk ? '    if (lesOn > 0) { vec2 lt = lesTornado(p, mode); s += lt; gDebris += lt.y; }\n' : '') + ret);
+      if (lesOk) {
+        for (const [a, b] of marchHooks) src = src.replace(a, b);
+        // and the nests' resolution in the march (nestDt): the same step for the extinction and the advance; fine
+        // only in cloud (the funnel, the wall cloud), not through rain alone, which is smooth and would cost the
+        // most (every step lit)
+        src = src.split('lesDt(p, rd, dt * 1.8, 2.5)').join('lesDt(p, rd, nestDt(p, dt * 1.8, 3.0), 2.5)')
+                 .split('lesDt(p, rd, dt, 1.0)').join('lesDt(p, rd, nestDt(p, dt, s.x > 0.2 * sg ? 0.6 : 4.0), 1.0)');
+      }
     }
+    lesShader = lesOk;
+    // relief (four more reads of the cloud a step, a box cell apart) only on the coarser grids and where the step
+    // is mostly cloud: inside a fine nest its box-sized offsets mean nothing and it costs the most.  Faded in and
+    // out (rlf), not switched: a switch showed as a hard line at the nest's edge
+    const rHead = 'if (relief > 0.0) {', rMix = '0.6 * relief);';
+    if (src.includes(rHead) && src.includes(rMix)) {
+      src = src.replace(rHead, 'float rlf = relief * smoothstep(0.1, 0.2, gDkm) * smoothstep(0.15, 0.4, s.x / (sg + 1e-6));\n' +
+                        '          if (rlf > 0.0) {').replace(rMix, '0.6 * rlf);');
+    } else console.warn('chase: relief hook not found');
     src = src.replace('float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));',
                       'float albedo = mix(mix(0.98, 0.78, s.y / (sg + 1e-6)), 0.3, clamp(gDebris * density / (sg + 1e-6), 0.0, 1.0));');
+    // the far cloud (FAR_GLSL) behind the box's, in front of the ground and the sky
+    const mainHead = '  void main() {';
+    if (src.split(mainHead).length === 2) {
+      src = src.replace(mainHead, FAR_GLSL + mainHead);
+      src = src.replace(tail, `if (T > 0.01) {
+      float Tf; vec3 fc = farMarch(ro, rd, tg, jit, haze, amb, wd, kmPerW, Tf);
+      col += T * fc; T *= Tf;
+    }
+    ${tail}`);
+    } else console.warn('chase: no place for the far cloud in the cloud shader');
     src = src.replace(tail, `if (cloudContrast != 1.0 && T < 0.995) {
       vec3 Lc = col / (1.0 - T);
       float l = max(dot(Lc, vec3(0.2126, 0.7152, 0.0722)), 1e-4), piv = 0.55;
@@ -234,6 +729,152 @@ const Render = (() => {
       gl.texParameteri(target, k, v);
   };
 
+  // ---------------------------------------------------------------- blending volumes
+  // With the model's wind (warp 1) the blend carries the picture along it instead of fading: the start (a, model
+  // time sa s ago) read from where the air here was then, the newest (b, sb s from now) from where it will be, each
+  // by its own wind (wa, wb: 3 bytes a point, 0.5 m/s steps about 128).  Round a vortex (vor: centre now x, y m, peak
+  // wind m/s + counter-clockwise, its radius m; vorM: its motion m/s) the air is turned about the centre instead,
+  // at the vortex's own rate (Rankine), and the centre carried along its track: a straight step would smear a
+  // fast-turning funnel into a ring.  org, span: the grid's box (its corner and size, m east, north, up).
+  // A grid that moved between the two (a nest following its tornado: moved 1) has its start (a) in its old box (orgA,
+  // spanA): read there by world position, the newest alone where the old box did not reach.  sa, sb come from the
+  // blend's own fraction, which runs past 1 while the next volume is late (the newest carried on along its wind);
+  // f, the share of the newest, stops at 1.
+  const MIX_FS = `#version 300 es
+  precision highp float; precision highp sampler3D;
+  out vec4 frag;
+  uniform sampler3D a, b, wa, wb; uniform float f, sa, sb; uniform int layer, warp, moved;
+  uniform vec3 org, span, orgA, spanA; uniform int vorN; uniform vec4 vor[4], vorM[4];
+  vec3 wind(sampler3D t, vec3 uvw) { return (texture(t, uvw).rgb * 255.0 - 128.0) * 0.5; }
+  mat2 rot(float x) { float c = cos(x), s = sin(x); return mat2(c, s, -s, c); }
+  // how much the start (a) has to say at its point ua: all of it well inside its box, fading to nothing over its
+  // outer part (its sides and top; the ground is its floor): 15 % for a nest that moved, 2 % for the box -- a cut
+  // there showed as a hard straight line across the cloud wherever the storm had changed between the two volumes
+  float inA(vec3 ua) {
+    if (any(lessThan(ua, vec3(0.0))) || any(greaterThan(ua, vec3(1.0)))) return 0.0;
+    vec2 e = min(ua.xy, 1.0 - ua.xy);
+    return smoothstep(0.0, 1.0, clamp(min(min(e.x, e.y), 1.0 - ua.z) / (moved == 1 ? 0.15 : 0.02), 0.0, 1.0));
+  }
+  void main() {
+    ivec3 c = ivec3(ivec2(gl_FragCoord.xy), layer);
+    if (warp == 0 && moved == 0) { frag = mix(texelFetch(a, c, 0), texelFetch(b, c, 0), f); return; }
+    vec3 uvw = (vec3(c) + 0.5) / vec3(textureSize(b, 0));
+    vec3 pm = org + uvw * span;
+    vec3 pa = pm, pb = pm;
+    if (warp == 0) {
+      vec3 ua0 = (pa - orgA) / spanA;
+      frag = mix(texture(a, ua0), texture(b, uvw), mix(1.0, f, inA(ua0)));
+      return;
+    }
+    pa = pm - wind(wa, (pm - orgA) / spanA) * sa; pb = pm + wind(wb, uvw) * sb;
+    for (int i = 0; i < 4; i++) {
+      if (i >= vorN) break;
+      vec2 d = pm.xy - vor[i].xy;
+      float r = length(d), V = vor[i].z, R = vor[i].w;
+      float k = (1.0 - smoothstep(3.0 * R, 6.0 * R, r)) * (1.0 - smoothstep(3000.0, 5000.0, pm.z));
+      if (k <= 0.0) continue;
+      float om = r < R ? V / R : V * R / max(r * r, 1.0);
+      vec2 qa = vor[i].xy - vorM[i].xy * sa + rot(-om * sa) * d;
+      vec2 qb = vor[i].xy + vorM[i].xy * sb + rot(om * sb) * d;
+      pa.xy = mix(pa.xy, qa, k); pb.xy = mix(pb.xy, qb, k);
+    }
+    vec3 ua = (pa - orgA) / spanA;
+    frag = mix(texture(a, ua), texture(b, (pb - org) / span), mix(1.0, f, inA(ua)));
+  }`;
+  // The detailed map (worldlink.js), drawn by Three.js into its own target, into the geometry buffer: its colour as
+  // it is lit under a clear sky (the cloud pass then darkens it under the storm's shadow and its cloud above), its
+  // distance along each ray in box units, stored negative to say so, and the depth the cars are tested against.
+  const MERGE_FS = `#version 300 es
+  precision highp float;
+  in vec2 ndc;
+  uniform sampler2D wCol, wDep; uniform mat4 invVP, VP; uniform vec3 eye;
+  uniform float n, f, tanY, aspect, mToBox;
+  layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1;
+  void main() {
+    vec2 uv = gl_FragCoord.xy / vec2(textureSize(wDep, 0));
+    float d = texture(wDep, uv).r;
+    if (d >= 1.0) discard;
+    float vz = 2.0 * n * f / ((f + n) - (2.0 * d - 1.0) * (f - n));     // m along the view axis
+    vec2 q = uv * 2.0 - 1.0;
+    float dist = vz * length(vec3(q.x * tanY * aspect, q.y * tanY, 1.0)) * mToBox;
+    vec4 a = invVP * vec4(q, -1.0, 1.0), b = invVP * vec4(q, 1.0, 1.0);
+    vec3 p = eye + normalize(b.xyz / b.w - a.xyz / a.w) * dist;
+    vec4 c = VP * vec4(p, 1.0);
+    gl_FragDepth = clamp((c.z / c.w) * 0.5 + 0.5, 0.0, 1.0);
+    o0 = vec4(pow(max(texture(wCol, uv).rgb, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
+    o1 = vec4(-dist, 0.0, 0.0, 1.0);
+  }`;
+  // the down channel of chase mode's light volume: the cloud between a point and the ground (for the light the
+  // ground sends back up, bounceAt)
+  // (and the rain's extinction as the cloud pass's, rainExt)
+  function lightSource() {
+    const end = 'frag = vec4(ts, tu, 0.0, 1.0);', sig = 'float sig0(vec3 p) {', lin = '(25.0 * m.x + 1.2 * rain * m.y)';
+    let src = L().FS_LIGHT;
+    if (src.includes(sig) && src.includes(lin)) {
+      src = src.replace(sig, RAIN_GLSL + '\n  ' + sig).replace(lin, '(25.0 * m.x + rain * rainExt(m.y))');
+    } else console.warn('chase: light volume rain hook not found');
+    if (!src.includes(end)) { console.warn('chase: light volume hook not found; no ground bounce'); return src; }
+    return src.replace(end, `float td = 0.0, dzb = p.z / 8.0;
+    for (int j = 0; j < 8; j++) td += sig0(p - vec3(0.0, 0.0, (float(j) + 0.5) * dzb)) * dzb * toKm.z;
+    frag = vec4(ts, tu, td, 1.0);`);
+  }
+  // the far cloud's tiers: the cloud and rain (their codes) and their light (to the sun, to the sky) in one texture
+  function farLightSource() {
+    const end = 'frag = vec4(ts, tu, td, 1.0);', src = lightSource();
+    if (!src.includes(end)) throw new Error('chase: far cloud light hook not found');
+    return src.replace(end, 'frag = vec4(texture(vol, uvw).rg, ts, tu);');
+  }
+  // a 3-D texture of this size and format (re-allocated only when they change), optionally filled with data
+  function alloc3D(tex, ifmt, nx, ny, nz, fmt, type, data) {
+    const k = `${ifmt}/${nx}/${ny}/${nz}`;
+    gl.bindTexture(gl.TEXTURE_3D, tex);
+    if (data || tex._k !== k) {
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage3D(gl.TEXTURE_3D, 0, ifmt, nx, ny, nz, 0, fmt, type, data || null);
+      texParams(gl.TEXTURE_3D, gl.LINEAR, gl.CLAMP_TO_EDGE);
+      tex._k = k;
+    }
+  }
+  // dst = mix(a, b, f), layer by layer (all three the same size); w: { org, span (this grid's box, m), orgA, spanA
+  // (the start's, when the grid moved), warp: carried along the wind (wa, wb), fw: the blend's own fraction (past 1
+  // while the next volume is late) } -- the times and the vortices from mixSt
+  function mixInto(dst, a, b, f, nx, ny, nz, w) {
+    gl.disable(gl.BLEND);
+    gl.useProgram(mixProg); gl.bindVertexArray(vao);
+    const u = mixProg.u;
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, a); gl.uniform1i(u.a, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_3D, b); gl.uniform1i(u.b, 1);
+    gl.uniform1f(u.f, f);
+    gl.uniform1i(u.warp, w && w.warp ? 1 : 0);
+    gl.uniform1i(u.moved, w && w.moved ? 1 : 0);
+    if (w) {
+      gl.uniform3f(u.org, ...w.org); gl.uniform3f(u.span, ...w.span);
+      gl.uniform3f(u.orgA, ...(w.orgA || w.org)); gl.uniform3f(u.spanA, ...(w.spanA || w.span));
+    }
+    if (w && w.warp) {
+      gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_3D, w.wa); gl.uniform1i(u.wa, 2);
+      gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_3D, w.wb); gl.uniform1i(u.wb, 3);
+      const dtm = mixSt.tB - mixSt.tA, fw = w.fw === undefined ? f : w.fw;
+      gl.uniform1f(u.sa, fw * dtm); gl.uniform1f(u.sb, (1 - fw) * dtm);
+      const vs = (mixSt.vor || []).slice(0, 4), V = new Float32Array(16), M = new Float32Array(16);
+      vs.forEach((v, i) => {
+        const back = (1 - fw) * dtm;                   // the centre now: back from where it is at the newest volume
+        V.set([v.x - v.vx * back, v.y - v.vy * back, v.v, v.r], 4 * i); M.set([v.vx, v.vy, 0, 0], 4 * i);
+      });
+      gl.uniform1i(u.vorN, vs.length); gl.uniform4fv(u.vor, V); gl.uniform4fv(u.vorM, M);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, mixFbo);
+    gl.viewport(0, 0, nx, ny);
+    for (let k = 0; k < nz; k++) {
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, dst, 0, k);
+      gl.uniform1i(u.layer, k);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+  const sameBox = (p, q) => p && q && p.length === q.length && p.every((v, i) => Math.abs(v - q[i]) < 1e-6);
+  const sameGrid = (p, q) => p && q && p.nx === q.nx && p.ny === q.ny && p.nz === q.nz;
+
   function init(canvas) {
     cv = canvas;
     gl = cv.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
@@ -241,10 +882,14 @@ const Render = (() => {
     if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('this browser cannot render to float textures (EXT_color_buffer_float)');
     floatLinear = !!gl.getExtension('OES_texture_float_linear');
     cloudProg = program(L().VS, cloudSource());
-    lightProg = program(L().VS, L().FS_LIGHT);
+    lightProg = program(L().VS, lightSource());
+    try { farLightProg = program(L().VS, farLightSource()); } catch (e) { console.warn('chase far cloud:', e.message); }
+    mixProg = program(L().VS, MIX_FS);
+    mergeProg = program(L().VS, MERGE_FS);
     roadProg = program(ROAD_VS, ROAD_FS);
     meshProg = program(MESH_VS, MESH_FS);
     treeProg = program(TREE_VS, MESH_FS);
+    try { precipProg = program(PRECIP_VS, PRECIP_FS); } catch (e) { console.warn('chase rain and snow:', e.message); }
     trees.vao = gl.createVertexArray(); trees.mesh = gl.createBuffer(); trees.inst = gl.createBuffer();
     const tm = treeMesh();
     gl.bindVertexArray(trees.vao);
@@ -260,7 +905,11 @@ const Render = (() => {
     blds.vao = gl.createVertexArray(); blds.buf = gl.createBuffer();
     vao = gl.createVertexArray();
     volTex = gl.createTexture(); gndTex = gl.createTexture(); lightTex = gl.createTexture(); lightFbo = gl.createFramebuffer();
-    for (let i = 0; i < 4; i++) insTex.push(gl.createTexture());
+    volA = gl.createTexture(); volB = gl.createTexture(); lightA = gl.createTexture(); lightB = gl.createTexture();
+    mixFbo = gl.createFramebuffer();
+    for (let i = 0; i < 4; i++) { insTex.push(gl.createTexture()); insA.push(gl.createTexture()); insB.push(gl.createTexture()); }
+    windA = gl.createTexture(); windB = gl.createTexture();
+    for (let i = 0; i < 4; i++) { wInsA.push(gl.createTexture()); wInsB.push(gl.createTexture()); }
     noiseTex = L().makeNoise(gl);
     gb.fbo = gl.createFramebuffer(); gb.col = gl.createTexture(); gb.dist = gl.createTexture(); gb.depth = gl.createRenderbuffer();
     roads.buf = gl.createBuffer(); roads.vao = gl.createVertexArray();
@@ -270,14 +919,35 @@ const Render = (() => {
   }
 
   // ---------------------------------------------------------------- the volume
-  function setVolume(b, buf) {
+  // blendMs > 0: blend from what is shown now to this volume over that many ms (when it is the same box on the same
+  // grid; otherwise, and with 0, it replaces it at once)
+  function setVolume(b, buf, blendMs = 0) {
     const { header, data } = unpack(buf);
+    header.insets = (header.insets || []).slice(0, 4);
+    const two = header.channels === 2, ifmt = two ? gl.RG8 : gl.R8, fmt = two ? gl.RG : gl.RED;
+    const blend = blendMs > 0 && !!head && sameBox(box, b) && sameGrid(head, header) && head.channels === header.channels;
+    const oldIns = head ? head.insets || [] : [];
+    // the model time shown now (a blend under way: part way between its two) is the new blend's start
+    const tNow = shownT(), tNew = Number.isFinite(header.t) ? header.t : null, hadWind = hasWind;
+    if (blend) {
+      // the picture on the screen now becomes the blend's start, carried by the wind the newest volume had
+      [volA, volTex] = [volTex, volA];
+      [lightA, lightTex] = [lightTex, lightA];
+      for (let i = 0; i < 4; i++) [insA[i], insTex[i]] = [insTex[i], insA[i]];
+      [windA, windB] = [windB, windA];
+      for (let i = 0; i < 4; i++) [wInsA[i], wInsB[i]] = [wInsB[i], wInsA[i]];
+    }
     head = header; box = b; loadSeq++; volData = data;
-    const two = header.channels === 2;
-    gl.bindTexture(gl.TEXTURE_3D, volTex);
-    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-    gl.texImage3D(gl.TEXTURE_3D, 0, two ? gl.RG8 : gl.R8, header.nx, header.ny, header.nz, 0, two ? gl.RG : gl.RED, gl.UNSIGNED_BYTE, data);
-    texParams(gl.TEXTURE_3D, gl.LINEAR, gl.CLAMP_TO_EDGE);
+    alloc3D(volB, ifmt, header.nx, header.ny, header.nz, fmt, gl.UNSIGNED_BYTE, data);
+    alloc3D(volA, ifmt, header.nx, header.ny, header.nz, fmt, gl.UNSIGNED_BYTE, null);
+    alloc3D(volTex, ifmt, header.nx, header.ny, header.nz, fmt, gl.UNSIGNED_BYTE, null);
+    for (const t of [lightA, lightB, lightTex]) alloc3D(t, gl.RGBA16F, header.nx, header.ny, header.nz, gl.RGBA, gl.HALF_FLOAT, null);
+    hasWind = !!(header.wind && header.wind.dims);
+    if (tNew !== null && (mixSt.tB === null || !blend)) flowEpoch = flowEpoch || tNew;
+    const dtm = tNew !== null && tNow !== null ? tNew - tNow : 0;
+    const warp = blend && hasWind && hadWind && dtm > 0 && dtm < WARP_MAX;
+    Object.assign(mixSt, { t0: performance.now(), dur: blend ? blendMs : 0, f: blend ? 0 : 1, dirty: true, lightB: -1,
+                           tA: blend && tNow !== null ? tNow : tNew, tB: tNew, warp, vor: header.vortices || [] });
     gMap = null;
     if (header.ground) {
       const n = header.nx * header.ny, off = data.byteOffset + n * header.nz * header.channels;
@@ -289,16 +959,165 @@ const Render = (() => {
       texParams(gl.TEXTURE_2D, floatLinear ? gl.LINEAR : gl.NEAREST, gl.CLAMP_TO_EDGE);
     }
     let off = data.byteOffset + header.nx * header.ny * header.nz * header.channels + (header.ground ? 2 * header.nx * header.ny : 0);
-    header.insets = (header.insets || []).slice(0, 4);
     header.insets.forEach((ins, i) => {
       const n = ins.nx * ins.ny * ins.nz * header.channels;
-      gl.bindTexture(gl.TEXTURE_3D, insTex[i]);
-      gl.texImage3D(gl.TEXTURE_3D, 0, two ? gl.RG8 : gl.R8, ins.nx, ins.ny, ins.nz, 0, two ? gl.RG : gl.RED, gl.UNSIGNED_BYTE,
-                    new Uint8Array(data.buffer, off, n));
-      texParams(gl.TEXTURE_3D, gl.LINEAR, gl.CLAMP_TO_EDGE);
+      // a nest blends from where it was (a tornado's nest follows it: its box moves every volume), on the same grid
+      // and levels, unless it jumped more than half its width
+      const o = oldIns[i];
+      mixSt.insBlend[i] = blend && sameGrid(o, ins) && o.ztop === ins.ztop &&
+        Math.hypot(o.box[0] - ins.box[0], o.box[1] - ins.box[1]) < 0.5 * (ins.box[2] - ins.box[0]);
+      mixSt.insBoxA[i] = mixSt.insBlend[i] && !sameBox(o.box, ins.box) ? { box: o.box, ztop: o.ztop } : null;
+      alloc3D(insB[i], ifmt, ins.nx, ins.ny, ins.nz, fmt, gl.UNSIGNED_BYTE, new Uint8Array(data.buffer, off, n));
+      alloc3D(insA[i], ifmt, ins.nx, ins.ny, ins.nz, fmt, gl.UNSIGNED_BYTE, null);
+      alloc3D(insTex[i], ifmt, ins.nx, ins.ny, ins.nz, fmt, gl.UNSIGNED_BYTE, null);
       off += n;
     });
+    // then the wind: the box's, each nest's (RGB bytes at every second point)
+    if (hasWind) {
+      const put = (tex, d) => { const n = d[0] * d[1] * d[2] * 3; alloc3D(tex, gl.RGB8, d[0], d[1], d[2], gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array(data.buffer, off, n)); off += n; };
+      put(windB, header.wind.dims);
+      header.insets.forEach((ins, i) => {
+        const prev = oldIns[i];
+        if (ins.wind) put(wInsB[i], ins.wind);
+        mixSt.insWarp[i] = warp && mixSt.insBlend[i] && !!ins.wind && !!(prev && prev.wind) && prev.wind.join() === ins.wind.join();
+      });
+      mixSt.warp = warp && windA._k === windB._k;     // the same wind grid at both ends
+    } else mixSt.insWarp.fill(false);
     return header;
+  }
+
+  // the far cloud's tier i (0 the nearer, 1 the wider): a volume from volume.py extract (far=1), blended into over
+  // blendMs from the one shown (on the same grid; it may have moved); buf null: none
+  function setFar(i, buf, blendMs = 0) {
+    const s = farV[i];
+    if (!gl || !s || !farLightProg) return;
+    if (!buf) { s.head = null; return; }
+    const { header, data } = unpack(buf);
+    if (header.channels !== 2) return;
+    if (!s.tex) for (const k of ['tex', 'A', 'B', 'raw']) s[k] = gl.createTexture();
+    const blend = blendMs > 0 && !!s.head && sameGrid(s.head, header) && s.head.ztop === header.ztop;
+    if (blend) [s.A, s.tex] = [s.tex, s.A];
+    s.from = blend && !sameBox(s.head.box, header.box) ? { box: s.head.box, ztop: s.head.ztop } : null;
+    const { nx, ny, nz } = header;
+    alloc3D(s.raw, gl.RG8, nx, ny, nz, gl.RG, gl.UNSIGNED_BYTE, data.subarray(0, nx * ny * nz * 2));
+    for (const t of [s.A, s.B, s.tex]) alloc3D(t, gl.RGBA16F, nx, ny, nz, gl.RGBA, gl.HALF_FLOAT, null);
+    Object.assign(s, { head: header, key: '', t0: performance.now(), dur: blend ? blendMs : 0, f: blend ? 0 : 1, dirty: true });
+  }
+  // a tier's own units (as geometry()'s for the box: its longer side 2) for its light pass
+  function farGeom(h) {
+    const sx = (h.box[2] - h.box[0]) / 1000, sy = (h.box[3] - h.box[1]) / 1000, k = 2 / Math.max(sx, sy);
+    return { sx: sx * k, sy: sy * k, sz: h.ztop / 1000 * k, k };
+  }
+  function advanceFar(sun, dens, rain) {
+    const now = performance.now();
+    let lit = false;
+    for (const s of farV) {
+      if (!s.head) continue;
+      // the newest lit when it comes and when the sun (to about half a degree; at most every FAR_RELIGHT ms as it
+      // moves with the model's clock) or the sliders change -- one tier a frame, so two never land in one frame;
+      // the start of a blend keeps the light it had
+      const key = [...sun.map(v => v.toFixed(2)), dens, rain].join('/'), slidKey = `${dens}/${rain}`;
+      const due = s.key === '' || !s.key.endsWith(slidKey) || now - s.litAt > FAR_RELIGHT;
+      if (key !== s.key && due && !lit) {
+        lightInto(s.B, s.raw, farGeom(s.head), sun, dens, rain, s.head, farLightProg);
+        s.key = key; s.litAt = now; s.dirty = true; lit = true;
+      }
+      if (s.key === '') continue;                // its newest not lit yet (the other tier's turn): next frame
+      const f = s.dur > 0 ? Math.min(1, (now - s.t0) / s.dur) : 1;
+      if (!s.dirty && (f === s.f || now - s.at < FAR_MIX_EVERY)) continue;
+      const h = s.head, w = s.from ? warpOf(null, null, h.box, h.ztop, s.from, false, f) : null;
+      mixInto(s.tex, s.A, s.B, f, h.nx, h.ny, h.nz, w);
+      Object.assign(s, { f, at: now, dirty: false });
+    }
+  }
+
+  // the model time of the picture shown now (part way through a blend: between its two volumes), or null
+  function shownT() {
+    if (mixSt.tB === null) return null;
+    if (mixSt.tA === null) return mixSt.tB;
+    return mixSt.tA + blendFrac(performance.now()) * (mixSt.tB - mixSt.tA);
+  }
+  // the blend's own fraction now: 0 .. 1, on past 1 (to OVERRUN) when carried along the wind and the next is late
+  function blendFrac(now) {
+    if (!(mixSt.dur > 0)) return 1;
+    return Math.min(mixSt.warp ? OVERRUN : 1, (now - mixSt.t0) / mixSt.dur);
+  }
+  // the newest volume's vortices where they are now (back along their tracks from the newest volume's time)
+  function vortexNow() {
+    const t = shownT(), vs = (mixSt.vor || []).slice(0, 4);
+    if (t === null || mixSt.tB === null) return vs;
+    const back = mixSt.tB - t;
+    return vs.map(v => ({ ...v, x: v.x - v.vx * back, y: v.y - v.vy * back }));
+  }
+  // what the blend of one grid needs to carry it along the wind (MIX_FS): its wind at both ends and its box (m)
+  function warpOf(wa, wb, bx, ztop, from, warp, fw) {
+    const w = { wa, wb, warp, fw, org: [bx[0], bx[1], 0], span: [bx[2] - bx[0], bx[3] - bx[1], ztop] };
+    if (from) { w.moved = true; w.orgA = [from.box[0], from.box[1], 0]; w.spanA = [from.box[2] - from.box[0], from.box[3] - from.box[1], from.ztop]; }
+    return w;
+  }
+
+  // the tornado model's frame (lestornado.py / AtmosBridge.cs): header, media and wind bytes (RGBA8 each); blendMs > 0
+  // blends from what is shown into it over that long (same grids only).  h null: no tornado.
+  function setLes(h, media, vel, blendMs = 0) {
+    if (!gl || !lesShader) return;
+    if (!h) { lesHead = null; return; }
+    if (!lesM) {
+      lesM = gl.createTexture(); lesMA = gl.createTexture(); lesMB = gl.createTexture();
+      lesVt = gl.createTexture(); lesVA = gl.createTexture(); lesVB = gl.createTexture();
+    }
+    const [w, hh, d] = h.tex, [vw, vh, vd] = h.vtex;
+    const blend = blendMs > 0 && !!lesHead && lesHead.tex.join() === h.tex.join() && lesHead.vtex.join() === h.vtex.join();
+    if (blend) { [lesMA, lesM] = [lesM, lesMA]; [lesVA, lesVt] = [lesVt, lesVA]; }
+    alloc3D(lesMB, gl.RGBA8, w, hh, d, gl.RGBA, gl.UNSIGNED_BYTE, media);
+    alloc3D(lesVB, gl.RGBA8, vw, vh, vd, gl.RGBA, gl.UNSIGNED_BYTE, vel);
+    for (const t of [lesMA, lesM]) alloc3D(t, gl.RGBA8, w, hh, d, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    for (const t of [lesVA, lesVt]) alloc3D(t, gl.RGBA8, vw, vh, vd, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    Object.assign(lesSt, { t0: performance.now(), dur: blend ? blendMs : 0, f: blend ? 0 : 1, dirty: true });
+    lesHead = h;
+  }
+  function advanceLes() {
+    if (!lesHead) return;
+    const now = performance.now(), f = lesSt.dur > 0 ? Math.min(1, (now - lesSt.t0) / lesSt.dur) : 1;
+    if (!lesSt.dirty && (f === lesSt.f || (f < 1 && now - lesSt.at < MIX_EVERY))) return;
+    const [w, hh, d] = lesHead.tex, [vw, vh, vd] = lesHead.vtex;
+    mixInto(lesM, lesMA, lesMB, f, w, hh, d);
+    mixInto(lesVt, lesVA, lesVB, f, vw, vh, vd);
+    Object.assign(lesSt, { f, at: now, dirty: false });
+  }
+
+  // the blend now: the volume (and its nests) and their light mixed for this moment, at most every MIX_EVERY ms
+  function advance(G, sun, dens, rain) {
+    const now = performance.now();
+    // fw: the blend's own fraction (on past 1, carried along the wind, while the next volume is late); f: the newest's share
+    const fw = blendFrac(now), f = Math.min(1, fw);
+    const lit = buildLight(G, sun, dens, rain, f < 1);
+    // A blend pass over everything costs ~12 ms even on a fast GPU with a tornado's nests in the box (some ten
+    // million points, carried along the wind), far too much 30 times a second -- a laptop fell to 20 fps.  So the
+    // box (500 m cells: its cloud moves a few metres between passes) at most every MIX_MAIN ms, the nests (the
+    // tornado: faster, finer) every MIX_INS ms, never both in one frame; everything at once when a volume comes in
+    // or the light changed.
+    const all = mixSt.dirty || lit;
+    const mainDue = all || (fw !== mixSt.fMain && now - mixSt.atMain >= MIX_MAIN);
+    const insDue = all || (!mainDue && fw !== mixSt.fIns && now - mixSt.atIns >= MIX_INS);
+    if (!mainDue && !insDue) return;
+    if (mainDue) {
+      const { nx, ny, nz } = head;
+      // carried along the wind while blending, and on along the newest's wind past the end until the next comes in
+      const w = mixSt.warp ? warpOf(windA, windB, head.box, head.ztop, null, true, fw) : null;
+      mixInto(volTex, volA, volB, f, nx, ny, nz, w);
+      mixInto(lightTex, lightA, lightB, f, nx, ny, nz, w);
+      mixSt.fMain = fw; mixSt.atMain = now;
+    }
+    if (insDue) {
+      (head.insets || []).forEach((ins, i) => {
+        const fi = mixSt.insBlend[i] ? f : 1, from = mixSt.insBlend[i] ? mixSt.insBoxA[i] : null;
+        const wi = mixSt.insWarp[i] ? warpOf(wInsA[i], wInsB[i], ins.box, ins.ztop, from, true, mixSt.insBlend[i] ? fw : 1)
+          : from ? warpOf(null, null, ins.box, ins.ztop, from, false, fi) : null;
+        mixInto(insTex[i], insA[i], insB[i], fi, ins.nx, ins.ny, ins.nz, wi);
+      });
+      mixSt.fIns = fw; mixSt.atIns = now;
+    }
+    mixSt.f = fw; mixSt.at = now; mixSt.dirty = false;
   }
 
   // the ground's height (m above the model's zero) at world x, y m: bilinear, the same as the cloud pass reads it
@@ -353,16 +1172,31 @@ const Render = (() => {
     return [(p[0] / 1000 - cx) * G.k, (p[1] / 1000 - cy) * G.k, p[2] / 1000 * G.k];
   }
 
-  function buildLight(G, sun, dens, rain) {
-    const key = [head.nx, head.ny, head.nz, loadSeq, ...sun.map(v => v.toFixed(3)), dens, rain, G.sx, G.sy, G.sz].join('/');
-    if (key === lightKey) return true;
-    const nx = head.nx, ny = head.ny, nz = head.nz;
-    gl.bindTexture(gl.TEXTURE_3D, lightTex);
-    gl.texImage3D(gl.TEXTURE_3D, 0, gl.RG16F, nx, ny, nz, 0, gl.RG, gl.HALF_FLOAT, null);
-    texParams(gl.TEXTURE_3D, gl.LINEAR, gl.CLAMP_TO_EDGE);
-    gl.useProgram(lightProg); gl.bindVertexArray(vao);
-    const u = lightProg.u;
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, volTex); gl.uniform1i(u.vol, 0);
+  // the light volumes: the newest volume's (lightB) when it comes in, and both ends of a blend under way when the sun
+  // or the sliders change.  True when one was built (the blend's mix then runs again).
+  function buildLight(G, sun, dens, rain, blending) {
+    const key = [head.nx, head.ny, head.nz, ...sun.map(v => v.toFixed(3)), dens, rain, G.sx, G.sy, G.sz].join('/');
+    if (key !== lightKey) {
+      lightInto(lightB, volB, G, sun, dens, rain);
+      if (blending) lightInto(lightA, volA, G, sun, dens, rain);
+      lightKey = key; mixSt.lightB = loadSeq;
+      return true;
+    }
+    if (mixSt.lightB !== loadSeq) {
+      lightInto(lightB, volB, G, sun, dens, rain);
+      mixSt.lightB = loadSeq;
+      return true;
+    }
+    return false;
+  }
+  // dims: the grid (the box's); prog: lightProg, or farLightProg for a far tier
+  function lightInto(dst, src, G, sun, dens, rain, dims = head, prog = lightProg) {
+    const { nx, ny, nz } = dims;
+    alloc3D(dst, gl.RGBA16F, nx, ny, nz, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.disable(gl.BLEND);
+    gl.useProgram(prog); gl.bindVertexArray(vao);
+    const u = prog.u;
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_3D, src); gl.uniform1i(u.vol, 0);
     gl.uniform3f(u.size, G.sx, G.sy, G.sz);
     gl.uniform3f(u.toKm, 1 / G.k, 1 / G.k, 1 / G.k);
     gl.uniform3f(u.sunDir, ...sun);
@@ -371,13 +1205,11 @@ const Render = (() => {
     gl.bindFramebuffer(gl.FRAMEBUFFER, lightFbo);
     gl.viewport(0, 0, nx, ny);
     for (let k = 0; k < nz; k++) {
-      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, lightTex, 0, k);
+      gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, dst, 0, k);
       gl.uniform1f(u.layer, k);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    lightKey = key;
-    return true;
   }
 
   // ---------------------------------------------------------------- roads and cars
@@ -419,10 +1251,11 @@ const Render = (() => {
     return { vao: v, n: arr.length / 9 };
   }
   function carMeshes(kind, color) {
-    const key = `${kind}/${color.join(',')}`;
+    // (built again once the car's model has come in: carmesh.js)
+    const key = `${kind}/${color.join(',')}/${CarMesh.ready && CarMesh.ready(kind) ? 'model' : 'code'}`;
     if (!meshes.has(key)) {
       const m = CarMesh.build(CarPhys.SPECS[kind], kind, color);
-      meshes.set(key, { body: meshBuffer(m.body), wheel: meshBuffer(m.wheel) });
+      meshes.set(key, { body: meshBuffer(m.body), wheel: meshBuffer(m.wheel), wheelVis: m.wheelVis || null });
     }
     return meshes.get(key);
   }
@@ -457,14 +1290,43 @@ const Render = (() => {
     return new Float32Array([...x, ...l, ...z]);
   }
 
-  function drawGeometry(G, VP, eye, sun, cars, wet, showTrees) {
+  // where a wheel is drawn: the physics' wheel centre, or with a model car (vis: its wheels' places along and across
+  // the body, m from the centre of gravity) there, at the physics' suspension height
+  function wheelAt(c, w, vis) {
+    if (!vis) return w.c;
+    const M = c.M, d = [w.c[0] - c.p[0], w.c[1] - c.p[1], w.c[2] - c.p[2]];
+    const bx = d[0] * M[0][0] + d[1] * M[0][1] + d[2] * M[0][2], by = d[0] * M[1][0] + d[1] * M[1][1] + d[2] * M[1][2];
+    const bz = d[0] * M[2][0] + d[1] * M[2][1] + d[2] * M[2][2];
+    const x = bx > 0 ? vis.xf : vis.xr, y = by > 0 ? vis.half : -vis.half;
+    return [0, 1, 2].map(i => c.p[i] + M[0][i] * x + M[1][i] * y + M[2][i] * bz);
+  }
+
+  // the detailed map's picture (wimg: worldlink.js drawer's) into the geometry buffer, under the cars
+  function mergeWorld(wimg, G, VP, eye, fov) {
+    gl.useProgram(mergeProg); gl.bindVertexArray(vao);
+    const u = mergeProg.u;
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, wimg.color); gl.uniform1i(u.wCol, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, wimg.depth); gl.uniform1i(u.wDep, 1);
+    gl.uniformMatrix4fv(u.invVP, false, L().invert(VP)); gl.uniformMatrix4fv(u.VP, false, VP);
+    gl.uniform3f(u.eye, ...eye);
+    gl.uniform1f(u.n, wimg.near); gl.uniform1f(u.f, wimg.far);
+    gl.uniform1f(u.tanY, Math.tan(fov / 2)); gl.uniform1f(u.aspect, gb.w / gb.h);
+    gl.uniform1f(u.mToBox, (wimg.scale || 1) * G.k / 1000);
+    gl.depthFunc(gl.ALWAYS);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.depthFunc(gl.LESS);
+  }
+
+  function drawGeometry(G, VP, eye, sun, cars, wet, showTrees, wimg, fov) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, gb.fbo);
     gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.viewport(0, 0, gb.w, gb.h);
     gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]); gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, 0]); gl.clearBufferfv(gl.DEPTH, 0, [1]);
-    gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+    gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.depthMask(true);
     const s = G.k / 1000;
-    if (roads.n) {
+    // the detailed map in place of chase mode's own roads, trees and buildings
+    if (wimg && mergeProg) { mergeWorld(wimg, G, VP, eye, fov); showTrees = false; }
+    if (roads.n && !wimg) {
       gl.useProgram(roadProg);
       const u = roadProg.u;
       gl.uniformMatrix4fv(u.VP, false, VP);
@@ -495,7 +1357,7 @@ const Render = (() => {
     const u = meshProg.u;
     gl.uniformMatrix4fv(u.VP, false, VP);
     gl.uniform3f(u.eye, ...eye); gl.uniform3f(u.sunDir, ...sun); gl.uniform1f(u.s, s);
-    if (blds.n) {
+    if (blds.n && !wimg) {
       gl.uniformMatrix3fv(u.R, false, new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]));
       gl.uniform3f(u.org, ...toBox(G, [blds.origin[0], blds.origin[1], 0]));
       gl.bindVertexArray(blds.vao); gl.drawArrays(gl.TRIANGLES, 0, blds.n);
@@ -503,6 +1365,17 @@ const Render = (() => {
     gl.enable(gl.CULL_FACE);
     for (const c of cars) {
       if (c.hidden) continue;
+      if (c.parts) {
+        // a figure (walker.js): each part its own mesh, turned and placed
+        for (const pt of c.parts) {
+          let b = partBufs.get(pt.data);
+          if (!b) { b = meshBuffer(pt.data); partBufs.set(pt.data, b); }
+          gl.uniformMatrix3fv(u.R, false, mat3(pt.M));
+          gl.uniform3f(u.org, ...toBox(G, pt.p));
+          gl.bindVertexArray(b.vao); gl.drawArrays(gl.TRIANGLES, 0, b.n);
+        }
+        continue;
+      }
       const m = carMeshes(c.kind, c.color);
       gl.uniformMatrix3fv(u.R, false, mat3(c.M));
       gl.uniform3f(u.org, ...toBox(G, c.p));
@@ -510,7 +1383,7 @@ const Render = (() => {
       gl.bindVertexArray(m.wheel.vao);
       for (const w of c.wheels) {
         gl.uniformMatrix3fv(u.R, false, wheelMat(c.M, w.steer, -w.spin));
-        gl.uniform3f(u.org, ...toBox(G, w.c));
+        gl.uniform3f(u.org, ...toBox(G, wheelAt(c, w, m.wheelVis)));
         gl.drawArrays(gl.TRIANGLES, 0, m.wheel.n);
       }
     }
@@ -557,9 +1430,17 @@ const Render = (() => {
     const near = 0.4 * G.k / 1000, far = 40 * G.k;
     const VPr = L().mul(L().perspective(view.fov, W / H, near, far), V);
     const VPc = L().mul(L().perspective(view.fov, W / H, 0.001, 50), V);
+    // the detailed map (worldlink.js), drawn first by Three.js in this same context (it leaves the state reset)
+    let wimg = null;
+    if (view.world) {
+      try { wimg = view.world(W, H); } catch (e) { console.warn('chase: detailed map', e); wimg = null; }
+    }
     targets(W, H);
-    drawGeometry(G, VPr, eye, view.sun, cars, view.wet, view.trees !== false);
-    buildLight(G, view.sun, view.density, view.rain);
+    drawGeometry(G, VPr, eye, view.sun, cars, view.wet, view.trees !== false, wimg, view.fov);
+    advance(G, view.sun, view.density, view.rain);
+    if (view.far) advanceFar(view.sun, view.density, view.rain);
+    const les = lesHead && view.les ? view.les : null;
+    if (les) advanceLes();
     gl.viewport(0, 0, W, H);
     if (view.blend > 0) {
       gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, 1 - view.blend);
@@ -589,14 +1470,18 @@ const Render = (() => {
     gl.uniform1f(u.density, view.density); gl.uniform1f(u.rain, view.rain);
     gl.uniform1f(u.relief, view.relief);
     gl.uniform1f(u.cloudContrast, view.contrast || 1);
-    // the tornadoes' funnels: [{x, y (world m), R m, V m/s, base m above the ground, ground m}]
-    const tors = (view.tornadoes || []).slice(0, 4), TA = new Float32Array(16), TB = new Float32Array(16);
-    tors.forEach((t, i) => {
-      const b = toBox(G, [t.x, t.y, 0]);
-      TA.set([b[0], b[1], t.R, t.V], 4 * i); TB.set([t.base, t.ground, 0, 0], 4 * i);
-    });
-    gl.uniform1i(u.torN, tors.length); gl.uniform4fv(u.torA, TA); gl.uniform4fv(u.torB, TB);
-    gl.uniform1f(u.uTime, performance.now() / 1000 % 10000); gl.uniform1f(u.funnelK, view.funnel === undefined ? 2 : view.funnel);
+    gl.uniform1i(u.geoWins, wimg ? 1 : 0);
+    // the model's vortices where they are now, the storm's drift over the model's time, the spin in real time
+    const vs = vortexNow(), VA = new Float32Array(16);
+    vs.forEach((v, i) => { const b = toBox(G, [v.x, v.y, 0]); VA.set([b[0], b[1], v.v, v.r], 4 * i); });
+    gl.uniform1i(u.vorN, vs.length); gl.uniform4fv(u.vorA, VA);
+    const ft = shownT();
+    gl.uniform1f(u.flowT, ft === null ? 0 : ft - flowEpoch);
+    gl.uniform1f(u.spinT, performance.now() / 1000 % 3600);
+    const dr = (head && head.drift) || [0, 0];
+    gl.uniform2f(u.drift, dr[0], dr[1]);
+    gl.uniform1f(u.bounce, view.bounce === undefined ? 1 : view.bounce);
+    if (u.nestStep) gl.uniform1f(u.nestStep, view.nestStep === undefined ? 1 : view.nestStep);
     gl.uniform3f(u.texel, 1 / head.nx, 1 / head.ny, 1 / head.nz);
     // the nests
     const ins = head.insets || [], cx = (box[0] + box[2]) / 2, cy = (box[1] + box[3]) / 2;
@@ -607,6 +1492,21 @@ const Render = (() => {
     });
     for (let i = 0; i < 4; i++) { gl.activeTexture(gl.TEXTURE9 + i); gl.bindTexture(gl.TEXTURE_3D, i < ins.length ? insTex[i] : null); gl.uniform1i(u['ins' + i], 9 + i); }
     gl.uniform1i(u.insN, ins.length); gl.uniform4fv(u.insBox, B); gl.uniform1fv(u.insTop, T);
+    // the far cloud's tiers (units 1 and 15: the cloud pass has nothing else there)
+    if (u.farHas) {
+      const FB = new Float32Array(8), FT = [1, 1], FC = [1, 1], has = [0, 0];
+      farV.forEach((s, i) => {
+        const on = !!(view.far && s.head);
+        gl.activeTexture(i ? gl.TEXTURE15 : gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_3D, on ? s.tex : null);
+        gl.uniform1i(u['farT' + i], i ? 15 : 1);
+        if (!on) return;
+        const fb = s.head.box;
+        FB.set([(fb[0] / 1000 - cx) * G.k, (fb[1] / 1000 - cy) * G.k, (fb[2] / 1000 - cx) * G.k, (fb[3] / 1000 - cy) * G.k], 4 * i);
+        FT[i] = s.head.ztop / 1000 * G.k; FC[i] = (fb[2] - fb[0]) / 1000 / s.head.nx; has[i] = 1;
+      });
+      gl.uniform2i(u.farHas, has[0], has[1]); gl.uniform4fv(u.farBox, FB);
+      gl.uniform2f(u.farTop, FT[0], FT[1]); gl.uniform2f(u.farCell, FC[0], FC[1]);
+    }
     gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_3D, noiseTex); gl.uniform1i(u.noiseTex, 4);
     gl.uniform1f(u.detail, view.detail);
     gl.uniform1f(u.detailKm, Math.max(0.05, (box[2] - box[0]) / head.nx));
@@ -619,9 +1519,51 @@ const Render = (() => {
     gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, gb.col); gl.uniform1i(u.geoA, 6);
     gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, gb.dist); gl.uniform1i(u.geoT, 7);
     gl.uniform1i(u.hasGeo, 1);
+    // the tornado model's volume, standing on the ground at the vortex
+    gl.uniform1i(u.lesOn, les ? 1 : 0);
+    if (les) {
+      const h = lesHead, k = h.look || {};
+      gl.activeTexture(gl.TEXTURE13); gl.bindTexture(gl.TEXTURE_3D, lesM); gl.uniform1i(u.lesM, 13);
+      gl.activeTexture(gl.TEXTURE14); gl.bindTexture(gl.TEXTURE_3D, lesVt); gl.uniform1i(u.lesV, 14);
+      gl.uniform3f(u.lesC, ...toBox(G, [les.x, les.y, les.ground]));
+      gl.uniform3f(u.lesSize, h.size[0], h.size[1], h.size[2]);
+      gl.uniform1f(u.lesStepM, Math.max(0.5, Math.min(h.size[0] / h.tex[0], h.size[1] / h.tex[1], h.size[2] / h.tex[2]) / 3));
+      gl.uniform1f(u.lesTime, performance.now() / 1000 % 3600);
+      gl.uniform1f(u.lesTubes, view.lesTubes ? 1 : 0);
+      gl.uniform4f(u.lesCode, h.condMin, h.condMax, h.dustMax, h.velMax);
+      const W3 = k.detailWind || [0, 0, 0];
+      gl.uniform3f(u.lesWind, W3[0], W3[1], W3[2]);
+      const set = (n, v, d) => gl.uniform1f(u[n], v === undefined ? d : v);
+      set('lesCloud', k.cloudDensity, 0.08); set('lesDust', k.dustDensity, 0.045); set('lesSharp', k.edgeSharpness, 2);
+      set('lesThr', k.condensationThreshold, 0); set('lesStri', k.striation, 1); set('lesStriScale', k.striationScale, 14);
+      set('lesStriStretch', k.striationStretch, 6); set('lesEro', k.erosion, 0.3); set('lesEroScale', k.erosionScale, 32);
+      set('lesDustEro', k.dustErosion, 0.6); set('lesDustScale', k.dustScale, 28); set('lesDustClumps', k.dustClumps, 0.8);
+      set('lesDustGrain', k.dustGrain, 0.15); set('lesDustStreaks', k.dustStreaks, 0.05); set('lesShroud', k.shroud, 0);
+      set('lesShroudW', k.shroudWidth, 0.7);
+    }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    drawPrecip(view, G, VPr, eye, W, H);
     gl.disable(gl.BLEND);
     return { G, VP: VPc, W, H };
+  }
+
+  // the rain and snow round the eye, over the finished picture.  view.precip: { n drops / flakes, snow (their
+  // share that are flakes), cube m, minD m (none closer: inside the car), wind [u, v] m/s, camV m/s, col }
+  function drawPrecip(view, G, VP, eye, W, H) {
+    const pr = view.precip;
+    if (!precipProg || !pr || pr.n < 1) return;
+    const p = precipProg, u = p.u;
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(p); gl.bindVertexArray(vao);
+    gl.uniformMatrix4fv(u.VP, false, VP);
+    gl.uniform3f(u.eye, ...eye); gl.uniform1f(u.s, G.k / 1000);
+    gl.uniform1f(u.t, performance.now() / 1000 % 600);
+    gl.uniform1f(u.cube, pr.cube); gl.uniform1f(u.snow, pr.snow); gl.uniform1f(u.minD, pr.minD);
+    gl.uniform1f(u.expo, pr.expo || 0.03); gl.uniform1f(u.focal, H * 0.5 / Math.tan(view.fov / 2));
+    gl.uniform3f(u.camV, ...pr.camV); gl.uniform3f(u.wind, pr.wind[0], pr.wind[1], 0);
+    gl.uniform2f(u.res, W, H); gl.uniform3f(u.col, ...pr.col);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, gb.dist); gl.uniform1i(u.geoT, 7);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, Math.min(40000, Math.round(pr.n)));
   }
 
   // a world point (m) on the screen (CSS px of the canvas), or null behind the camera
@@ -632,6 +1574,22 @@ const Render = (() => {
     return [(o[0] / o[3] * 0.5 + 0.5) * cv.clientWidth, (1 - (o[1] / o[3] * 0.5 + 0.5)) * cv.clientHeight];
   }
 
-  return { init, setVolume, setRoads, setTrees, setBuildings, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
+  // how the picture is moving now (the HUD, testing): carried along the wind or fading, the model times, the vortices
+  const motion = () => ({ warp: mixSt.warp, wind: hasWind, f: mixSt.f, tA: mixSt.tA, tB: mixSt.tB, shown: shownT(),
+                          vortices: vortexNow(), insWarp: mixSt.insWarp.slice() });
+  // (testing) one level of the shown volume ('vol') or nest i ('ins'), its first channel, after the blend's next step
+  function _peek(which, i, k) {
+    const t = which === 'vol' ? volTex : insTex[i], h = which === 'vol' ? head : head.insets[i];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, mixFbo);
+    gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, t, 0, k);
+    const px = new Uint8Array(h.nx * h.ny * 4);
+    gl.readPixels(0, 0, h.nx, h.ny, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    const out = new Uint8Array(h.nx * h.ny);
+    for (let j = 0; j < out.length; j++) out[j] = px[4 * j];
+    return { nx: h.nx, ny: h.ny, data: out };
+  }
+  return { init, setVolume, setFar, farInfo: () => farV.map(s => s.head && { box: s.head.box, nx: s.head.nx, ny: s.head.ny, nz: s.head.nz }), setLes,lesReady: () => lesShader, blending: () => mixSt.f < 1, motion, _gb: () => gb, _peek,
+           _step: () => { mixSt.dirty = true; advance(geometry(), [0.5, 0.3, 0.81], 1, 1); }, setRoads, setTrees, setBuildings, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
 })();
 window.Render = Render;

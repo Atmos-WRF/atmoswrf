@@ -44,10 +44,16 @@ log = logging.getLogger(__name__)
 WIDTH = 5                    # spec_bdy_width of the nest's tables (spec_zone 1 + relax_zone 4)
 REPLACE_FRAC = 0.15          # re-placed when where its storm is heading is this far (x its side) off its centre
 PLACE_EVERY = 60.0           # s of model time between placement checks
-# a nest goes where its storm will be LEAD s later (the track's motion), not where it is: re-placed only every few
-# minutes, a nest centred on the updraft had it on its downstream side most of the time, its forward flank and
-# anvil cut by the edge, and its inflow, RFD and mesocyclone (behind and right of the updraft) crowded by it
-LEAD = 240.0
+# A nest is centred on its storm's strongest near-ground rotation (vertical vorticity on the lowest levels, a ~1 km
+# mean, within FOCUS_R of the storm's updraft: Rotation(low=True).peak_near) -- its low-level mesocyclone, its
+# tornadoes -- or, without any (FOCUS_ZETA), on the updraft; FOCUS_LEAD s of the storm's motion ahead of that, about
+# half the time between re-placements, so it is centred on average.  A nest put by hand goes just where it was put.
+# (It used to go 240 s ahead of the updraft, 5 km at 20 m/s, so a nest put on a tornado, which sits behind and right
+# of the updraft, went into the inflow and kept running from the rotation; the 0-3 km updraft helicity is no better
+# a target: it is rotation x updraft, its maximum in the rotating updraft, on the inflow side.)
+FOCUS_R = 12000.0            # m round a storm's updraft its near-ground rotation is looked for
+FOCUS_ZETA = 0.004           # 1/s (that mean): rotation worth centring on
+FOCUS_LEAD = 120.0           # s
 ROT_UH = 150.0               # m2/s2 of 0-3 km UH: a storm rotating this hard ranks 2 x its updraft (Rotation.score)
 SWAP_RANK = 1.6              # x: a storm this much higher ranked than an auto nest's (placed SWAP_AFTER ago) takes it
 SWAP_AFTER = 900.0
@@ -596,11 +602,20 @@ class Nests:
                 return self, n
         return self.inner.find(nid) if self.inner else None
 
-    def _aim(self, tr) -> tuple[float, float]:
-        """Where a nest on track ``tr`` is centred: LEAD s ahead of its updraft."""
+    def _rotation(self) -> "Rotation":
+        """The near-ground rotation of this level's parents (what nests are centred on)."""
+        return Rotation(self._parents(), low=True)
+
+    def _aim(self, tr, low: "Rotation | None" = None) -> tuple[float, float]:
+        """Where a nest on track ``tr`` is centred: the strongest near-ground rotation within FOCUS_R of its updraft
+        (at least FOCUS_ZETA: its low-level mesocyclone, its tornado), else its updraft -- FOCUS_LEAD s of its
+        motion ahead.  ``low``: a near-ground Rotation already made."""
         _, x, y, _ = tr.last
         vx, vy = tr.velocity(getattr(self.engine.env, "storm_motion", None) or (0.0, 0.0))
-        return x + vx * LEAD, y + vy * LEAD
+        pk = (low or self._rotation()).peak_near(x, y, FOCUS_R)
+        if pk is not None and pk[2] >= FOCUS_ZETA:
+            x, y = pk[0], pk[1]
+        return x + vx * FOCUS_LEAD, y + vy * FOCUS_LEAD
 
     def move(self, nid: int, x: float, y: float) -> bool:
         """Nest ``nid`` moved by hand to ground point (x, y).  An outer nest dropped on a storm takes it (it
@@ -616,7 +631,7 @@ class Nests:
             tr = eng.tracks.nearest(x, y, eng.t, within=15000.0)
             if tr is not None:
                 n.track_id, n.lost_since = tr.id, None
-                x, y = lv._aim(tr)
+            # it goes just where it was put (it follows its storm's near-ground rotation from the next check)
         moved = lv.place(lv._parent_rect_at(x, y), n.track_id, old=n)
         if moved is None:
             eng.note("nest", f"nest {nid} cannot go there: it has to sit inside a patch (or its outer nest)")
@@ -636,8 +651,7 @@ class Nests:
         if tr is not None and any(n.track_id == tr.id for n in self._followers()):
             eng.note("nest", f"storm {tr.id} has a nest already")
             return False
-        ax, ay = self._aim(tr) if tr is not None else (x, y)
-        n = self.place(self._parent_rect_at(ax, ay), tr.id if tr is not None else None, why=" (added by hand)")
+        n = self.place(self._parent_rect_at(x, y), tr.id if tr is not None else None, why=" (added by hand)")
         if n is None:
             eng.note("nest", "no nest there: it has to sit inside a patch, with room for its whole box")
             return False
@@ -695,11 +709,16 @@ class Nests:
                     if eng.t - n.lost_since >= LOST_AFTER:
                         self.drop(n, "its mesocyclone weakened")
                 continue
+            # a mesocyclone (its UH03) means an inner nest; it goes on the strongest near-ground rotation within
+            # 8 km of it (the UH peak is in the rotating updraft, on the inflow side of the tornado)
             x, y, _ = got
+            lp = Rotation([outer.patch], low=True).peak_near(x, y, 8000.0)
+            if lp is not None and lp[2] >= FOCUS_ZETA:
+                x, y = lp[0], lp[1]
             tr = eng.tracks.resolve(outer.track_id)
             if tr is not None:                     # half the outer nest's lead: re-placed twice as often
                 vx, vy = tr.velocity(getattr(eng.env, "storm_motion", None) or (0.0, 0.0))
-                x, y = x + 0.5 * vx * LEAD, y + 0.5 * vy * LEAD
+                x, y = x + 0.5 * vx * FOCUS_LEAD, y + 0.5 * vy * FOCUS_LEAD
             if n is None:
                 if len(self._auto()) < self.max_nests:
                     self.place(self._parent_rect_at(x, y), outer.id)
@@ -729,6 +748,7 @@ class Nests:
                 live[tr.id] = tr
         rot = Rotation(eng.patches)
         rank = {tid: rot.score(tr.strength(), tr.last[1], tr.last[2]) for tid, tr in live.items()}
+        low = Rotation(eng.patches, low=True)      # where the nests are centred (_aim)
         side = self._side_cells() * eng.env.grid.dx
 
         def centre(m):
@@ -747,7 +767,7 @@ class Nests:
                     not any(m.track_id == near.id for m in self._followers() if m is not n) else None
             if tr is not None:
                 n.track_id, n.lost_since, n.rank = tr.id, None, rank.get(tr.id, 0.0)
-                ax, ay = self._aim(tr)
+                ax, ay = self._aim(tr, low)
                 cx, cy = centre(n)
                 if math.hypot(ax - cx, ay - cy) > REPLACE_FRAC * side:
                     self.place(self._parent_rect_at(ax, ay), tr.id, old=n)
@@ -770,7 +790,7 @@ class Nests:
                 if weak is None or rank[tr.id] < SWAP_RANK * max(weak.rank, 1e-6):
                     break
                 self.drop(weak, f"storm {tr.id} rotates harder (rank {rank[tr.id]:.0f} over {weak.rank:.0f})")
-            ax, ay = self._aim(tr)
+            ax, ay = self._aim(tr, low)
             n = self.place(self._parent_rect_at(ax, ay), tr.id)
             if n is not None:
                 n.rank = rank[tr.id]
@@ -1112,17 +1132,31 @@ def uh03_map(patch):
     return (w * zeta * dz).sum(axis=0)
 
 
-class Rotation:
-    """The 0-3 km updraft helicity of a set of patches, made once (on the host, max-pooled to ~2 km so a
-    lookup is a slice): how strongly the storm at a point rotates, for ranking storms (a supercell's or a
-    QLCS's low-level mesocyclone over a stronger but plain updraft)."""
+def low_zeta_map(patch):
+    """A patch's near-ground rotation: vertical vorticity on its lowest two levels, a ~1 km mean, 1/s per cell."""
+    import cupy as cp
+    from cupyx.scipy import ndimage as cnd
+    st, dx = patch.state, patch.env.grid.dx
+    uc = 0.5 * (st.u[:2, :, 1:] + st.u[:2, :, :-1])
+    vc = 0.5 * (st.v[:2, 1:, :] + st.v[:2, :-1, :])
+    z = (cp.gradient(vc, dx, axis=2) - cp.gradient(uc, dx, axis=1)).mean(axis=0)
+    return cnd.uniform_filter(z, max(3, int(round(1000.0 / dx))) | 1, mode="nearest")
 
-    def __init__(self, patches):
+
+class Rotation:
+    """The 0-3 km updraft helicity of a set of patches (``low``: their near-ground vorticity, low_zeta_map), made
+    once (on the host, max-pooled to ~2 km so a lookup is a slice): how strongly the storm at a point rotates, for
+    ranking storms (a supercell's or a QLCS's low-level mesocyclone over a stronger but plain updraft); the
+    near-ground one is where a nest is centred (Nests._aim: UH peaks in the updraft, on the inflow side)."""
+
+    def __init__(self, patches, low: bool = False):
         import cupy as cp
         self.maps = []
         for p in patches:
+            if getattr(p, "state", None) is None:
+                continue
             try:
-                uh = uh03_map(p)
+                uh = low_zeta_map(p) if low else uh03_map(p)
             except Exception:
                 continue
             dx = p.env.grid.dx
@@ -1143,6 +1177,23 @@ class Rotation:
             i1, j1 = min(i1, a.shape[1]), min(j1, a.shape[0])
             if i1 > i0 and j1 > j0:
                 best = max(best, float(a[j0:j1, i0:i1].max()))
+        return best
+
+    def peak_near(self, x: float, y: float, r: float):
+        """(x, y, UH) of the largest UH03 within ``r`` m of ground point (x, y) -- the centre of its ~2 km pooled
+        cell -- or None outside every patch."""
+        best = None
+        for x0, y0, d, a in self.maps:
+            i0, i1 = max(int((x - r - x0) // d), 0), min(int((x + r - x0) // d) + 1, a.shape[1])
+            j0, j1 = max(int((y - r - y0) // d), 0), min(int((y + r - y0) // d) + 1, a.shape[0])
+            if i1 <= i0 or j1 <= j0:
+                continue
+            sub = a[j0:j1, i0:i1]
+            k = int(np.argmax(sub))
+            j, i = divmod(k, sub.shape[1])
+            val = float(sub[j, i])
+            if best is None or val > best[2]:
+                best = (x0 + (i0 + i + 0.5) * d, y0 + (j0 + j + 0.5) * d, val)
         return best
 
     def score(self, w: float, x: float, y: float) -> float:

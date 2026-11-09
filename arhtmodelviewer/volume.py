@@ -27,6 +27,18 @@ LIVE_NZ = 96                     # the tornado view's levels, ground to its top
 # (INSET_SIDE points a side at most), so a tornado zoom's 55 m grid is not smeared onto the box's ~500 m one
 INSET_MAX = 4
 INSET_SIDE = 160
+# chase mode's moving clouds (extract(..., wind=True)): the ground-relative wind on every WIND_STRIDE-th point of the
+# box and of each inset, three bytes a point (east, north, up: clip(rint(m/s * WIND_SCALE + 128), 1, 255); 128 is calm
+# and "no data"), so the page can carry the cloud along the wind between two volumes instead of fading one into the next
+WIND_STRIDE = 2
+WIND_SCALE = 2.0                 # 0.5 m/s steps, +-63.5 m/s
+# and the tornadoes in the box, each as a vortex the page turns the cloud round: its centre now, its motion and the
+# model's own azimuthal-mean tangential wind about it (VORTEX_RADII radii out to VORTEX_REACH m, averaged from
+# VORTEX_LOW to VORTEX_TOP m above the ground), from which its peak and the radius of that peak
+VORTEX_REACH = 2000.0
+VORTEX_RADII = 80
+VORTEX_LOW, VORTEX_TOP = 100.0, 1500.0
+VORTEX_MIN = 12.0                # m/s: weaker than this, no vortex
 
 
 def levels_for(dx: float) -> tuple:
@@ -39,6 +51,13 @@ def levels_for(dx: float) -> tuple:
     return 5000.0, 112
 CLOUD_SPECIES = ("qc", "qi", "qs")       # what the cloud is made of; the rest falls out of it
 PRECIP_SPECIES = ("qr", "qg", "qh")
+
+
+def _live_patch(patches, pid):
+    """Patch ``pid`` of ``patches`` if it has a state to read now, else None (the radar fields alone): a nest being
+    re-placed has none for a moment, and a volume asked for then failed ('NoneType' object has no attribute 'p')."""
+    p = (patches or {}).get(pid)
+    return p if p is not None and getattr(p, "state", None) is not None else None
 
 
 def _species(patch, names):
@@ -82,6 +101,9 @@ def _sample(f, name: str, X, Y, zv, patch=None):
             a = _near_saturation(patch, (0, ny_, 0, nx_), a)
         if a is None:
             return None
+    elif name in ("wu", "wv", "ww"):
+        # the wind, ground-relative: the patch's state now (the cloud's own moment), else the radar fields'
+        a = _wind(patch, name) if patch is not None else {"wu": f.uc, "wv": f.vc, "ww": f.wc}[name]
     else:
         a = cp.gradient(f.vc, f.dx, axis=2) - cp.gradient(f.uc, f.dx, axis=1)
     zh = np.asarray(cp.asnumpy(f.z_h) if hasattr(f.z_h, "device") else f.z_h, np.float64)
@@ -108,15 +130,91 @@ def _sample(f, name: str, X, Y, zv, patch=None):
     return cp.where(ok, v, cp.nan)
 
 
+def _wind(patch, name):
+    """The patch's ground-relative wind now on its mass points: "wu" east, "wv" north (+ the grid's motion), "ww" up."""
+    st = patch.state
+    if name == "ww":
+        return 0.5 * (st.w[:-1] + st.w[1:])
+    mx, my = patch.env.motion
+    if name == "wu":
+        return 0.5 * (st.u[:, :, :-1] + st.u[:, :, 1:]) + mx
+    return 0.5 * (st.v[:, :-1, :] + st.v[:, 1:, :]) + my
+
+
+def _wind_codes(fields, patches, box, nx, ny, ztop, nz):
+    """The wind (WIND_STRIDE) under a grid of nx, ny, nz points over box to ztop: (bytes, [nx, ny, nz]) of the coarser
+    grid, the finest field holding each point (a coarse grid's wind would smear a nest's vortex), calm elsewhere."""
+    import cupy as cp
+    x0, y0, x1, y1 = box
+    wx, wy, wz = (max(2, int(math.ceil(n / WIND_STRIDE))) for n in (nx, ny, nz))
+    xs = x0 + (np.arange(wx) + 0.5) * (x1 - x0) / wx
+    ys = y0 + (np.arange(wy) + 0.5) * (y1 - y0) / wy
+    X, Y = np.meshgrid(xs, ys)
+    zv = (np.arange(wz) + 0.5) * ztop / wz
+    best = [cp.full((wz, wy, wx), cp.nan, cp.float32) for _ in range(3)]
+    for f in sorted(fields, key=lambda f: -f.dx):                  # coarse first: the finer ones overwrite
+        if f.x0 > x1 or f.x0 + f.nx * f.dx < x0 or f.y0 > y1 or f.y0 + f.ny * f.dx < y0:
+            continue
+        p = _live_patch(patches, f.patch_id)
+        for c, ch in enumerate(("wu", "wv", "ww")):
+            v = _sample(f, ch, X, Y, zv, p)
+            if v is not None:
+                best[c] = cp.where(cp.isnan(v), best[c], v)
+    codes = [cp.where(cp.isnan(b), 128, cp.clip(cp.rint(b * WIND_SCALE + 128.0), 1, 255)).astype(cp.uint8) for b in best]
+    return cp.asnumpy(cp.stack(codes, axis=-1)).tobytes(), [wx, wy, wz]
+
+
+def vortices(fields: dict, patches: dict | None, tors) -> list:
+    """The tornadoes ``tors`` [(id, x m, y m, vx, vy m/s)] as vortices: each one's peak azimuthal-mean tangential wind
+    (m/s, + counter-clockwise) and its radius (m), from the finest grid holding it; the weak ones left out."""
+    import cupy as cp
+    out = []
+    na = 16
+    th = np.arange(na) * (2.0 * math.pi / na)
+    for tid, x, y, vx, vy in tors:
+        hold = [f for f in fields.values() if f.x0 < x < f.x0 + f.nx * f.dx and f.y0 < y < f.y0 + f.ny * f.dx]
+        if not hold:
+            continue
+        f = min(hold, key=lambda f: f.dx)
+        p = _live_patch(patches, f.patch_id)
+        rr = np.linspace(0.5 * f.dx, VORTEX_REACH, VORTEX_RADII)
+        X, Y = x + rr[:, None] * np.cos(th), y + rr[:, None] * np.sin(th)          # (radii, azimuths)
+        g = ground(f, np.array([[x]]), np.array([[y]])) if getattr(f, "hgt", None) is not None else None
+        g0 = 0.0 if g is None or bool(cp.isnan(g).any()) else float(g[0, 0])
+        zv = g0 + np.linspace(VORTEX_LOW, VORTEX_TOP, 8)
+        u, v = _sample(f, "wu", X, Y, zv, p), _sample(f, "wv", X, Y, zv, p)
+        if u is None or v is None:
+            continue
+        s, c = cp.asarray(np.sin(th), cp.float32), cp.asarray(np.cos(th), cp.float32)
+        vt = cp.asnumpy(cp.nanmean(v * c - u * s, axis=(0, 2)))                   # (radii,)
+        if not np.isfinite(vt).any():
+            continue
+        i = int(np.nanargmax(np.abs(vt)))
+        if abs(vt[i]) < VORTEX_MIN:
+            continue
+        out.append({"id": tid, "x": round(float(x), 1), "y": round(float(y), 1), "vx": round(float(vx), 2),
+                    "vy": round(float(vy), 2), "v": round(float(vt[i]), 1), "r": round(max(float(rr[i]), 1.5 * f.dx), 1),
+                    "dx": f.dx})
+    return out
+
+
 HAZE_RH = 0.95                   # the tornado view: relative humidity where air starts to look like cloud
 HAZE_GKG = 0.25                  # g/kg of "cloud" it shows as at saturation
+# A 30-50 m nest still under-resolves a tornado's core: its peak winds, and so its pressure drop (~V^2), come out
+# lower than the real vortex's, and the air drawn into it is not expanded and cooled enough to condense.  The
+# vortex's own drop -- the pressure below the mean of its surroundings VORTEX_M across, so the mesocyclone, the
+# cloud base and the rest of the storm are left as they are -- counts (1 + VORTEX_GAIN) x for the condensation.
+VORTEX_GAIN = 0.5
+VORTEX_M = 600.0                 # m: the surroundings a tornado's drop is measured against
 
 
 def _near_saturation(patch, win, cloud):
     """The tornado view's cloud plus the air that is nearly saturated: a vortex's pressure drop cools the air
     it draws in toward saturation, which is how a real funnel and wall cloud condense below the storm's base.
     The model only condenses at 100 %, and a ~100 m grid's vortex rarely gets there, so the air from HAZE_RH
-    up is drawn as thin cloud (HAZE_GKG at saturation): the lowering and the funnel where the vortex is."""
+    up is drawn as thin cloud (HAZE_GKG at saturation): the lowering and the funnel where the vortex is.
+    On fine grids a tornado's own drop counts a little more (VORTEX_GAIN): the air in it is taken on, dry
+    adiabatically, to that lower pressure before its saturation is reckoned."""
     import cupy as cp
     st = patch.state
     j0, j1, i0, i1 = win
@@ -125,6 +223,13 @@ def _near_saturation(patch, win, cloud):
         thb = thb[:, j0:j1, i0:i1]
     p = st.p[:, j0:j1, i0:i1].astype(cp.float32)
     T = (thb + st.thp[:, j0:j1, i0:i1]).astype(cp.float32) * (p / 1.0e5) ** 0.2857
+    n = int(round(VORTEX_M / patch.env.grid.dx)) | 1
+    if VORTEX_GAIN > 0.0 and n >= 5 and min(p.shape[1:]) >= n:
+        from cupyx.scipy.ndimage import uniform_filter
+        drop = cp.minimum(p - uniform_filter(p, size=(1, n, n), mode="nearest"), 0.0)     # Pa, <= 0
+        pe = cp.maximum(p + VORTEX_GAIN * drop, 0.5 * p)
+        T = T * (pe / p) ** 0.2857
+        p = pe
     es = 611.2 * cp.exp(17.67 * (T - 273.15) / (T - 29.65))              # Bolton, over water
     qs = 0.622 * es / cp.maximum(p - es, 1.0)
     rh = st.qv[:, j0:j1, i0:i1].astype(cp.float32) / qs
@@ -248,11 +353,12 @@ def _plan_insets(entries, box, res):
     return out
 
 
-def _pack(name, head: dict, main: bytes, insets) -> bytes:
-    """Header (with the insets' boxes, sizes and levels) then the box's points, its ground, the insets' points."""
+def _pack(name, head: dict, main: bytes, insets, winds: bytes = b"") -> bytes:
+    """Header (with the insets' boxes, sizes and levels) then the box's points, its ground, the insets' points (and,
+    with the wind, the box's wind and each inset's)."""
     head["insets"] = [m for m, _ in insets]
     hb = json.dumps(head).encode()
-    return struct.pack("<I", len(hb)) + hb + main + b"".join(d for _, d in insets)
+    return struct.pack("<I", len(hb)) + hb + main + b"".join(d for _, d in insets) + winds
 
 
 def _stack(codes):
@@ -260,14 +366,19 @@ def _stack(codes):
     return cp.asnumpy(cp.stack(codes, axis=-1) if len(codes) > 1 else codes[0]).tobytes()
 
 
-def _insets_live(fields, box, name, res, patches):
-    """The live insets (_plan_insets) from the radar fields of the nests (and their patches' cloud)."""
+def _insets_live(fields, box, name, res, patches, winds=None):
+    """The live insets (_plan_insets) from the radar fields of the nests (and their patches' cloud); ``winds`` (a
+    list): each one's wind (_wind_codes) appended to it, its size in the inset's "wind"."""
     import cupy as cp
     by = {f.patch_id: f for f in fields.values()}
     ent = [(f.patch_id, f.x0, f.y0, f.x0 + f.nx * f.dx, f.y0 + f.ny * f.dx, f.dx) for f in fields.values()]
     channels = ("cloud", "precip") if name == "cloud" else (name,)
     out = []
     for key, ib, r, nx, ny in _plan_insets(ent, box, res):
+        if winds is not None:
+            ztop_, nz_ = levels_for(by[key].dx)
+            wb, wd = _wind_codes(list(fields.values()), patches, ib, nx, ny, ztop_, nz_)
+            winds.append((wd, wb))
         f = by[key]
         ztop, nz = levels_for(f.dx)
         xs = ib[0] + (np.arange(nx) + 0.5) * (ib[2] - ib[0]) / nx
@@ -276,16 +387,25 @@ def _insets_live(fields, box, name, res, patches):
         zv = (np.arange(nz) + 0.5) * ztop / nz
         codes = []
         for ch in channels:
-            v = _sample(f, ch, X, Y, zv, (patches or {}).get(f.patch_id))
+            v = _sample(f, ch, X, Y, zv, _live_patch(patches, f.patch_id))
             codes.append(_code(ch, v) if v is not None else cp.zeros((nz, ny, nx), cp.uint8))
-        out.append(({"box": list(ib), "nx": nx, "ny": ny, "nz": nz, "ztop": ztop, "dx": f.dx}, _stack(codes)))
+        meta = {"box": list(ib), "nx": nx, "ny": ny, "nz": nz, "ztop": ztop, "dx": f.dx}
+        if winds is not None:
+            meta["wind"] = winds[-1][0]
+        out.append((meta, _stack(codes)))
     return out
 
 
-def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None) -> bytes | None:
+def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None, wind: bool = False,
+            tors=None, t: float | None = None, drift=None, max_side: int = MAX_SIDE, nz: int = NZ,
+            insets: bool = True) -> bytes | None:
     """The volume of ``name`` in box (x0, y0, x1, y1, ground m) from the run's radar fields (and, for "cloud",
     ``patches``: the patches by id): a JSON header (dims, box, heights, scale, channels) then nz * ny * nx points
-    (x fastest) of ``channels`` bytes.  None if no patch overlaps the box."""
+    (x fastest) of ``channels`` bytes.  None if no patch overlaps the box.  ``wind``: the wind too (_wind_codes;
+    the header's "wind": its size, scale), with the vortices of the tornadoes ``tors`` [(id, x, y, vx, vy)] in the
+    box (vortices()), the model time t s and the storm's motion ``drift`` (m/s) in the header.  ``max_side``, ``nz``:
+    the grid's points along the longer side and its levels; ``insets`` False: no nests (chase mode's far cloud,
+    extract_far), and no grid finer than the box's own spacing read (its parent has the cloud at that scale)."""
     import cupy as cp
     if name not in FIELDS:
         raise ValueError(f"unknown field {name!r}")
@@ -293,23 +413,26 @@ def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None) -
     x0, x1 = min(x0, x1), max(x0, x1)
     y0, y1 = min(y0, y1), max(y0, y1)
     dxmin = min((f.dx for f in fields.values()), default=1000.0)
-    res = max(dxmin, max(x1 - x0, y1 - y0) / MAX_SIDE)
+    res = max(dxmin, max(x1 - x0, y1 - y0) / max_side)
     nx = max(2, int(math.ceil((x1 - x0) / res)))
     ny = max(2, int(math.ceil((y1 - y0) / res)))
     xs = x0 + (np.arange(nx) + 0.5) * (x1 - x0) / nx
     ys = y0 + (np.arange(ny) + 0.5) * (y1 - y0) / ny
     X, Y = np.meshgrid(xs, ys)
-    zv = (np.arange(NZ) + 0.5) * ZTOP / NZ
+    zv = (np.arange(nz) + 0.5) * ZTOP / nz
     channels = ("cloud", "precip") if name == "cloud" else (name,)
     best = [None] * len(channels)
     gnd = None
+    coarsest = max((f.dx for f in fields.values()), default=1000.0)
     for f in fields.values():
         if f.x0 > x1 or f.x0 + f.nx * f.dx < x0 or f.y0 > y1 or f.y0 + f.ny * f.dx < y0:
             continue
+        if not insets and f.dx < min(res / 4.0, coarsest):
+            continue                          # a fine nest seen from far: its parent's grid shows it
         g = ground(f, X, Y)
         if g is not None:
             gnd = g if gnd is None else cp.fmax(gnd, g)
-        p = (patches or {}).get(f.patch_id)
+        p = _live_patch(patches, f.patch_id)
         for c, ch in enumerate(channels):
             v = _sample(f, ch, X, Y, zv, p)
             if v is None:
@@ -321,7 +444,7 @@ def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None) -
     codes = []
     for b in best:
         if b is None:
-            codes.append(cp.zeros((NZ, ny, nx), cp.uint8))
+            codes.append(cp.zeros((nz, ny, nx), cp.uint8))
             continue
         if name == "cloud":                   # log-coded; nothing below 0.001 g/kg
             code = cp.where(cp.isnan(b) | (b < 1e-3), 0,
@@ -330,12 +453,22 @@ def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None) -
             code = cp.where(cp.isnan(b), 0, cp.clip(cp.rint(b * scale + offset), 1, 255))
         codes.append(code.astype(cp.uint8))
     data = cp.stack(codes, axis=-1) if len(codes) > 1 else codes[0]
-    head = {"field": name, "units": units, "nx": nx, "ny": ny, "nz": NZ, "box": [x0, y0, x1, y1],
+    head = {"field": name, "units": units, "nx": nx, "ny": ny, "nz": nz, "box": [x0, y0, x1, y1],
             "ztop": ZTOP, "scale": scale, "offset": offset, "channels": len(codes), "ground": gnd is not None}
     main = cp.asnumpy(data).tobytes()
     if gnd is not None:          # then the ground under each point, uint16 m above the model's zero
         main += cp.asnumpy(cp.clip(cp.rint(cp.nan_to_num(gnd, nan=0.0)), 0, 65535).astype(cp.uint16)).tobytes()
-    return _pack(name, head, main, _insets_live(fields, (x0, y0, x1, y1), name, res, patches))
+    if not insets:
+        return _pack(name, head, main, [])
+    if not wind:
+        return _pack(name, head, main, _insets_live(fields, (x0, y0, x1, y1), name, res, patches))
+    wb, wd = _wind_codes(list(fields.values()), patches, (x0, y0, x1, y1), nx, ny, ZTOP, NZ)
+    iw: list = []
+    insets = _insets_live(fields, (x0, y0, x1, y1), name, res, patches, iw)
+    inside = [tr for tr in (tors or []) if x0 <= tr[1] <= x1 and y0 <= tr[2] <= y1]
+    head.update({"wind": {"dims": wd, "scale": WIND_SCALE, "offset": 128.0}, "t": t,
+                 "vortices": vortices(fields, patches, inside), "drift": list(drift or (0.0, 0.0))})
+    return _pack(name, head, main, insets, wb + b"".join(b for _, b in iw))
 
 
 # ---------------------------------------------------------------- the history (the page's 3-D replay)
@@ -374,7 +507,7 @@ def snapshot(fields: dict, patches: dict | None = None) -> dict:
         xs = f.x0 + (np.arange(nx) * s + 0.5) * f.dx
         ys = f.y0 + (np.arange(ny) * s + 0.5) * f.dx
         X, Y = np.meshgrid(xs, ys)
-        p = (patches or {}).get(f.patch_id)
+        p = _live_patch(patches, f.patch_id)
         out[f"{k}_meta"] = np.array([xs[0], ys[0], s * f.dx, nx, ny, ztop, nz], np.float64)
         for ch in HISTORY_CHANNELS:
             v = _sample(f, ch, X, Y, zv, p)

@@ -13,6 +13,7 @@ import gzip
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -204,12 +205,15 @@ class Handler(BaseHTTPRequestHandler):
                      headers.get("User-Agent", "no user agent") if headers else "no headers")
 
     # ------------------------------------------------------------ helpers
-    def _send(self, code, body: bytes, ctype="application/json", encoding=None, cache=False, modified=None):
+    def _send(self, code, body: bytes, ctype="application/json", encoding=None, cache=False, modified=None,
+              headers=None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         if encoding:
             self.send_header("Content-Encoding", encoding)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         if modified is not None:
             self.send_header("Last-Modified", email.utils.formatdate(modified, usegmt=True))
         self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
@@ -247,7 +251,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(n)
         try:
             return json.loads(raw.decode() or "{}")
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return {}
 
     _FORWARDED = ("CF-Connecting-IP", "X-Forwarded-For", "Forwarded", "X-Real-IP")
@@ -314,6 +318,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._poll(path[len("/poll"):])
             if path == "/api/state":
                 return self._state()
+            if path == "/api/tornado3d":
+                return self._tornado3d_get(q)
+            if path == "/api/c/air":
+                return self._chase_air(q)
             if path == "/api/defaults":
                 from . import backend
                 from .engine import CELL_BYTES
@@ -844,15 +852,83 @@ class Handler(BaseHTTPRequestHandler):
         fields, t = vf
         try:
             box = [1000.0 * float(q[k]) for k in ("x0", "y0", "x1", "y1")]
+            since = float(q["since"]) if q.get("since") not in (None, "") else None
         except (KeyError, ValueError):
             return self._error(400, "x0, y0, x1, y1 (km) needed")
+        # chase mode asks about once a second with the model time of the volume it has (since=): while the model
+        # has not stepped on (paused, or one long step) it gets 204 without waiting for the run's lock
+        eng = sim.engine
+        if since is not None and eng is not None and abs(float(eng.t) - since) < 1e-3:
+            return self._send(204, b"", "application/octet-stream", headers={"X-Model-Time": f"{float(eng.t):.3f}"})
+        try:
+            # chase mode's far cloud (far=1): a wide box on a coarse grid, no nests, no wind
+            far = q.get("far") == "1"
+            side = max(32, min(320, int(q.get("side", 256)))) if far else volume.MAX_SIDE
+            nz = max(8, min(volume.NZ, int(q.get("nz", 40)))) if far else volume.NZ
+        except ValueError:
+            return self._error(400, "side, nz: whole numbers")
         with sim.lock:
             patches = ({p.id: p for p in sim.engine.patches + sim.engine.nest_patches()}
                        if sim.engine is not None else {})
-            blob = volume.extract(fields, box, q.get("field", "dbz"), patches)
+            t_now = float(sim.engine.t) if sim.engine is not None else float(t)
+            if far:
+                blob = volume.extract(fields, box, "cloud", patches, max_side=side, nz=nz, insets=False)
+            elif q.get("wind") == "1":
+                # chase mode's moving clouds: the wind too, and the tornadoes now (from the last radar refresh on at
+                # their motion) to turn the cloud round
+                from . import radar as rd
+                tk = sim.tornadoes
+                age = max(0.0, t_now - tk.t) if tk.t is not None else 0.0
+                tors = [(c.id, c.x + c.vx * age, c.y + c.vy * age, c.vx, c.vy) for c in tk.items
+                        if c.found and c.seen >= rd.TORNADO_CONFIRM]
+                drift = getattr(sim.env, "storm_motion", None) if sim.env is not None else None
+                blob = volume.extract(fields, box, q.get("field", "dbz"), patches, wind=True, tors=tors, t=t_now,
+                                      drift=drift)
+            else:
+                blob = volume.extract(fields, box, q.get("field", "dbz"), patches)
         if blob is None:
             return self._error(404, "no storm patch in that box")
-        self._send(200, zlib.compress(blob, 1), "application/octet-stream", encoding="deflate")
+        self._send(200, zlib.compress(blob, 1), "application/octet-stream", encoding="deflate",
+                   headers={"X-Model-Time": f"{t_now:.3f}"})
+
+    def _tornado3d_put(self):
+        """A frame from the tornado model's bridge (lestornado.py): this PC only, binary, the newest kept."""
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n > 0 else b""
+        if not self._is_local():
+            return self._error(403, "the tornado stream is only taken from this PC")
+        from . import lestornado
+        try:
+            return self._json(lestornado.put(raw))
+        except (ValueError, KeyError, TypeError) as e:
+            return self._error(400, str(e))
+
+    def _chase_air(self, q):
+        """The model's wind, gust, temperature and dew point at chase mode's cars: p=x,y;x,y (world m)."""
+        from . import chase
+        sim = APP.sim
+        if sim is None or sim.engine is None:
+            return self._error(404, "no run")
+        try:
+            pts = [tuple(float(v) for v in s.split(",")) for s in str(q.get("p", "")).split(";") if s.strip()]
+            if any(len(p) != 2 or not all(math.isfinite(v) for v in p) for p in pts):
+                raise ValueError
+        except ValueError:
+            return self._error(400, "p=x,y;x,y (world m)")
+        with sim.lock:
+            out = chase.air(sim, pts)
+        self._json({"t": float(sim.engine.t), "air": out})
+
+    def _tornado3d_get(self, q):
+        """The newest tornado frame for chase mode, or 204 (X-Tornado-State: same / off). No run lock needed."""
+        from . import lestornado
+        since = int(q["since"]) if str(q.get("since", "")).isdigit() else None
+        state, seq, blob = lestornado.get(since)
+        if blob is None:
+            return self._send(204, b"", "application/octet-stream",
+                              headers={"X-Tornado-State": state, "X-Tornado-Seq": str(seq)})
+        self._send(200, blob, "application/octet-stream", encoding="deflate",
+                   headers={"X-Tornado-State": state, "X-Tornado-Seq": str(seq)})
 
     def _pmw(self, path, q):
         """The PMWeather addon's live feed (pmw.py): targets as JSON, or a frame around x, y (m; none: the tornado
@@ -1073,6 +1149,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
         path = url.path
+        if path == "/api/tornado3d":
+            return self._tornado3d_put()
         body = self._body()
         if self._remote_refused(path):
             return None

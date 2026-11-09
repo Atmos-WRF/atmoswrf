@@ -111,24 +111,192 @@ function lru(map, key, make, max) {
   return p;
 }
 
+// The elevation tiles have broken pixels in places (data voids at -6000 m, spikes, lines of junk along source
+// seams), which the terrain turns into bottomless trenches and walls. A pixel is junk when it is far from what its
+// neighbours agree on: of its 8 neighbours drop the 2 lowest and 2 highest (so a line or pair of junk pixels can't
+// vouch for each other), and if the middle 4 are close together but this pixel is way off, replace it with their
+// mean. Real cliffs survive: there the middle neighbours themselves disagree. Repeated so small clusters peel away.
+function repairDem(H) {
+  const nb = new Float32Array(8);
+  for (let pass = 0; pass < 4; pass++) {
+    let fixed = 0;
+    for (let j = 0; j < 256; j++) for (let i = 0; i < 256; i++) {
+      let n = 0;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        if (!di && !dj) continue;
+        const x = i + di, y = j + dj;
+        if (x < 0 || y < 0 || x > 255 || y > 255) continue;
+        nb[n++] = H[y * 256 + x];
+      }
+      const v = nb.subarray(0, n).sort(), lo = n >= 8 ? 2 : 1, hi = n - lo;
+      let s = 0; for (let k = lo; k < hi; k++) s += v[k];
+      const mean = s / (hi - lo), spread = v[hi - 1] - v[lo], h = H[j * 256 + i], dev = Math.abs(h - mean);
+      if ((dev > 40 && dev > 4 * spread + 20) || (h < -1000 && mean > -50)) { H[j * 256 + i] = mean; fixed++; }
+    }
+    if (!fixed) break;
+  }
+}
+async function fetchTerrarium(z, x, y) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`);
+      if (!res.ok) throw new Error(res.status);
+      const bmp = await createImageBitmap(await res.blob(), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+      const ctx = new OffscreenCanvas(256, 256).getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(bmp, 0, 0); bmp.close();
+      const d = ctx.getImageData(0, 0, 256, 256).data, out = new Float32Array(65536);
+      for (let i = 0; i < 65536; i++) out[i] = d[i * 4] * 256 + d[i * 4 + 1] + d[i * 4 + 2] / 256 - 32768;
+      return out;
+    } catch { await sleep(400 * (attempt + 1)); }
+  }
+  return null;
+}
+
+// ---- the far north. Above ~60 N the detailed elevation (zoom 11+) is, in places, a surface model measured from the
+// ellipsoid instead of sea level (ArcticDEM): in Iceland the land sits ~66 m too high - a sheer wall at every shore -
+// and it includes buildings and glitches (spikes hundreds of metres tall). Elsewhere (Norway, Finland...) the same
+// zoom is fine, and even inside one tile gaps are filled from sea-level data. So, per pixel: if the detailed height
+// stands well above the coarse zoom-10 height (more than half the local geoid height), it's from the shifted source and
+// the geoid height (EGM96, 1 x 2 degree table below) is taken off. The mask is softened (ignoring the sea, which is
+// filled near 0 in both) so there are no steps. Tiles that were shifted also lose buildings/spikes (assembleHeights).
+const NORTH_LAT = 59.5;
+const GEOID_N = (() => { const b = atob('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BgYHBwcHBwgICAgICAgICAgICQkJCAgICAkJCQkJCgoKCwsMDAwNDQ0ODg4PDw8PEBAREhMTFBQUFRUWFhcXGBgZGRkZGRkZGhobGxsbGxsaGhobGxsbGxsbGxsbGhoaGhkZGRkYGBgXFxYWFRUUFBMTEhIREBAPDw4ODg0NDAwLCwsKCgoKCgoKCgkJCQoKCQkJCgoKCQgHBwcHBgYGBgcICQgIBwcHBgUFBQUFBQUFBgYGCAgICQkJCQkKCgoKCgoKCgoKCgoLCwsLCwsMDAwMDQ0NDQ4ODg4PDw8PEBAQEBAQERESEhITExQUFRUVFhYWFhUVFRUVFhYXFxgYGBkZGRoaGhoaGRkZGBkZGRkZGRkZGRkZGBgYGBgXFxYWFRUUFBQTExISEREREBAPDw8ODg4ODQ0NDQ0MDAwMDAwMDAsLCwsLCgoJCQkJCQgIBwcHCAkKCQkIBwcHBwYGBgYGBwcHBwcICQkJCgoKCgoKCgoKCgoKCgsLDAwMDQ0NDQ4ODg4ODg4ODw8PDw8PDxAQEBAQEBAQEBERERISEhMTFBUWFhcXFhUVFBQVFRUVFRYWFhYWFhYWFxcXFxYWFhYXFxcXFhYWFxcXFxcXFhYWFhUVFRQUFBQTExMSEhISEREREREQEBAPDw8PDg4ODg0NDQ0NDAwMCwsLCwsLCgoKCQkJCQkKCwsLCwkICAcHBwcHBwcHCAgJCQkJCgoLCwsLCwsLCwsLCwsLCwwMDAwNDQ0NDQ0NDg4ODw8PDw8PDw8PDw8PDw8QEBAQEBERERESEhITExQUFBUVFRQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUExMTExMSEhIRERERERERERAQEA8PDw4ODg4ODg0NDQ0MDAwMDAwMDAwLCwoKCgoKCwwNDQ0NDQwLCgkJCAkJCQkKCgoKCgoKCwsLCwsLCwsLCwsMDAwMDAwMDAwMDA0NDQ0NDQ0NDQ4ODg4ODg4ODg8PDxAQEBAQEREREREREhISEhMTExMTExISEhISERERERESEhISEhISEhISEhISEhISEhISEhIRERERERERERERERERERERERAQEBAQEBAPDw8PDw8PDw4ODg4ODg4ODQ0NDQ0NDQ0NDAwMDAsLCwsLDAwNDQ4ODw8PDw4ODQ0MCwsLCwsLCwsLCwsLDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDg4ODg4ODg4ODg4ODg4PDw8PDw8PDw8PDxAQEBAQEBAQEBAQEBAQEBAQEBAPDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw8PDw4ODg4ODg4ODg4ODg4ODg4NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4ODg4O'), a = new Int8Array(b.length); for (let i = 0; i < b.length; i++) a[i] = b.charCodeAt(i) << 24 >> 24; return a; })();
+function geoidAt(lat, lon) {      // EGM96 geoid height (m), bilinear; table rows lat 59..90, cols lon -180..178 step 2
+  const r = Math.min(31, Math.max(0, lat - 59)), c = ((lon + 180) / 2 % 180 + 180) % 180;
+  const r0 = Math.min(30, Math.floor(r)), c0 = Math.floor(c), fr = r - r0, fc = c - c0, c1 = (c0 + 1) % 180;
+  const g = (i, j) => GEOID_N[i * 180 + j];
+  return (g(r0, c0) * (1 - fc) + g(r0, c1) * fc) * (1 - fr) + (g(r0 + 1, c0) * (1 - fc) + g(r0 + 1, c1) * fc) * fr;
+}
+const coarseCache = new Map();
+const getCoarse = (x10, y10) => lru(coarseCache, x10 + '/' + y10, () => fetchTerrarium(10, x10, y10), 24);
+const tileLatOf = y => Math.atan(Math.sinh(Math.PI * (1 - 2 * y / NT))) * 180 / Math.PI;
+const tileLonOf = x => x / NT * 360 - 180;
+async function northFix(out, x, y) {
+  const N0 = geoidAt(tileLatOf(y), tileLonOf(x)), N1 = geoidAt(tileLatOf(y), tileLonOf(x + 1));
+  const N2 = geoidAt(tileLatOf(y + 1), tileLonOf(x)), N3 = geoidAt(tileLatOf(y + 1), tileLonOf(x + 1));
+  if (Math.max(N0, N1, N2, N3) < 6) return;                     // small geoid height: nothing to see
+  const lo = await getCoarse(x >> 4, y >> 4);
+  if (!lo) return;
+  const bx = (x & 15) * 16, by = (y & 15) * 16;                 // this tile's corner in the zoom-10 tile's pixels
+  const coarse = (i, j) => {                                    // zoom-10 height under pixel (i, j), bilinear
+    const u = Math.min(255, Math.max(0, bx + (i + 0.5) / 16 - 0.5)), v = Math.min(255, Math.max(0, by + (j + 0.5) / 16 - 0.5));
+    const i0 = Math.min(254, Math.floor(u)), j0 = Math.min(254, Math.floor(v)), fu = u - i0, fv = v - j0, k = j0 * 256 + i0;
+    return (lo[k] * (1 - fu) + lo[k + 1] * fu) * (1 - fv) + (lo[k + 256] * (1 - fu) + lo[k + 257] * fu) * fv;
+  };
+  const Nat = (i, j) => { const fu = (i + 0.5) / 256, fv = (j + 0.5) / 256; return (N0 * (1 - fu) + N1 * fu) * (1 - fv) + (N2 * (1 - fu) + N3 * fu) * fv; };
+  const mask = new Float32Array(65536), valid = new Uint8Array(65536);
+  let shifted = 0, land = 0;
+  for (let j = 0; j < 256; j++) for (let i = 0; i < 256; i++) {
+    const k = j * 256 + i, h = out[k];
+    if (h < 3) continue;                                         // sea / fill near 0: no say either way
+    valid[k] = 1; land++;
+    const N = Nat(i, j);
+    if (N > 6 && h - coarse(i, j) > N * 0.5) { mask[k] = 1; shifted++; }
+  }
+  if (!shifted) return;
+  // soften the mask over ~6 pixels, averaging only over land pixels (separable box)
+  const R = 6, num = new Float32Array(65536), den = new Float32Array(65536), num2 = new Float32Array(65536), den2 = new Float32Array(65536);
+  for (let j = 0; j < 256; j++) for (let i = 0; i < 256; i++) {
+    let a = 0, b = 0;
+    for (let d = -R; d <= R; d++) { const ii = i + d; if (ii < 0 || ii > 255) continue; const q = j * 256 + ii; a += mask[q] * valid[q]; b += valid[q]; }
+    num[j * 256 + i] = a; den[j * 256 + i] = b;
+  }
+  for (let j = 0; j < 256; j++) for (let i = 0; i < 256; i++) {
+    let a = 0, b = 0;
+    for (let d = -R; d <= R; d++) { const jj = j + d; if (jj < 0 || jj > 255) continue; const q = jj * 256 + i; a += num[q]; b += den[q]; }
+    num2[j * 256 + i] = a; den2[j * 256 + i] = b;
+  }
+  for (let j = 0; j < 256; j++) for (let i = 0; i < 256; i++) {
+    const k = j * 256 + i;
+    if (!valid[k]) continue;
+    const m = den2[k] > 0 ? num2[k] / den2[k] : mask[k];
+    let h = Math.max(out[k] - Nat(i, j) * m, 0.5);               // shifted land comes down to sea level, never below it
+    // slabs of junk over open water (hundreds of metres high, hundreds wide): where the coarse data says the whole
+    // area is low-lying, a pixel claiming 45 m more is wrong - take the coarse height. Real hills and cliffs keep
+    // their shape (there the coarse height is up too).
+    const c = coarse(i, j);
+    if (c < 20 && h - c > 45) h = Math.max(c, 0.5);
+    out[k] = h;
+  }
+  out.north = shifted > 30;                                     // any of that source here: despike it too
+}
+// grey-scale opening (min then max over a (2r+1)^2 square, separable): flattens bumps narrower than ~2r+1 pixels -
+// buildings and spikes in a surface model - while broad hills and valleys keep their shape
+function openHeights(H, W, r) {
+  const tmp = new Float32Array(H.length), pass = (src, dst, horiz, useMin) => {
+    for (let j = 0; j < W; j++) for (let i = 0; i < W; i++) {
+      let m = useMin ? Infinity : -Infinity;
+      for (let d = -r; d <= r; d++) {
+        const ii = horiz ? Math.min(W - 1, Math.max(0, i + d)) : i, jj = horiz ? j : Math.min(W - 1, Math.max(0, j + d)), v = src[jj * W + ii];
+        if (useMin ? v < m : v > m) m = v;
+      }
+      dst[j * W + i] = m;
+    }
+  };
+  pass(H, tmp, true, true); pass(tmp, H, false, true);     // erode
+  pass(H, tmp, true, false); pass(tmp, H, false, false);   // dilate
+}
+
+// ---- city heights. Outside the US the elevation is a ~30 m radar surface model: dense towers show up as soft hills
+// tens of metres high (Melbourne's Southbank sat ~20 m above the river under its towers). Where OpenStreetMap shows
+// dense building cover, bumps narrower than ~300 m are taken off with a grey-scale opening - broad slopes keep their
+// exact shape - fading in with building density, so open country and real hills are untouched. Works on the wide
+// grid from the 3x3 neighbourhood's buildings, so neighbouring tiles agree. (US elevation is bare-earth already.)
+function boxBlur(A, W, r) {
+  const T = new Float32Array(A.length);
+  for (let j = 0; j < W; j++) { let s = 0; for (let i = -r; i <= r; i++) s += A[j * W + Math.min(W - 1, Math.max(0, i))];
+    for (let i = 0; i < W; i++) { T[j * W + i] = s / (2 * r + 1); s += A[j * W + Math.min(W - 1, i + r + 1)] - A[j * W + Math.max(0, i - r)]; } }
+  for (let i = 0; i < W; i++) { let s = 0; for (let j = -r; j <= r; j++) s += T[Math.min(W - 1, Math.max(0, j)) * W + i];
+    for (let j = 0; j < W; j++) { A[j * W + i] = s / (2 * r + 1); s += T[Math.min(W - 1, j + r + 1) * W + i] - T[Math.max(0, j - r) * W + i]; } }
+}
+function urbanFlatten(HE, nbs, c, tileSize) {
+  const W = GE, g = new OffscreenCanvas(W, W).getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#fff';
+  let any = 0;
+  for (let n = 0; n < 9; n++) {
+    const t = nbs[n];
+    if (!t || t.empty || !t.building) continue;
+    const ox = ((n % 3) - 1) * tileSize, oz = (Math.floor(n / 3) - 1) * tileSize, k = tileSize / t.building.extent;
+    g.beginPath();
+    for (const fb of t.building.features) {
+      const f = readFeature(fb, t.building);
+      if (f.type !== 3) continue;
+      for (const ring of f.parts) {
+        g.moveTo((ring[0] * k + ox) / c + ME, (ring[1] * k + oz) / c + ME);
+        for (let p = 2; p < ring.length; p += 2) g.lineTo((ring[p] * k + ox) / c + ME, (ring[p + 1] * k + oz) / c + ME);
+        g.closePath(); any++;
+      }
+    }
+    g.fill('nonzero');
+  }
+  if (!any) return null;
+  const px = g.getImageData(0, 0, W, W).data, dens = new Float32Array(W * W);
+  for (let i = 0; i < W * W; i++) dens[i] = px[i * 4 + 3] / 255;
+  const rb = Math.max(2, Math.round(60 / c));
+  boxBlur(dens, W, rb); boxBlur(dens, W, rb);                       // building cover within ~100 m
+  let top = 0;
+  for (let i = 0; i < W * W; i++) top = Math.max(top, dens[i]);
+  if (top < 0.12) return null;
+  const O = new Float32Array(HE);
+  openHeights(O, W, Math.max(3, Math.round(150 / c)));       // bumps narrower than ~300 m: tower clusters, not hills
+  for (let i = 0; i < W * W; i++) {
+    const u = Math.min(1, Math.max(0, (dens[i] - 0.12) / 0.18)), w = u * u * (3 - 2 * u);
+    dens[i] = w;                                                   // reused: how "city" each point is (0..1)
+    if (w > 0) HE[i] += (Math.min(O[i], HE[i]) - HE[i]) * w;
+  }
+  return dens;
+}
+
 const demCache = new Map();
 function getDem(x, y) {
   x = ((x % NT) + NT) % NT; y = Math.min(NT - 1, Math.max(0, y));
   return lru(demCache, x + '/' + y, async () => {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const res = await fetch(DEM_URL(x, y));
-        if (!res.ok) throw new Error(res.status);
-        const bmp = await createImageBitmap(await res.blob(), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
-        const ctx = new OffscreenCanvas(256, 256).getContext('2d', { willReadFrequently: true });
-        ctx.drawImage(bmp, 0, 0); bmp.close();
-        const d = ctx.getImageData(0, 0, 256, 256).data, out = new Float32Array(65536);
-        for (let i = 0; i < 65536; i++) out[i] = d[i * 4] * 256 + d[i * 4 + 1] + d[i * 4 + 2] / 256 - 32768;
-        return out;
-      } catch { await sleep(400 * (attempt + 1)); }
-    }
-    return null;
-  }, 100);
+    const out = await fetchTerrarium(Z, x, y);
+    if (!out) return null;
+    repairDem(out);
+    if (tileLatOf(y + 0.5) > NORTH_LAT) { try { await northFix(out, x, y); } catch (e) { /* keep the raw heights */ } }
+    return out;
+  }, 160);
 }
 
 const vtCache = new Map();
@@ -147,22 +315,187 @@ function getVectorLayers(template, x, y) {
   }, 30);
 }
 
-// Heights for the tile plus M pixels on every side (pixel-corner convention).
-async function assembleHeights(tx, ty) {
+// Heights for the tile plus MM pixels on every side (pixel-corner convention). The default margin M is the
+// terrain grid; road profiles use a wider one (ME) so tiles can agree on roads that cross their borders.
+const ME = 100, GE = 257 + 2 * ME;
+async function assembleHeights(tx, ty, MM = M, centreOnly = false) {
+  const GG = 257 + 2 * MM;
   const jobs = [];
-  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) jobs.push(getDem(tx + dx, ty + dy));
+  // coarse far tiles only need their own heights (the margin is clamped; skirts hide the seams)
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) jobs.push(centreOnly && (dx || dy) ? Promise.resolve(null) : getDem(tx + dx, ty + dy));
   const t = await Promise.all(jobs), center = t[4];
-  const H = new Float32Array(G * G);
-  for (let gj = 0; gj < G; gj++) {
-    const py = gj - M, oy = py < 0 ? -1 : py >= 256 ? 1 : 0, ly = py - oy * 256;
-    for (let gi = 0; gi < G; gi++) {
-      const px = gi - M, ox = px < 0 ? -1 : px >= 256 ? 1 : 0, lx = px - ox * 256;
+  const H = new Float32Array(GG * GG);
+  for (let gj = 0; gj < GG; gj++) {
+    const py = gj - MM, oy = py < 0 ? -1 : py >= 256 ? 1 : 0, ly = py - oy * 256;
+    for (let gi = 0; gi < GG; gi++) {
+      const px = gi - MM, ox = px < 0 ? -1 : px >= 256 ? 1 : 0, lx = px - ox * 256;
       const tile = t[(oy + 1) * 3 + ox + 1];
-      H[gj * G + gi] = tile ? tile[ly * 256 + lx]
+      H[gj * GG + gi] = tile ? tile[ly * 256 + lx]
         : center ? center[Math.min(255, Math.max(0, py)) * 256 + Math.min(255, Math.max(0, px))] : 0;
     }
   }
+  // far-north surface model: strip buildings and spikes (done on the stitched grid so tile edges agree)
+  if (center && center.north) openHeights(H, GG, 4);
   return H;
+}
+/** Crop the wide height grid down to the terrain grid (same values cell for cell). */
+function cropHeights(HE) {
+  const H = new Float32Array(G * G), d = ME - M;
+  for (let gj = 0; gj < G; gj++) H.set(HE.subarray((gj + d) * GE + d, (gj + d) * GE + d + G), gj * G);
+  return H;
+}
+function sampleWide(H, x, z, c) {
+  const gx = Math.min(GE - 1.0001, Math.max(0, x / c + ME)), gz = Math.min(GE - 1.0001, Math.max(0, z / c + ME));
+  const i = Math.floor(gx), j = Math.floor(gz), fx = gx - i, fz = gz - j, k = j * GE + i;
+  return (H[k] * (1 - fx) + H[k + 1] * fx) * (1 - fz) + (H[k + GE] * (1 - fx) + H[k + GE + 1] * fx) * fz;
+}
+
+// ------------------------------------------------ road lines from this tile and its neighbours
+// Each tile used to work out its roads alone, so a ramp or overpass near a border came out different on each
+// side and the road stepped at the seam. Now every tile reads the roads of its 8 neighbours too: each tile's
+// lines are cut exactly at its own border (no overlap from the vector tile buffers), the pieces of one way are
+// joined back up across borders, and the result is cut to a window W metres around this tile. Both tiles at a
+// border then process the same lines and agree on their heights there.
+function clipLine(pts, x0, z0, x1, z1) {
+  const out = []; let cur = null;
+  const ins = (x, z) => x >= x0 && x <= x1 && z >= z0 && z <= z1;
+  for (let i = 0; i + 3 < pts.length; i += 2) {
+    const ax = pts[i], az = pts[i + 1], bx = pts[i + 2], bz = pts[i + 3], dx = bx - ax, dz = bz - az;
+    let t0 = 0, t1 = 1, ok = true;
+    for (const [pp, q] of [[-dx, ax - x0], [dx, x1 - ax], [-dz, az - z0], [dz, z1 - az]]) {
+      if (pp === 0) { if (q < 0) { ok = false; break; } continue; }
+      const r = q / pp;
+      if (pp < 0) { if (r > t1) { ok = false; break; } if (r > t0) t0 = r; }
+      else { if (r < t0) { ok = false; break; } if (r < t1) t1 = r; }
+    }
+    if (!ok) { if (cur) { out.push(cur); cur = null; } continue; }
+    const sx = ax + dx * t0, sz = az + dz * t0, ex = ax + dx * t1, ez = az + dz * t1;
+    if (!cur) cur = [sx, sz];
+    else if (t0 > 0) { out.push(cur); cur = [sx, sz]; }
+    cur.push(ex, ez);
+    if (t1 < 1) { out.push(cur); cur = null; }
+  }
+  if (cur) out.push(cur);
+  return out.filter(l => l.length >= 4 && !(l.length === 4 && l[0] === l[2] && l[1] === l[3]));
+}
+function gatherRoadLines(vts, S, W) {
+  const lines = [];
+  for (let n = 0; n < 9; n++) {
+    const vt = vts[n], layer = vt && !vt.empty && vt.transportation;
+    if (!layer) continue;
+    const ddx = (n % 3) - 1, ddy = Math.floor(n / 3) - 1, k = S / layer.extent;
+    for (const fb of layer.features) {
+      const f = readFeature(fb, layer), p = f.props;
+      if (f.type !== 2 || !ROAD_CLASSES[p.class] || p.class === 'path' || (p.brunnel === 'tunnel' && p.class === 'rail') || p.indoor === 1) continue;
+      const key = [p.class, p.subclass, p.brunnel, p.layer, p.oneway, p.ramp, p.surface].join('|');
+      for (const part of f.parts) {
+        const m = new Array(part.length);
+        for (let i = 0; i < part.length; i += 2) { m[i] = part[i] * k + ddx * S; m[i + 1] = part[i + 1] * k + ddy * S; }
+        for (const l of clipLine(m, ddx * S, ddy * S, ddx * S + S, ddy * S + S)) lines.push({ props: p, key, pts: l, alive: true });
+      }
+    }
+  }
+  // join pieces of one way that meet on a tile border (same tags, ends within 1.5 m)
+  const onB = v => [0, S, -S, 2 * S].some(b => Math.abs(v - b) < 0.02);
+  const ends = [];
+  lines.forEach((L, i) => {
+    const n = L.pts.length;
+    for (const e of [0, 1]) { const x = e ? L.pts[n - 2] : L.pts[0], z = e ? L.pts[n - 1] : L.pts[1]; if (onB(x) || onB(z)) ends.push({ i, e, x, z }); }
+  });
+  const used = new Set();
+  for (let a = 0; a < ends.length; a++) {
+    if (used.has(a)) continue;
+    let match = -1, cnt = 0;
+    for (let b = 0; b < ends.length; b++) {
+      if (b === a || used.has(b) || ends[b].i === ends[a].i || lines[ends[b].i].key !== lines[ends[a].i].key) continue;
+      if (Math.abs(ends[b].x - ends[a].x) < 1.5 && Math.abs(ends[b].z - ends[a].z) < 1.5) { match = b; cnt++; }
+    }
+    if (cnt !== 1) continue;
+    used.add(a); used.add(match);
+    ends[a].pair = match; ends[match].pair = a;
+  }
+  // walk the chains
+  const endOf = new Map(); ends.forEach((E, q) => endOf.set(E.i * 2 + E.e, q));
+  const out = [], done = new Uint8Array(lines.length);
+  for (let i = 0; i < lines.length; i++) {
+    if (done[i]) continue;
+    // go back to the start of this chain
+    let si = i, se = 0, guard = 0;
+    for (;;) {
+      const q = endOf.get(si * 2 + se); if (q === undefined || ends[q].pair === undefined || guard++ > 500) break;
+      const o = ends[ends[q].pair]; if (o.i === i && guard > 1) break;
+      si = o.i; se = 1 - o.e;
+    }
+    // walk forward from (si, entering at end se)
+    const pts = []; let ci = si, ce = se; guard = 0;
+    while (ci >= 0 && !done[ci] && guard++ < 500) {
+      done[ci] = 1;
+      const P = lines[ci].pts, n = P.length / 2;
+      for (let k = 0; k < n; k++) { const kk = ce === 0 ? k : n - 1 - k; if (pts.length && k === 0) continue; pts.push(P[2 * kk], P[2 * kk + 1]); }
+      const q = endOf.get(ci * 2 + (1 - ce));
+      if (q === undefined || ends[q].pair === undefined) break;
+      const o = ends[ends[q].pair]; ci = o.i; ce = o.e;
+    }
+    for (const l of clipLine(pts, -W, -W, S + W, S + W)) out.push({ props: lines[si].props, parts: [l] });
+  }
+  return out;
+}
+/** Water over the whole road window, from this tile's and its neighbours' water polygons and waterways, for
+ *  grade separation (bridges clearing water, culverts). Same rule for every cell, so neighbouring tiles agree;
+ *  level = the ground there (the DEM is flat at a water surface), the sea at 0. */
+function wideWater(vts, HE, c, S) {
+  const ctx = new OffscreenCanvas(GE, GE).getContext('2d', { willReadFrequently: true });
+  let drew = false;
+  for (let n = 0; n < 9; n++) {
+    const vt = vts[n]; if (!vt || vt.empty) continue;
+    const ox = ((n % 3) - 1) * S, oz = (Math.floor(n / 3) - 1) * S;
+    const toW = (v, k, o) => (v * k + o) / c + ME + 0.5;
+    if (vt.water) {
+      const k = S / vt.water.extent;
+      for (const fb of vt.water.features) {
+        const f = readFeature(fb, vt.water);
+        if (f.type !== 3 || f.props.brunnel === 'tunnel') continue;
+        ctx.fillStyle = f.props.class === 'ocean' ? '#00ff00' : '#ff0000';
+        ctx.beginPath();
+        for (const ring of f.parts) { ctx.moveTo(toW(ring[0], k, ox), toW(ring[1], k, oz)); for (let i = 2; i < ring.length; i += 2) ctx.lineTo(toW(ring[i], k, ox), toW(ring[i + 1], k, oz)); ctx.closePath(); }
+        ctx.fill('evenodd'); drew = true;
+      }
+    }
+    if (vt.waterway) {
+      const k = S / vt.waterway.extent;
+      ctx.strokeStyle = '#ff0000'; ctx.lineCap = ctx.lineJoin = 'round';
+      for (const fb of vt.waterway.features) {
+        const f = readFeature(fb, vt.waterway), w = WATERWAY_WIDTH[f.props.class];
+        if (f.type !== 2 || !w || f.props.brunnel === 'tunnel') continue;
+        ctx.lineWidth = Math.max(w / c, 1.6); ctx.beginPath();
+        for (const part of f.parts) { ctx.moveTo(toW(part[0], k, ox), toW(part[1], k, oz)); for (let i = 2; i < part.length; i += 2) ctx.lineTo(toW(part[i], k, ox), toW(part[i + 1], k, oz)); }
+        ctx.stroke(); drew = true;
+      }
+    }
+  }
+  if (!drew) return null;
+  const px = ctx.getImageData(0, 0, GE, GE).data, isW = new Uint8Array(GE * GE), L = new Float32Array(GE * GE).fill(NaN);
+  for (let i = 0; i < GE * GE; i++) {
+    if (px[i * 4 + 1] > 127) { isW[i] = 2; L[i] = 0; }
+    else if (px[i * 4] > 127) { isW[i] = 1; L[i] = HE[i]; }
+  }
+  return { isW, L, wide: true };
+}
+/** Cut a processed road to the box [lo, hi]² (pieces keep their heights; new ends are interpolated). */
+function trimRoad(r, lo, hi) {
+  const n = r.pts.length / 2, out = [];
+  const ins = i => r.pts[2 * i] >= lo && r.pts[2 * i] <= hi && r.pts[2 * i + 1] >= lo && r.pts[2 * i + 1] <= hi;
+  let all = true; for (let i = 0; i < n; i++) if (!ins(i)) { all = false; break; }
+  if (all) return [r];
+  let cur = null;
+  const add = (i) => { cur.pts.push(r.pts[2 * i], r.pts[2 * i + 1]); cur.h.push(r.h[i]); cur.len.push(r.len[i]); cur.fade.push(r.fade[i]); };
+  const close = () => { if (cur && cur.pts.length >= 4) out.push({ ...r, ring: false, origIdx: [], pts: cur.pts, h: Float32Array.from(cur.h), len: cur.len, fade: Float32Array.from(cur.fade) }); cur = null; };
+  for (let i = 0; i < n; i++) {
+    if (ins(i)) { if (!cur) { cur = { pts: [], h: [], len: [], fade: [] }; if (i > 0) add(i - 1); } add(i); }
+    else if (cur) { add(i); close(); }
+  }
+  close();
+  return out;
 }
 
 // ------------------------------------------------ height sampling
@@ -186,15 +519,14 @@ function normalAt(H, x, z, c) {
 }
 
 // ------------------------------------------------ roads
-function extractRoads(layer, tileSize, H0, c, lms) {
+function extractRoads(feats, tileSize, HE, c, lms, W) {
   // distance to the nearest landmark pad edge-ish (centre distance minus its size), tile-local metres
   const lmNear = (x, z) => { let d = Infinity; for (const L of lms || []) if (!L.bridge) d = Math.min(d, Math.hypot(x - L.x, z - L.z) - Math.max(L.pax || L.hx, L.paz || L.hz)); return d; };
-  const k = tileSize / layer.extent, lo = -M * c, hi = (256 + M) * c;
+  const k = 1, lo = -W, hi = tileSize + W;
   const roads = [];
-  for (const fb of layer.features) {
-    const f = readFeature(fb, layer);
+  for (const f of feats) {
     const p = f.props, cls = p.class, info = ROAD_CLASSES[cls];
-    if (f.type !== 2 || !info || p.brunnel === 'tunnel' || p.indoor === 1) continue;
+    if (!info || (p.brunnel === 'tunnel' && cls === 'rail') || p.indoor === 1) continue;
     if (cls === 'path') continue;       // footpaths, steps and pedestrian ways are not built
 
     if (cls === 'rail' && p.subclass && !/^(rail|narrow_gauge|preserved)$/.test(p.subclass)) continue;
@@ -213,8 +545,8 @@ function extractRoads(layer, tileSize, H0, c, lms) {
     if (cls === 'rail') surf = SURF.gravel;
     if (surf !== SURF.asphalt) { centre = 0; edges = 0; shoulder = 0; }
     const hw = lanes * laneW / 2 + shoulder;
-    const bridge = p.brunnel === 'bridge';
-    const zl = p.layer != null && Number.isFinite(+p.layer) ? +p.layer : bridge ? 1 : 0;   // OSM layer: which way goes on top
+    const bridge = p.brunnel === 'bridge', tunnel = p.brunnel === 'tunnel';
+    const zl = p.layer != null && Number.isFinite(+p.layer) ? +p.layer : bridge ? 1 : tunnel ? -1 : 0;   // OSM layer: which way goes on top
 
     for (const part of f.parts) {
       const orig = []; let inside = false;
@@ -234,21 +566,42 @@ function extractRoads(layer, tileSize, H0, c, lms) {
         acc += sl;
         origIdx.push(pts.length / 2 - 1);
       }
-      const np = pts.length / 2, raw = new Float32Array(np), h = new Float32Array(np);
-      for (let i = 0; i < np; i++) raw[i] = sampleBilinear(H0, pts[2 * i], pts[2 * i + 1], c);
-      if (bridge) {
-        const total = len[np - 1] || 1;
-        for (let i = 0; i < np; i++) h[i] = raw[0] + (raw[np - 1] - raw[0]) * len[i] / total;
-      } else {
-        // smooth the profile (about ±15 m); endpoints stay on true terrain. Within a few hundred metres of a
-        // landmark the road follows the ground closely (±3 m) so it meets plazas, pads and summits exactly
-        for (let i = 0; i < np; i++) {
-          const dl = lms && lms.length ? lmNear(pts[2 * i], pts[2 * i + 1]) : Infinity;
-          const rmax = dl < 250 ? 1 : dl < 450 ? 3 : 5;
-          const r = Math.min(rmax, i, np - 1 - i);
-          let s = 0; for (let j = i - r; j <= i + r; j++) s += raw[j];
-          h[i] = s / (2 * r + 1);
+      const np = pts.length / 2, h = new Float32Array(np);
+      // Smooth the height profile with a window that suits the road: engineered roads are graded gently
+      // (motorway ±36 m, rail ±45 m), streets follow the ground more (±15 m), and within a few hundred metres of a
+      // landmark a road follows it closely (±3 m) so it meets plazas, pads and summits exactly. The terrain is
+      // sampled on past each end along the road's direction (or round a closed loop), so the window never shrinks
+      // at an end: ends used to sit on the raw, bumpy (building-biased) city DEM, which put kinks and dives at
+      // every junction and every place a way is split.
+      const RW = cls === 'rail' ? 15 : cls === 'motorway' || cls === 'trunk' ? 12 : cls === 'primary' || cls === 'secondary' ? 8 : 5;
+      const closed = np > 4 && Math.hypot(pts[0] - pts[2 * np - 2], pts[1] - pts[2 * np - 1]) < 1.5;
+      const E = RW, rawX = new Float64Array(np + 2 * E);
+      for (let i = 0; i < np; i++) rawX[E + i] = sampleWide(HE, pts[2 * i], pts[2 * i + 1], c);
+      {
+        const sdx = pts[0] - pts[2], sdz = pts[1] - pts[3], sl = Math.hypot(sdx, sdz) || 1;
+        const edx = pts[2 * np - 2] - pts[2 * np - 4], edz = pts[2 * np - 1] - pts[2 * np - 3], el = Math.hypot(edx, edz) || 1;
+        for (let q = 1; q <= E; q++) {
+          rawX[E - q] = closed ? rawX[E + ((np - 1 - q) % np + np) % np] : sampleWide(HE, pts[0] + sdx / sl * q * RESAMPLE, pts[1] + sdz / sl * q * RESAMPLE, c);
+          rawX[E + np - 1 + q] = closed ? rawX[E + (q % np)] : sampleWide(HE, pts[2 * np - 2] + edx / el * q * RESAMPLE, pts[2 * np - 1] + edz / el * q * RESAMPLE, c);
         }
+      }
+      const pre = new Float64Array(rawX.length + 1);
+      for (let i = 0; i < rawX.length; i++) pre[i + 1] = pre[i] + rawX[i];
+      // only the small roads that actually lead up to a landmark follow it closely; main roads passing nearby
+      // keep their grading (a motorway beside a cathedral used to copy every DEM step at 40%)
+      const lmClose = rank <= 6 && lms && lms.length;
+      const smooth = i => {
+        const dl = lmClose ? lmNear(pts[2 * i], pts[2 * i + 1]) : Infinity;
+        const r = dl < 120 ? 2 : dl < 300 ? Math.min(RW, 3) : RW;
+        return (pre[E + i + r + 1] - pre[E + i - r]) / (2 * r + 1);
+      };
+      if (bridge || tunnel) {
+        // a bridge is a straight deck between its abutments (levelBridges joins the pieces of one bridge);
+        // a tunnel a straight bore between its portals (levelTunnels, once the roads outside are settled)
+        const total = len[np - 1] || 1, h0 = smooth(0), h1 = smooth(np - 1);
+        for (let i = 0; i < np; i++) h[i] = h0 + (h1 - h0) * len[i] / total;
+      } else {
+        for (let i = 0; i < np; i++) h[i] = smooth(i);
       }
       // roundabout: a short closed loop of a public road that is close to a circle (not a parking or service loop)
       let ring = np > 8 && len[np - 1] < 450 && Math.hypot(pts[0] - pts[2 * np - 2], pts[1] - pts[2 * np - 1]) < 1.5 && !/^(rail|service|track)$/.test(cls);
@@ -258,11 +611,11 @@ function extractRoads(layer, tileSize, H0, c, lms) {
         let dev = 0; for (let i = 0; i < np; i++) dev = Math.max(dev, Math.abs(Math.hypot(pts[2 * i] - cx, pts[2 * i + 1] - cz) - mr));
         ring = mr >= 8 && mr <= 60 && dev < mr * 0.25;
       }
-      roads.push({ pts, h, len, origIdx, hw, laneW, lanes, shoulder, centre: ring ? 0 : centre, edges, oneway, surf, rank, bridge, ring, layer: zl,
+      roads.push({ pts, h, len, origIdx, hw, laneW, lanes, shoulder, centre: ring ? 0 : centre, edges, oneway, surf, rank, bridge, tunnel, ring, layer: zl,
                    cls: CLASS_LIST.indexOf(cls), fade: new Float32Array(np).fill(1) });
     }
   }
-  levelBridges(roads, tileSize);
+  levelBridges(roads, tileSize, W);
   return roads;
 }
 
@@ -270,7 +623,7 @@ function extractRoads(layer, tileSize, H0, c, lms) {
 // Sampling the DEM where two pieces meet puts that joint on the valley floor and the deck dips into the gorge.
 // Instead: join the pieces into a graph, pin the real abutments (free ends on solid ground) to the terrain,
 // and solve the joints as length-weighted averages - for a simple chain that is one straight deck end to end.
-function levelBridges(roads, tileSize) {
+function levelBridges(roads, tileSize, W = 0) {
   const br = roads.filter(r => r.bridge);
   if (!br.length) return;
   const nodes = [], nodeAt = (x, z, h) => {
@@ -293,14 +646,16 @@ function levelBridges(roads, tileSize) {
     while (st.length) { const k = st.pop(); for (const [q] of nodes[k].edges) if (grp[q] < 0) { grp[q] = ng; st.push(q); } }
     ng++;
   }
-  const clipped = nd => nd.x < -1 || nd.z < -1 || nd.x > tileSize + 1 || nd.z > tileSize + 1;
+  const clipped = nd => nd.x < -W + 1 || nd.z < -W + 1 || nd.x > tileSize + W - 1 || nd.z > tileSize + W - 1;
   for (let gi = 0; gi < ng; gi++) {
     const ns = nodes.filter((_, i) => grp[i] === gi), ends = ns.filter(nd => nd.edges.length === 1);
     const solid = ends.filter(nd => !clipped(nd));
     let top = -Infinity; for (const nd of solid) top = Math.max(top, nd.raw);
     if (!solid.length) for (const nd of ends) top = Math.max(top, nd.raw);
-    // ends inside the tile are abutments; ends cut off at the tile edge only count if they're on high ground
-    for (const nd of ends) if (!clipped(nd) || nd.raw >= top - 5 || !solid.length) nd.fixed = true;
+    // ends inside the window are abutments. An end cut off at the window edge (a long viaduct running on) is held
+    // at the ground there too: the deck then depends only on what's nearby, so neighbouring tiles - whose windows
+    // cut it in different places - still agree where it crosses their border
+    for (const nd of ends) nd.fixed = true;
     if (!ns.some(nd => nd.fixed)) { for (const nd of ns) { nd.h = top; } continue; }
     for (const nd of ns) if (!nd.fixed) nd.h = top;
     for (let it = 0; it < 300; it++) for (const nd of ns) {
@@ -309,6 +664,46 @@ function levelBridges(roads, tileSize) {
       for (const [q, L] of nd.edges) { sw += 1 / L; sh += nodes[q].h / L; }
       nd.h = sh / sw;
     }
+  }
+  for (const { r, a, b } of pieces) {
+    const n = r.pts.length / 2, L = r.len[n - 1] || 1, ha = nodes[a].h, hb = nodes[b].h;
+    for (let i = 0; i < n; i++) r.h[i] = ha + (hb - ha) * r.len[i] / L;
+  }
+}
+
+// Tunnels: one straight bore between the portals. A portal end takes the height of the road it continues
+// (found by endpoint), else the smoothed ground there; ends cut off at the window are left free, joints between
+// pieces are solved like bridge joints. Runs after the outside roads have been graded.
+function levelTunnels(roads, tileSize, W) {
+  const tn = roads.filter(r => r.tunnel);
+  if (!tn.length) return;
+  const outside = roads.filter(r => !r.tunnel);    // a passage through a building on a bridge (Tower Bridge) meets decks
+  const endH = (x, z) => {
+    let best = null;
+    for (const r of outside) {
+      const n = r.pts.length / 2;
+      for (const k of [0, n - 1]) { const d = Math.hypot(r.pts[2 * k] - x, r.pts[2 * k + 1] - z); if (d < 3 && (!best || d < best.d)) best = { d, h: r.h[k] }; }
+    }
+    return best ? best.h : null;
+  };
+  const nodes = [], nodeAt = (x, z, h) => {
+    for (let i = 0; i < nodes.length; i++) if (Math.abs(nodes[i].x - x) < 1.5 && Math.abs(nodes[i].z - z) < 1.5) return i;
+    nodes.push({ x, z, raw: h, edges: [], h, fixed: false });
+    return nodes.length - 1;
+  };
+  const pieces = tn.map(r => {
+    const n = r.pts.length / 2, a = nodeAt(r.pts[0], r.pts[1], r.h[0]), b = nodeAt(r.pts[2 * n - 2], r.pts[2 * n - 1], r.h[n - 1]), L = r.len[n - 1] || 1;
+    nodes[a].edges.push([b, L]); nodes[b].edges.push([a, L]);
+    return { r, a, b };
+  });
+  const clipped = nd => nd.x < -W + 1 || nd.z < -W + 1 || nd.x > tileSize + W - 1 || nd.z > tileSize + W - 1;
+  for (const nd of nodes) if (nd.edges.length === 1 && !clipped(nd)) { const h = endH(nd.x, nd.z); nd.fixed = true; if (h !== null) nd.h = h; }
+  let lo = Infinity; for (const nd of nodes) if (nd.fixed) lo = Math.min(lo, nd.h);
+  if (lo === Infinity) for (const nd of nodes) lo = Math.min(lo, nd.raw);
+  for (const nd of nodes) if (!nd.fixed) nd.h = lo;
+  for (let it = 0; it < 300; it++) for (const nd of nodes) {
+    if (nd.fixed || nd.edges.length < 2) continue;
+    let sw = 0, sh = 0; for (const [q, L] of nd.edges) { sw += 1 / L; sh += nodes[q].h / L; } nd.h = sh / sw;
   }
   for (const { r, a, b } of pieces) {
     const n = r.pts.length / 2, L = r.len[n - 1] || 1, ha = nodes[a].h, hb = nodes[b].h;
@@ -341,7 +736,7 @@ function connectRoads(roads) {
       const ri = list[a], i = list[a + 1], rj = list[b], j = list[b + 1];
       if (ri === rj) continue;
       const r = roads[ri], q = roads[rj];
-      if (r.bridge !== q.bridge) continue;
+      if (r.bridge !== q.bridge || r.tunnel !== q.tunnel) continue;
       const ax = r.pts[2 * i], az = r.pts[2 * i + 1], bx = r.pts[2 * i + 2], bz = r.pts[2 * i + 3];
       const cx = q.pts[2 * j], cz = q.pts[2 * j + 1], dx = q.pts[2 * j + 2], dz = q.pts[2 * j + 3];
       const den = (bx - ax) * (dz - cz) - (bz - az) * (dx - cx);
@@ -367,8 +762,9 @@ function connectRoads(roads) {
     const cand = new Set([0, n - 1]);
     for (const i of r.origIdx) if (shared.get(vkey(r, i)).size > 1) cand.add(i);
     for (const i of crossAt.get(ri) || []) cand.add(i);
+    const sharedSet = new Set(); for (const i of r.origIdx) if (shared.get(vkey(r, i)).size > 1) sharedSet.add(i);
     for (const i of cand) {
-      const px = r.pts[2 * i], pz = r.pts[2 * i + 1];
+      const px = r.pts[2 * i], pz = r.pts[2 * i + 1], isEnd = i === 0 || i === n - 1, sharedAt = sharedSet.has(i);
       const list = grid.get(key(Math.floor(px / GC), Math.floor(pz / GC)));
       if (!list) continue;
       let best = null;
@@ -376,7 +772,9 @@ function connectRoads(roads) {
         const si = list[q], j = list[q + 1];
         if (si === ri) continue;
         const s = roads[si];
-        if (s.bridge !== r.bridge) continue;
+        if (s.bridge !== r.bridge || s.tunnel !== r.tunnel || s.layer !== r.layer) continue;      // different levels never meet
+        // two decks crossing mid-span (no shared node, not an end) are stacked, not joined
+        if (r.bridge && !isEnd && !sharedAt) continue;
         const ax = s.pts[2 * j], az = s.pts[2 * j + 1], dx = s.pts[2 * j + 2] - ax, dz = s.pts[2 * j + 3] - az;
         const t = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / (dx * dx + dz * dz || 1e-9)));
         const d = Math.hypot(ax + dx * t - px, az + dz * t - pz);
@@ -396,9 +794,10 @@ function connectRoads(roads) {
       const target = best.s.h[best.j] + (best.s.h[best.j + 1] - best.s.h[best.j]) * best.t;
       const delta = target - r.h[i];
       if (Math.abs(delta) < 1e-3) continue;
-      const L0 = r.len[i];
+      // blend over a distance that keeps the slope gentle (a 30 m blend of a 5 m step is a 25% ramp)
+      const L0 = r.len[i], BL = Math.min(220, Math.max(30, Math.abs(delta) * (CLASS_LIST[r.cls] === 'rail' ? 40 : r.rank >= 7 ? 24 : 14)));
       for (let k = 0; k < n; k++) {
-        const u = Math.abs(r.len[k] - L0) / 30;
+        const u = Math.abs(r.len[k] - L0) / BL;
         if (u < 1) r.h[k] += delta * (1 - u * u * (3 - 2 * u));
       }
     }
@@ -437,8 +836,9 @@ function flatten(roads, H0, H, c) {
   const wBest = new Float32Array(G * G), dBest = new Float32Array(G * G).fill(1e9), target = new Float32Array(G * G);
   for (const r of roads) {
     if (r.bridge) continue;
-    const inner = r.hw + 0.9 * c, outer = inner + BLEND, n = r.pts.length / 2;
+    const inner = r.hw + 0.9 * c, outer = inner + BLEND, n = r.pts.length / 2, total = r.len[n - 1];
     for (let s = 0; s < n - 1; s++) {
+      if (r.tunnel && r.len[s] > 14 && r.len[s + 1] < total - 14) continue;
       const ax = r.pts[2 * s], az = r.pts[2 * s + 1], bx = r.pts[2 * s + 2], bz = r.pts[2 * s + 3];
       const ha = r.h[s] - CUT, hb = r.h[s + 1] - CUT, dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz || 1e-6;
       const i0 = Math.max(0, Math.floor((Math.min(ax, bx) - outer) / c + M)), i1 = Math.min(G - 1, Math.ceil((Math.max(ax, bx) + outer) / c + M));
@@ -589,7 +989,7 @@ function buildRoads(roads, H, c, S) {
         const y = p.h + lift;
         rv(p.x + ux * r.hw, y, p.z + uz * r.hw, nn, [0, p.len, W, p.fade], rs);
         rv(p.x - ux * r.hw, y, p.z - uz * r.hw, nn, [W, p.len, W, p.fade], rs);
-        if (!r.bridge) {
+        if (!r.bridge && !r.tunnel) {
           for (const sgn of [1, -1]) {
             const ox = p.x + sgn * ux * (r.hw + VERGE), oz = p.z + sgn * uz * (r.hw + VERGE);
             vv(p.x + sgn * ux * r.hw, y - 0.012, p.z + sgn * uz * r.hw, nn, 0);
@@ -600,7 +1000,7 @@ function buildRoads(roads, H, c, S) {
       for (let i = 0; i < n - 1; i++) {
         const L0 = base + 2 * i;
         R.idx.push(L0 + 1, L0, L0 + 2, L0 + 1, L0 + 2, L0 + 3);
-        if (!r.bridge) {
+        if (!r.bridge && !r.tunnel) {
           const v0 = vbase + 4 * i, v1 = v0 + 4; // per point: [L inner, L outer, R inner, R outer]
           V.idx.push(v0, v0 + 1, v1, v0 + 1, v1 + 1, v1);
           V.idx.push(v0 + 2, v1 + 2, v0 + 3, v0 + 3, v1 + 2, v1 + 3);
@@ -616,7 +1016,7 @@ function buildRoads(roads, H, c, S) {
           rv(p.x + Math.cos(a) * r.hw, y, p.z + Math.sin(a) * r.hw, UP, [W / 2, p.len, W, 0], rs);
         }
         for (let s = 0; s < seg; s++) R.idx.push(cv, cv + s + 2, cv + s + 1);
-        if (!r.bridge) {
+        if (!r.bridge && !r.tunnel) {
           const vb = V.pos.length / 3;
           for (let s = 0; s <= seg; s++) {
             const a = s / seg * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
@@ -645,7 +1045,7 @@ function buildSegs(roads) {
     const lift = ROAD_LIFT + r.rank * 0.003;
     for (let i = 0; i < r.pts.length / 2 - 1; i++) {
       segs.set([r.pts[2 * i], r.pts[2 * i + 1], r.pts[2 * i + 2], r.pts[2 * i + 3], r.hw, r.surf, r.rank, r.cls,
-        r.bridge ? 1 : 0, r.h[i] + lift, r.h[i + 1] + lift, r.oneway ? -r.lanes : r.lanes, rid], o);
+        r.tunnel ? 2 : r.bridge ? 1 : 0, r.h[i] + lift, r.h[i + 1] + lift, r.oneway ? -r.lanes : r.lanes, rid], o);
       o += SEG;
     }
   });
@@ -683,6 +1083,7 @@ function gradeSeparate(roads, wm, c) {
         for (const u of list) {
           if (vr[u] === r) continue;
           const Q = roads[vr[u]], ku = vk[u], d = Math.hypot(Q.pts[2 * ku] - x, Q.pts[2 * ku + 1] - z);
+          if (Q.tunnel || R.tunnel) continue;
           if (d < 2.5 && Math.abs(Q.h[ku] - R.h[k]) < 2) link(v, u, d);
         }
       }
@@ -739,8 +1140,10 @@ function gradeSeparate(roads, wm, c) {
           if (!list) continue;
           for (let q = 0; q < list.length; q += 2) {
             const ni = list[q], j = list[q + 1], N = roads[ni];
-            // a bridge over a ground road, or over another bridge when OSM's layer says which is on top
-            if (ni === bi || (N.bridge && N.layer === B.layer)) continue;
+            if (N.tunnel) continue;
+            // a bridge over a ground road, or over another bridge (OSM's layer says which is on top; if the
+            // layers match, two decks crossing at a real angle are still stacked - the higher one stays on top)
+            if (ni === bi || (N.bridge && N.layer === B.layer && !(Math.abs((bx - ax) * (N.pts[2 * j + 3] - N.pts[2 * j + 1]) - (bz - az) * (N.pts[2 * j + 2] - N.pts[2 * j])) > 0.4 * Math.hypot(bx - ax, bz - az) * Math.hypot(N.pts[2 * j + 2] - N.pts[2 * j], N.pts[2 * j + 3] - N.pts[2 * j + 1])))) continue;
             const cx = N.pts[2 * j], cz = N.pts[2 * j + 1], dx = N.pts[2 * j + 2], dz = N.pts[2 * j + 3];
             const den = (bx - ax) * (dz - cz) - (bz - az) * (dx - cx);
             if (Math.abs(den) < 1e-9) continue;
@@ -754,7 +1157,8 @@ function gradeSeparate(roads, wm, c) {
             seen.add(key);
             const l1 = Math.hypot(bx - ax, bz - az) || 1, l2 = Math.hypot(dx - cx, dz - cz) || 1;
             const sin = Math.abs(den) / (l1 * l2), kb = u < 0.5 ? i : i + 1, kn = v < 0.5 ? j : j + 1;
-            if (N.layer > B.layer) crossings.push({ bi: ni, kb: kn, ni: bi, kn: kb, sin });
+            const nTop = N.layer > B.layer || (N.bridge && N.layer === B.layer && N.h[kn] > B.h[kb]);
+            if (nTop) crossings.push({ bi: ni, kb: kn, ni: bi, kn: kb, sin });
             else crossings.push({ bi, kb, ni, kn, sin });
           }
         }
@@ -767,14 +1171,18 @@ function gradeSeparate(roads, wm, c) {
     if (deficit < 0.2) continue;
     const fo = isRail(N) ? 0.8 : isRail(B) ? 0.35 : 0.6, up = deficit * fo, down = deficit - up;
     const across = (w) => (w + 4) / Math.max(x.sin, 0.35);
-    spread(x.bi, x.kb, up, across(N.hw), isRail(B) ? clamp(60 * up, 120, 240) : clamp(22 * up, 50, 140), new Set([x.ni]));
-    if (down > 0.05) spread(x.ni, x.kn, -down, across(B.hw), isRail(N) ? clamp(60 * down, 100, 220) : clamp(22 * down, 40, 120), new Set([x.bi]));
+    // ramps long enough to keep grades realistic: ~3% rail, ~5% big roads, ~7% streets
+    const rampFor = (R, d) => isRail(R) ? clamp(60 * d, 120, 260) : R.rank >= 7 ? clamp(30 * d, 70, 220) : clamp(22 * d, 40, 140);
+    spread(x.bi, x.kb, up, across(N.hw), rampFor(B, up), new Set([x.ni]));
+    if (down > 0.05) spread(x.ni, x.kn, -down, across(B.hw), rampFor(N, down), new Set([x.bi]));
   }
 
   // --- water: bridges clear it, roads crossing a stream sit just above it
   if (!wm) return;
-  const cell = (x, z) => { const gi = Math.round(x / c + M), gj = Math.round(z / c + M); return gi < 0 || gj < 0 || gi >= G || gj >= G ? -1 : gj * G + gi; };
+  const GG = wm.wide ? GE : G, MM = wm.wide ? ME : M;
+  const cell = (x, z) => { const gi = Math.round(x / c + MM), gj = Math.round(z / c + MM); return gi < 0 || gj < 0 || gi >= GG || gj >= GG ? -1 : gj * GG + gi; };
   roads.forEach((R, ri) => {
+    if (R.tunnel) return;
     const n = R.pts.length / 2;
     let run = null;
     const runs = [];
@@ -784,6 +1192,27 @@ function gradeSeparate(roads, wm, c) {
       else if (run) { runs.push(run); run = null; }
     }
     if (run) runs.push(run);
+    if (R.bridge && runs.length) {
+      // Bridges: a purely local rule, so every tile works out the same deck for a long bridge that crosses tile
+      // borders (spreading from "the middle of the water run" depended on how much of the bridge a tile could
+      // see, and left steps where tiles met). Each vertex over water needs level + clearance; every vertex of the
+      // deck is then held within a gentle grade of every such point, and the bridge's ends ramp the approaches.
+      const grade = isRail(R) ? 0.025 : 0.05, need = [];
+      for (const w of runs) {
+        const span = R.len[w.k1] - R.len[w.k0], clr = w.sea ? 5 : span < 15 ? 1.8 : span < 40 ? 3 : 4.5;
+        for (let k = w.k0; k <= w.k1; k++) { const q = cell(R.pts[2 * k], R.pts[2 * k + 1]); need.push(k, (q >= 0 && wm.isW[q] ? wm.L[q] : w.lvl) + clr); }
+      }
+      const delta = new Float32Array(n);
+      for (let k = 0; k < n; k++) {
+        let t = -Infinity;
+        for (let i = 0; i < need.length; i += 2) t = Math.max(t, need[i + 1] - Math.max(0, Math.abs(R.len[k] - R.len[need[i]]) - 3) * grade);
+        delta[k] = Math.max(0, t - R.h[k]);
+      }
+      for (let k = 0; k < n; k++) R.h[k] += delta[k];
+      // (spread() also lifts its starting vertex, which already has its delta: take it off first)
+      for (const k of n > 1 ? [0, n - 1] : [0]) if (delta[k] > 0.1) { R.h[k] -= delta[k]; spread(ri, k, delta[k], 0, delta[k] / grade + 10, new Set([ri])); }
+      return;
+    }
     for (const w of runs) {
       const span = R.len[w.k1] - R.len[w.k0];
       let clr, flat, ramp;
@@ -830,35 +1259,36 @@ function alignBridgeLandmarks(lms, roads) {
 // built, so roads, water and props all follow it. Without it, summit statues sank into the hillside (the base
 // goes at the lowest ground) and slopes ran straight through plinths and plazas. Carvings hung off a mountain
 // (anchor "centre") keep the natural ground.
-function padLandmarks(H, lms, c, wm) {
-  const wet = k => !!(wm && wm.isW[k]);
+function padLandmarks(H, lms, c, wm, GG = G, MM = M) {
+  // H may be the wide road grid (GG x GG, margin MM); the water mask is on the terrain grid
+  const d0 = MM - M, wet = k => { if (!wm) return false; const gi = k % GG - d0, gj = Math.floor(k / GG) - d0; return gi >= 0 && gj >= 0 && gi < G && gj < G && !!wm.isW[gj * G + gi]; };
   for (const L of lms) {
     if (L.anchor === 'centre' || L.bridge) continue;
     const cs = Math.cos(L.rot), sn = Math.sin(L.rot);
     const ax = L.pax || L.hx + 4, az = L.paz || L.hz + 4, BL = 20, R = Math.hypot(ax, az) + BL;
-    const i0 = Math.max(0, Math.floor((L.x - R) / c + M)), i1 = Math.min(G - 1, Math.ceil((L.x + R) / c + M));
-    const j0 = Math.max(0, Math.floor((L.z - R) / c + M)), j1 = Math.min(G - 1, Math.ceil((L.z + R) / c + M));
+    const i0 = Math.max(0, Math.floor((L.x - R) / c + MM)), i1 = Math.min(GG - 1, Math.ceil((L.x + R) / c + MM));
+    const j0 = Math.max(0, Math.floor((L.z - R) / c + MM)), j1 = Math.min(GG - 1, Math.ceil((L.z + R) / c + MM));
     if (i0 > i1 || j0 > j1) continue;
     // model-space distance outside the footprint rectangle (0 inside)
     const outside = (gi, gj) => {
-      const ex = (gi - M) * c - L.x, ez = (gj - M) * c - L.z, mx = ex * cs - ez * sn, mz = ex * sn + ez * cs;
+      const ex = (gi - MM) * c - L.x, ez = (gj - MM) * c - L.z, mx = ex * cs - ez * sn, mz = ex * sn + ez * cs;
       return Math.hypot(Math.max(0, Math.abs(mx) - ax), Math.max(0, Math.abs(mz) - az));
     };
     const inside = [];
     let wetN = 0;
-    for (let gj = j0; gj <= j1; gj++) for (let gi = i0; gi <= i1; gi++) if (outside(gi, gj) === 0) { const k = gj * G + gi; if (wet(k)) wetN++; else inside.push(H[k]); }
+    for (let gj = j0; gj <= j1; gj++) for (let gi = i0; gi <= i1; gi++) if (outside(gi, gj) === 0) { const k = gj * GG + gi; if (wet(k)) wetN++; else inside.push(H[k]); }
     if (wetN > inside.length * 3) continue;          // mostly over water (a span, a pier): leave the ground alone
     if (!inside.length) {           // footprint smaller than a cell: use the ground at the centre
-      const gi = Math.round(L.x / c + M), gj = Math.round(L.z / c + M);
-      if (gi < 0 || gj < 0 || gi >= G || gj >= G) continue;
-      inside.push(H[gj * G + gi]);
+      const gi = Math.round(L.x / c + MM), gj = Math.round(L.z / c + MM);
+      if (gi < 0 || gj < 0 || gi >= GG || gj >= GG) continue;
+      inside.push(H[gj * GG + gi]);
     }
     inside.sort((a, b) => a - b);
     const lvl = inside[inside.length >> 1];
     for (let gj = j0; gj <= j1; gj++) for (let gi = i0; gi <= i1; gi++) {
       const d = outside(gi, gj);
       if (d >= BL) continue;
-      const u = d / BL, w = 1 - u * u * (3 - 2 * u), k = gj * G + gi;
+      const u = d / BL, w = 1 - u * u * (3 - 2 * u), k = gj * GG + gi;
       if (wet(k)) continue;                          // never fill in water
       H[k] += (lvl - H[k]) * w;
     }
@@ -922,12 +1352,12 @@ function mesher() {
 }
 
 const CONCRETE = [0.66, 0.65, 0.62], CONCRETE_DARK = [0.5, 0.49, 0.47], GALV = [0.66, 0.68, 0.7];
-function buildStructures(roads, waterway, H, c, S) {
+function buildStructures(roads, waterway, H, c, S, lms = null) {
   const m = mesher(), colSegs = [];
   // is a ground-level road / railway within `pad` metres of (x, z)?
   const onGroundRoad = (x, z, pad) => {
     for (const q of roads) {
-      if (q.bridge) continue;
+      if (q.bridge || q.tunnel) continue;
       for (let i = 0; i < q.pts.length / 2 - 1; i++) {
         const ax = q.pts[2 * i], az = q.pts[2 * i + 1], dx = q.pts[2 * i + 2] - ax, dz = q.pts[2 * i + 3] - az;
         if (Math.abs(ax - x) > 60 || Math.abs(az - z) > 60) continue;
@@ -944,8 +1374,74 @@ function buildStructures(roads, waterway, H, c, S) {
     cx /= n; cz /= n; hy /= n;
     for (let i = 0; i < n; i++) rad += Math.hypot(r.pts[2 * i] - cx, r.pts[2 * i + 1] - cz) / n;
     const ir = rad - r.hw - 0.3;
+    if (lms && lms.some(L => Math.hypot(L.x - cx, L.z - cz) < ir)) continue;   // a landmark there (Slavija's fountain) is the island
     if (ir > 1.5 && cx >= 0 && cx < S && cz >= 0 && cz < S) m.cylinder([cx, hy - 0.6, cz], [cx, hy + 0.2, cz], ir, 28, CONCRETE, [0.3, 0.42, 0.2]);
   }
+  for (const r of roads) {
+    if (!r.tunnel) continue;
+    const lift = ROAD_LIFT + r.rank * 0.003, hw = r.hw, top = 5.4;
+    for (const piece of clipPieces(r, S)) {
+      const P = piece.pts.map((p, i, arr) => {
+        const a = arr[Math.max(0, i - 1)], b = arr[Math.min(arr.length - 1, i + 1)], l = Math.hypot(b.x - a.x, b.z - a.z) || 1;
+        return { x: p.x, z: p.z, y: p.h + lift, tx: (b.x - a.x) / l, tz: (b.z - a.z) / l, len: p.len };
+      });
+      if (P.length < 2) continue;
+      // only a real bore gets a tube: a passage under a building or through a bridge tower has none
+      let cover = 0; for (const a of P) cover = Math.max(cover, sampleTri(H, a.x, a.z, c) - a.y);
+      if (cover < 4) continue;
+      // walls and roof in one thick arch-ish section, plus a pale band of lights along the roof
+      m.extrude(P, [[-hw - 1.0, -0.3], [-hw - 1.0, top + 0.6], [hw + 1.0, top + 0.6], [hw + 1.0, -0.3], [hw + 0.5, -0.3], [hw + 0.5, top - 0.8], [hw - 0.6, top],
+                    [-hw + 0.6, top], [-hw - 0.5, top - 0.8], [-hw - 0.5, -0.3]], [0.42, 0.42, 0.4], false);
+      m.extrude(P, [[-0.5, top - 0.02], [0.5, top - 0.02], [0.5, top - 0.12], [-0.5, top - 0.12]], [0.95, 0.9, 0.7], false);
+      const Wt = (p, u, v) => [p.x - p.tz * u, p.y + v, p.z + p.tx * u];
+      for (const [use, a] of [[piece.startCap, P[0]], [piece.endCap, P[P.length - 1]]]) {
+        if (!use) continue;
+        m.box(a.x, a.y + top + 1.6, a.z, 2 * hw + 5, 2.4, 1.2, Math.atan2(a.tx, a.tz), [0.55, 0.54, 0.5]);
+      }
+      for (let i = 0; i < P.length - 1; i++) for (const sgn of [-1, 1]) {
+        const a = Wt(P[i], sgn * (hw + 0.4), 0), b = Wt(P[i + 1], sgn * (hw + 0.4), 0);
+        colSegs.push(a[0], a[2], b[0], b[2], a[1]);
+      }
+    }
+  }
+  // where decks merge or split (slip roads joining a bridge, carriageways meeting), one deck's edge runs across the
+  // other's surface: no parapet, railing or edge collision there. A point is "on another deck" when it lies within
+  // that deck's width at about the same height.
+  const DG = 16, deckGrid = new Map(), dkey = (x, z) => Math.floor(x / DG) * 100003 + Math.floor(z / DG);
+  roads.forEach((q, qi) => {
+    if (!q.bridge) return;
+    for (let i = 0; i < q.pts.length / 2 - 1; i++) {
+      const ax = q.pts[2 * i], az = q.pts[2 * i + 1], bx = q.pts[2 * i + 2], bz = q.pts[2 * i + 3], pad = q.hw + 1;
+      for (let gz = Math.floor((Math.min(az, bz) - pad) / DG); gz <= Math.floor((Math.max(az, bz) + pad) / DG); gz++)
+        for (let gx = Math.floor((Math.min(ax, bx) - pad) / DG); gx <= Math.floor((Math.max(ax, bx) + pad) / DG); gx++) {
+          const key = gx * 100003 + gz; (deckGrid.get(key) || deckGrid.set(key, []).get(key)).push(qi, i);
+        }
+    }
+  });
+  const onOtherDeck = (self, x, y, z) => {
+    const list = deckGrid.get(dkey(x, z));
+    if (!list) return false;
+    for (let s = 0; s < list.length; s += 2) {
+      const q = roads[list[s]], i = list[s + 1];
+      if (q === self) continue;
+      const ax = q.pts[2 * i], az = q.pts[2 * i + 1], dx = q.pts[2 * i + 2] - ax, dz = q.pts[2 * i + 3] - az;
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz || 1e-9)));
+      if (Math.hypot(ax + dx * t - x, az + dz * t - z) > q.hw + 0.1) continue;
+      const qy = q.h[i] + (q.h[i + 1] - q.h[i]) * t + ROAD_LIFT + q.rank * 0.003;
+      if (Math.abs(qy - y) < 1.3) return true;
+    }
+    return false;
+  };
+  // sweep a parapet along only the stretches of one side that are not on another deck
+  const sideRuns = (r, P, u) => {
+    const ok = P.map(p => !onOtherDeck(r, p.x - p.tz * u, p.y, p.z + p.tx * u)), runs = [];
+    let a = -1;
+    for (let i = 0; i <= P.length; i++) {
+      if (i < P.length && ok[i]) { if (a < 0) a = i; }
+      else if (a >= 0) { if (i - a >= 2) runs.push(P.slice(a, i)); a = -1; }
+    }
+    return { runs, ok };
+  };
   for (const r of roads) {
     if (!r.bridge) continue;
     const rail = CLASS_LIST[r.cls] === 'rail';
@@ -963,14 +1459,16 @@ function buildStructures(roads, waterway, H, c, S) {
       if (P.length < 2) continue;
       // deck slab
       m.extrude(P, [[-hw - 0.4, -0.03], [hw + 0.4, -0.03], [hw + 0.4, -T], [-hw - 0.4, -T]], CONCRETE, true);
-      // parapets: concrete barriers on big roads, steel railings otherwise
+      // parapets: concrete barriers on big roads, steel railings otherwise - skipping stretches that stand on
+      // another deck this one merges with
+      const side = { [-1]: sideRuns(r, P, -(hw + 0.25)), [1]: sideRuns(r, P, hw + 0.25) };
       if (r.rank >= 6 || style === 'concrete') {
-        m.extrude(P, [[-hw - 0.4, -0.03], [-hw + 0.05, -0.03], [-hw - 0.05, 0.25], [-hw - 0.15, 0.85], [-hw - 0.4, 0.85]], CONCRETE, true);
-        m.extrude(P, [[hw + 0.4, 0.85], [hw + 0.15, 0.85], [hw + 0.05, 0.25], [hw - 0.05, -0.03], [hw + 0.4, -0.03]], CONCRETE, true);
+        for (const run of side[-1].runs) m.extrude(run, [[-hw - 0.4, -0.03], [-hw + 0.05, -0.03], [-hw - 0.05, 0.25], [-hw - 0.15, 0.85], [-hw - 0.4, 0.85]], CONCRETE, true);
+        for (const run of side[1].runs) m.extrude(run, [[hw + 0.4, 0.85], [hw + 0.15, 0.85], [hw + 0.05, 0.25], [hw - 0.05, -0.03], [hw + 0.4, -0.03]], CONCRETE, true);
       } else {
-        for (const sgn of [-1, 1]) {
-          m.extrude(P, [[sgn * (hw + 0.25) - 0.04, 0.95], [sgn * (hw + 0.25) + 0.04, 0.95], [sgn * (hw + 0.25) + 0.04, 1.05], [sgn * (hw + 0.25) - 0.04, 1.05]], GALV, true);
-          m.extrude(P, [[sgn * (hw + 0.25) - 0.04, 0.5], [sgn * (hw + 0.25) + 0.04, 0.5], [sgn * (hw + 0.25) + 0.04, 0.6], [sgn * (hw + 0.25) - 0.04, 0.6]], GALV, true);
+        for (const sgn of [-1, 1]) for (const run of side[sgn].runs) {
+          m.extrude(run, [[sgn * (hw + 0.25) - 0.04, 0.95], [sgn * (hw + 0.25) + 0.04, 0.95], [sgn * (hw + 0.25) + 0.04, 1.05], [sgn * (hw + 0.25) - 0.04, 1.05]], GALV, true);
+          m.extrude(run, [[sgn * (hw + 0.25) - 0.04, 0.5], [sgn * (hw + 0.25) + 0.04, 0.5], [sgn * (hw + 0.25) + 0.04, 0.6], [sgn * (hw + 0.25) - 0.04, 0.6]], GALV, true);
         }
       }
       // walk the deck for posts, girders, truss members and piers
@@ -1003,7 +1501,10 @@ function buildStructures(roads, waterway, H, c, S) {
       }
       if (style !== 'concrete' && r.rank < 6) for (let d = L0; d <= L1; d += 2) {
         const a = pt(d);
-        for (const sgn of [-1, 1]) m.box(...W(a, sgn * (hw + 0.25), 0.5), 0.1, 1.05, 0.1, Math.atan2(a.tx, a.tz), GALV);
+        for (const sgn of [-1, 1]) {
+          const p = W(a, sgn * (hw + 0.25), 0);
+          if (!onOtherDeck(r, p[0], a.y, p[2])) m.box(...W(a, sgn * (hw + 0.25), 0.5), 0.1, 1.05, 0.1, Math.atan2(a.tx, a.tz), GALV);
+        }
       }
       // piers between spans, abutments at real ends
       const under = T + (style === 'girder' ? 1.1 : 0);
@@ -1036,6 +1537,7 @@ function buildStructures(roads, waterway, H, c, S) {
       }
       // edge collisions (with deck height so cars underneath don't hit them)
       for (let i = 0; i < P.length - 1; i++) for (const sgn of [-1, 1]) {
+        if (!side[sgn].ok[i] || !side[sgn].ok[i + 1]) continue;      // open where it joins another deck
         const a = W(P[i], sgn * (hw + 0.2), 0), b = W(P[i + 1], sgn * (hw + 0.2), 0);
         colSegs.push(a[0], a[2], b[0], b[2], a[1]);
       }
@@ -1082,12 +1584,14 @@ function buildStructures(roads, waterway, H, c, S) {
 const PC = 'https://planetarycomputer.microsoft.com/api/data/v1/mosaic/';
 const enc = encodeURIComponent;
 // ground material ids (also texture-array layers 0..6; 7 = water, photo only)
-const GRASS = 0, CROP = 1, SOIL = 2, FOREST = 3, MUD = 4, GRAVEL = 5, URBAN = 6, WATER = 7;
+const GRASS = 0, CROP = 1, SOIL = 2, FOREST = 3, MUD = 4, GRAVEL = 5, URBAN = 6, WATER = 7, SAND = 8, SNOW = 9;
+const NCLS = 10;
 const N = 512; // classification grid per tile (~3.7 m at 40° lat)
 
 function cdlMat(c) {
   if (c === 111 || c === 83 || c === 92) return WATER;
-  if (c === 112 || c === 131 || c === 65) return GRAVEL;
+  if (c === 112) return SNOW;                                   // perennial ice / snow
+  if (c === 131 || c === 65) return GRAVEL;                     // barren (sand where the photo is sandy)
   if (c === 121) return GRASS;                                  // developed, open space (lawns, parks)
   if (c === 82 || c === 122 || c === 123 || c === 124) return URBAN;
   if (c === 141 || c === 142 || c === 143 || c === 63 || c === 190 || c === 87) return FOREST;
@@ -1099,10 +1603,19 @@ function cdlMat(c) {
   return CROP;                                                  // every actual crop
 }
 function wcMat(c) {
-  return { 10: FOREST, 20: SOIL, 30: GRASS, 40: CROP, 50: URBAN, 60: GRAVEL, 70: GRAVEL, 80: WATER, 90: MUD, 95: FOREST, 100: GRASS }[c] ?? -1;
+  return { 10: FOREST, 20: SOIL, 30: GRASS, 40: CROP, 50: URBAN, 60: GRAVEL, 70: SNOW, 80: WATER, 90: MUD, 95: FOREST, 100: GRASS }[c] ?? -1;
 }
-// sharpen the coarse class with the photo's own NDVI (n) and brightness (lum)
-function refine(m, n, lum) {
+// sharpen the coarse class with the photo's own NDVI (n) and brightness (lum); bare ground that looks like sand in
+// the photo (bright and warm-yellow, no plants: deserts, dunes, beaches) becomes sand. Snow comes only from the
+// maps' snow/ice classes - by colour, white salt flats and pale rock would turn to snow.
+function refine(m, n, lum, r = 0, g = 0, b = 0) {
+  const out = refineBase(m, n, lum);
+  const sandy = lum > 0.44 && r - b > 0.1 && g - b > 0.04 && !(n > 0.12);
+  if (out === GRAVEL && sandy) return SAND;
+  if (out === SOIL && sandy && lum > 0.5) return SAND;
+  return out;
+}
+function refineBase(m, n, lum) {
   if (Number.isNaN(n)) return m < 0 ? GRASS : m;
   if (m < 0) m = n > 0.5 ? FOREST : n > 0.2 ? GRASS : SOIL;
   const wet = n < -0.08 && lum < 0.22;
@@ -1115,6 +1628,7 @@ function refine(m, n, lum) {
     case WATER: return n > 0.2 ? MUD : WATER;
     case MUD: return n > 0.4 ? GRASS : MUD;
     case GRAVEL: return n > 0.35 ? GRASS : GRAVEL;
+    case SNOW: return n > 0.3 ? GRASS : lum < 0.28 ? GRAVEL : SNOW;   // dark patches in a glacier map are rock
   }
   return m;
 }
@@ -1139,6 +1653,21 @@ function validFraction(px, byAlpha) {
   return ok / n;
 }
 
+// Some Sentinel-2 mosaic scenes are blown out to pure white (winter snow or cloud - the Himalaya, much of the high
+// Andes), which blankets the terrain. When most of a tile's photo is saturated white, use the Esri World Imagery
+// photo for that tile instead (high-res aerials, mostly snow-free season).
+const ESRI_IMG = (z, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
+function whiteFraction(px) {
+  let w = 0, n = 0;
+  for (let i = 0; i < px.length; i += 4 * 31, n++) if (px[i] > 238 && px[i + 1] > 238 && px[i + 2] > 238) w++;
+  return n ? w / n : 0;
+}
+async function unwhite(photo, source, tx, ty, size) {
+  if (!photo || whiteFraction(photo) < 0.3) return [photo, source];
+  const alt = await fetchPixels(ESRI_IMG(Z, tx, ty), size);
+  if (!alt || validFraction(alt, false) < 0.5 || whiteFraction(alt) > whiteFraction(photo) - 0.1) return [photo, source];
+  return [alt, 'Esri'];
+}
 async function buildImagery(tx, ty, lod, img) {
   const ids = img.ids, path = `tiles/WebMercatorQuad/${Z}/${tx}/${ty}`;
   const naipPhoto = s => ids.naip && `${PC}${ids.naip}/${path}@${s}x.jpg?collection=naip&assets=image&asset_bidx=image%7C1%2C2%2C3`;
@@ -1153,6 +1682,7 @@ async function buildImagery(tx, ty, lod, img) {
     let photo = img.us ? await get(naipPhoto(1), 256) : null;
     let source = 'NAIP';
     if (!photo || validFraction(photo, false) < 0.5) { photo = await get(s2Photo(1), 256); source = 'Sentinel-2'; }
+    [photo, source] = await unwhite(photo, source, tx, ty, 256);
     if (!photo) return null;
     for (let i = 3; i < photo.length; i += 4) photo[i] = 128;
     return { photo: new Uint8Array(photo.buffer), photoSize: 256, source };
@@ -1165,6 +1695,7 @@ async function buildImagery(tx, ty, lod, img) {
     size = 512; source = 'Sentinel-2';
   }
   if (!cls || validFraction(cls, true) < 0.5) { cls = await get(wc, 256); clsKind = 'wc'; }
+  [photo, source] = await unwhite(photo, source, tx, ty, size);
   if (!photo) return null;
 
   const mat = new Uint8Array(N * N), code = new Uint8Array(N * N);
@@ -1177,8 +1708,23 @@ async function buildImagery(tx, ty, lod, img) {
     const pi = (Math.floor(y * ps) * size + Math.floor(x * ps)) * 4;
     const lum = (photo[pi] * 0.3 + photo[pi + 1] * 0.59 + photo[pi + 2] * 0.11) / 255;
     const m0 = c ? (clsKind === 'cdl' ? cdlMat(c) : wcMat(c)) : -1;
-    mat[i] = refine(m0, n, lum);
+    mat[i] = refine(m0, n, lum, photo[pi] / 255, photo[pi + 1] / 255, photo[pi + 2] / 255);
     code[i] = clsKind === 'cdl' ? c : 0;
+  }
+
+  // sand only where sand plausibly is: the desert belt (|lat| < 42) or a beach (within ~60 m of water). Elsewhere
+  // the same pale, warm colour is limestone scree or glacial gravel.
+  {
+    const lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * (ty + 0.5) / NT))) * 180 / Math.PI;
+    if (Math.abs(lat) >= 42) {
+      const R = 16, wet = new Uint8Array(N * N), tmp = new Uint8Array(N * N);
+      for (let i = 0; i < N * N; i++) wet[i] = mat[i] === WATER ? 1 : 0;
+      for (let y = 0; y < N; y++) { let last = -1e9; for (let x = 0; x < N; x++) { if (wet[y * N + x]) last = x; tmp[y * N + x] = x - last <= R ? 1 : 0; }
+        last = 1e9; for (let x = N - 1; x >= 0; x--) { if (wet[y * N + x]) last = x; if (last - x <= R) tmp[y * N + x] = 1; } }
+      for (let x = 0; x < N; x++) { let last = -1e9; for (let y = 0; y < N; y++) { if (tmp[y * N + x]) last = y; wet[y * N + x] = y - last <= R ? 1 : 0; }
+        last = 1e9; for (let y = N - 1; y >= 0; y--) { if (tmp[y * N + x]) last = y; if (last - y <= R) wet[y * N + x] = 1; } }
+      for (let i = 0; i < N * N; i++) if (mat[i] === SAND && !wet[i]) mat[i] = GRAVEL;
+    }
   }
 
   // The crop map's 30 m pixels spill over field margins, farmyards and verges: pull crop areas
@@ -1199,19 +1745,19 @@ async function buildImagery(tx, ty, lod, img) {
   }
   mat.set(eroded);
 
-  // one-hot material weights, softened with a small blur, packed into two RGBA textures
-  const W = new Float32Array(N * N * 8), T = new Float32Array(N * N * 8);
-  for (let i = 0; i < N * N; i++) W[i * 8 + mat[i]] = 1;
+  // one-hot material weights, softened with a small blur, packed into three RGBA textures (wc: sand, snow)
+  const W = new Float32Array(N * N * NCLS), T = new Float32Array(N * N * NCLS);
+  for (let i = 0; i < N * N; i++) W[i * NCLS + mat[i]] = 1;
   for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-    const a = (y * N + Math.max(0, x - 1)) * 8, b = (y * N + x) * 8, c = (y * N + Math.min(N - 1, x + 1)) * 8;
-    for (let k = 0; k < 8; k++) T[b + k] = (W[a + k] + 2 * W[b + k] + W[c + k]) / 4;
+    const a = (y * N + Math.max(0, x - 1)) * NCLS, b = (y * N + x) * NCLS, c = (y * N + Math.min(N - 1, x + 1)) * NCLS;
+    for (let k = 0; k < NCLS; k++) T[b + k] = (W[a + k] + 2 * W[b + k] + W[c + k]) / 4;
   }
-  const wa = new Uint8Array(N * N * 4), wb = new Uint8Array(N * N * 4);
+  const wa = new Uint8Array(N * N * 4), wb = new Uint8Array(N * N * 4), wsc = new Uint8Array(N * N * 4);
   for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-    const a = (Math.max(0, y - 1) * N + x) * 8, b = (y * N + x) * 8, c = (Math.min(N - 1, y + 1) * N + x) * 8, o = (y * N + x) * 4;
-    for (let k = 0; k < 8; k++) {
+    const a = (Math.max(0, y - 1) * N + x) * NCLS, b = (y * N + x) * NCLS, c = (Math.min(N - 1, y + 1) * N + x) * NCLS, o = (y * N + x) * 4;
+    for (let k = 0; k < NCLS; k++) {
       const v = Math.round((T[a + k] + 2 * T[b + k] + T[c + k]) / 4 * 255);
-      if (k < 4) wa[o + k] = v; else wb[o + k - 4] = v;
+      if (k < 4) wa[o + k] = v; else if (k < 8) wb[o + k - 4] = v; else wsc[o + k - 8] = v;
     }
   }
 
@@ -1222,7 +1768,7 @@ async function buildImagery(tx, ty, lod, img) {
     out[o] = photo[o]; out[o + 1] = photo[o + 1]; out[o + 2] = photo[o + 2];
     out[o + 3] = ndvi && ndvi[ni + 3] > 0 ? ndvi[ni] : 128;
   }
-  return { photo: out, photoSize: size, wa, wb, mat, code, source, clsKind };
+  return { photo: out, photoSize: size, wa, wb, wc: wsc, mat, code, source, clsKind };
 }
 
 // ------------------------------------------------ water
@@ -1231,25 +1777,34 @@ async function buildImagery(tx, ty, lod, img) {
 const WATERWAY_WIDTH = { river: 14, canal: 10, stream: 3, drain: 2, ditch: 2 };
 // typical surface current (m/s); OSM waterways are drawn in the direction the water flows
 const WATERWAY_SPEED = { river: 1.3, canal: 0.25, stream: 0.9, drain: 0.5, ditch: 0.35 };
-function waterMask(vt, H0, c, tileSize) {
+const WSS = 4;   // the visible shoreline is drawn at 4x the terrain grid
+function waterMask(vt, H0, c, tileSize, urb = null) {
   if (!vt.water && !vt.waterway) return null;
   const ctx = new OffscreenCanvas(G, G).getContext('2d', { willReadFrequently: true });
+  // the same water at 4x resolution, streams at their true width: where the water's edge is drawn (the grid
+  // above decides levels, depth and physics, and is too coarse for a smooth waterline)
+  const hctx = new OffscreenCanvas(G * WSS, G * WSS).getContext('2d', { willReadFrequently: true });
+  hctx.setTransform(WSS, 0, 0, WSS, 0, 0);
+  // water polygons alone (no lines): tells the cells only a stream/ditch line made apart from lakes and rivers
+  const pctx = new OffscreenCanvas(G, G).getContext('2d', { willReadFrequently: true });
   const toG = (v, k) => v * k / c + M + 0.5; // vertex (gi) sits at canvas pixel centre gi + 0.5
   let drew = false;
-  const flowSegs = [];   // [gx0, gz0, gx1, gz1, speed, radius] in grid vertex units
+  const flowSegs = [];   // [gx0, gz0, gx1, gz1, speed, radius, drawn half-width] in grid vertex units
   if (vt.water) {
     const k = tileSize / vt.water.extent;
     for (const fb of vt.water.features) {
       const f = readFeature(fb, vt.water);
       if (f.type !== 3 || f.props.brunnel === 'tunnel') continue;
-      ctx.fillStyle = f.props.class === 'ocean' ? '#00ff00' : '#ff0000';
-      ctx.beginPath();
-      for (const ring of f.parts) {
-        ctx.moveTo(toG(ring[0], k), toG(ring[1], k));
-        for (let i = 2; i < ring.length; i += 2) ctx.lineTo(toG(ring[i], k), toG(ring[i + 1], k));
-        ctx.closePath();
+      for (const cx of [ctx, hctx, pctx]) {
+        cx.fillStyle = f.props.class === 'ocean' ? '#00ff00' : '#ff0000';
+        cx.beginPath();
+        for (const ring of f.parts) {
+          cx.moveTo(toG(ring[0], k), toG(ring[1], k));
+          for (let i = 2; i < ring.length; i += 2) cx.lineTo(toG(ring[i], k), toG(ring[i + 1], k));
+          cx.closePath();
+        }
+        cx.fill('evenodd');
       }
-      ctx.fill('evenodd');
       drew = true;
     }
   }
@@ -1262,21 +1817,38 @@ function waterMask(vt, H0, c, tileSize) {
       if (f.type !== 2 || !w || f.props.brunnel === 'tunnel') continue;
       ctx.lineWidth = Math.max(w / c, 1.6);
       ctx.beginPath();
-      const sp = WATERWAY_SPEED[f.props.class] || 0.5, rad = Math.max(1.5, w / c / 2 + 1);
+      const sp = WATERWAY_SPEED[f.props.class] || 0.5, rad = Math.max(1.5, w / c / 2 + 1), hw = Math.max(w / c, 1.6) / 2;
       for (const part of f.parts) {
         ctx.moveTo(toG(part[0], k), toG(part[1], k));
         for (let i = 2; i < part.length; i += 2) {
           ctx.lineTo(toG(part[i], k), toG(part[i + 1], k));
-          flowSegs.push(toG(part[i - 2], k) - 0.5, toG(part[i - 1], k) - 0.5, toG(part[i], k) - 0.5, toG(part[i + 1], k) - 0.5, sp, rad);
+          flowSegs.push(toG(part[i - 2], k) - 0.5, toG(part[i - 1], k) - 0.5, toG(part[i], k) - 0.5, toG(part[i + 1], k) - 0.5, sp, rad, hw);
         }
       }
       ctx.stroke();
+      // drawn at least 1.6 cells wide: the terrain grid can't carry a channel any narrower without breaking it into
+      // pools, and the channel is shaped to meet the water exactly at this edge (see buildWater)
+      hctx.lineWidth = Math.max(w / c, 1.6); hctx.strokeStyle = '#ff0000'; hctx.lineCap = hctx.lineJoin = 'round';
+      hctx.beginPath();
+      for (const part of f.parts) {
+        hctx.moveTo(toG(part[0], k), toG(part[1], k));
+        for (let i = 2; i < part.length; i += 2) hctx.lineTo(toG(part[i], k), toG(part[i + 1], k));
+      }
+      hctx.stroke();
       drew = true;
     }
   }
   if (!drew) return null;
-  const px = ctx.getImageData(0, 0, G, G).data;
-  const isW = new Uint8Array(G * G), L = new Float32Array(G * G).fill(NaN), cov = new Float32Array(G * G);
+  // fine coverage (0..1) with a 1-pixel blur so the edge is soft
+  const GS = G * WSS, hp = hctx.getImageData(0, 0, GS, GS).data, cf = new Float32Array(GS * GS), covHi = new Float32Array(GS * GS);
+  for (let i = 0; i < GS * GS; i++) cf[i] = Math.max(hp[i * 4], hp[i * 4 + 1]) / 255;
+  for (let y = 0; y < GS; y++) for (let x = 0; x < GS; x++) {
+    let sum = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { const xx = x + dx, yy = y + dy; if (xx < 0 || yy < 0 || xx >= GS || yy >= GS) continue; sum += cf[yy * GS + xx]; n++; }
+    covHi[y * GS + x] = sum / n;
+  }
+  const px = ctx.getImageData(0, 0, G, G).data, ppx = pctx.getImageData(0, 0, G, G).data;
+  const isW = new Uint8Array(G * G), L = new Float32Array(G * G).fill(NaN), cov = new Float32Array(G * G), thinW = new Uint8Array(G * G);
   let any = 0;
   for (let i = 0; i < G * G; i++) {
     cov[i] = Math.max(px[i * 4], px[i * 4 + 1]) / 255;                    // anti-aliased edge coverage
@@ -1338,11 +1910,11 @@ function waterMask(vt, H0, c, tileSize) {
       }
       comps.push({ cells, river: false });
     }
-    for (let o = 0; o < flowSegs.length; o += 6) for (let t = 0; t <= 4; t++) {
+    for (let o = 0; o < flowSegs.length; o += 7) for (let t = 0; t <= 4; t++) {
       const gi = Math.round(flowSegs[o] + (flowSegs[o + 2] - flowSegs[o]) * t / 4), gj = Math.round(flowSegs[o + 1] + (flowSegs[o + 3] - flowSegs[o + 1]) * t / 4);
       if (gi >= 0 && gj >= 0 && gi < G && gj < G && comp[gj * G + gi] >= 0) comps[comp[gj * G + gi]].river = true;
     }
-    // distance from the bank, for carrying river levels out from the middle
+    // distance from the bank, for carrying river levels out from the middle (also tells thin channels apart)
     const dist = new Int32Array(G * G).fill(0), q0 = [];
     for (let k = 0; k < G * G; k++) {
       if (isW[k] !== 1) continue;
@@ -1353,7 +1925,35 @@ function waterMask(vt, H0, c, tileSize) {
       const k = q0[h];
       for (const q of [k - 1, k + 1, k - G, k + G]) if (q >= 0 && q < G * G && isW[q] === 1 && !dist[q]) { dist[q] = dist[k] + 1; q0.push(q); }
     }
+    // cells that only a waterway line put there (streams, ditches, rivers mapped as a line): they follow the
+    // valley floor, so they skip the slope limit and the hillside peel below, even where the line runs into a lake
+    const thin = thinW;
+    for (let k = 0; k < G * G; k++) if (isW[k] === 1 && ppx[k * 4 + 3] < 64) thin[k] = 1;
+    // how "city" the surroundings of each cell are: the most built-up value within ~200 m (a river's own cells
+    // are open water with promenades and gardens along it, so they never look built-up themselves)
+    let urbNear = null;
+    if (urb) {
+      const r = Math.max(2, Math.round(200 / c)), T = new Float32Array(G * G);
+      urbNear = new Float32Array(G * G);
+      for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) { let m = 0; for (let d = -r; d <= r; d++) { const ii = i + d; if (ii >= 0 && ii < G) m = Math.max(m, urb[j * G + ii]); } T[j * G + i] = m; }
+      for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) { let m = 0; for (let d = -r; d <= r; d++) { const jj = j + d; if (jj >= 0 && jj < G) m = Math.max(m, T[jj * G + i]); } urbNear[j * G + i] = m; }
+    }
     for (const cp of comps) {
+      // water inside a city (outside the US): the radar elevation over a narrow city river is junk - the Yarra
+      // through Melbourne reads 10-31 m - so the outline is trusted and the level is one flat value from the low
+      // end of what's under it; such water is never peeled away as "climbing a hill" below
+      if (urbNear) {
+        let u = 0;
+        for (const k of cp.cells) if (urbNear[k] > 0.3) u++;
+        if (u / cp.cells.length > 0.12) {                        // a fair share of it runs through the city
+          let inner = cp.cells.filter(k => dist[k] >= 2);
+          if (inner.length < 8) inner = cp.cells;
+          const hs = inner.map(k => H0[k]).sort((a, b) => a - b), lvl = hs[Math.floor(hs.length * 0.15)];
+          for (const k of cp.cells) L[k] = lvl;
+          cp.urban = true;
+          continue;
+        }
+      }
       if (!cp.river) {
         const hs = cp.cells.map(k => L[k]).sort((a, b) => a - b), lvl = hs[Math.floor(hs.length * 0.2)];
         for (const k of cp.cells) L[k] = lvl;
@@ -1374,7 +1974,7 @@ function waterMask(vt, H0, c, tileSize) {
       const L2 = new Float32Array(L);
       for (let j = 1; j < G - 1; j++) for (let i = 1; i < G - 1; i++) {
         const k = j * G + i;
-        if (isW[k] !== 1 || !comps[comp[k]].river) continue;
+        if (isW[k] !== 1 || !comps[comp[k]].river || comps[comp[k]].urban) continue;
         let s = 0, n = 0;
         for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) { const q = k + dj * G + di; if (isW[q] === 1) { s += L2[q]; n++; } }
         L[k] = s / n;
@@ -1385,7 +1985,7 @@ function waterMask(vt, H0, c, tileSize) {
     for (let it = 0; it < 3; it++) {
       for (let j = 1; j < G - 1; j++) for (let i = 1; i < G - 1; i++) {
         const k = j * G + i;
-        if (isW[k] !== 1) continue;
+        if (isW[k] !== 1 || thin[k]) continue;
         let m = L[k];
         if (isW[k - 1] === 1) m = Math.min(m, L[k - 1] + r1);
         if (isW[k - G] === 1) m = Math.min(m, L[k - G] + r1);
@@ -1395,7 +1995,7 @@ function waterMask(vt, H0, c, tileSize) {
       }
       for (let j = G - 2; j >= 1; j--) for (let i = G - 2; i >= 1; i--) {
         const k = j * G + i;
-        if (isW[k] !== 1) continue;
+        if (isW[k] !== 1 || thin[k]) continue;
         let m = L[k];
         if (isW[k + 1] === 1) m = Math.min(m, L[k + 1] + r1);
         if (isW[k + G] === 1) m = Math.min(m, L[k + G] + r1);
@@ -1406,7 +2006,7 @@ function waterMask(vt, H0, c, tileSize) {
     }
     // peel from the banks inward: a cell whose ground stands well above the level and touches dry land is dropped,
     // which trims sheets climbing a hillside; bulges in the DEM out in the middle of a river stay water
-    const high = k => isW[k] === 1 && H0[k] - L[k] > 3;
+    const high = k => isW[k] === 1 && !thin[k] && !(comp[k] >= 0 && comps[comp[k]].urban) && H0[k] - L[k] > 3;
     const dry = k => { const i = k % G; return (i > 0 && !isW[k - 1]) || (i < G - 1 && !isW[k + 1]) || (k >= G && !isW[k - G]) || (k < G * G - G && !isW[k + G]); };
     const peel = [];
     for (let k = 0; k < G * G; k++) if (high(k) && dry(k)) peel.push(k);
@@ -1416,12 +2016,45 @@ function waterMask(vt, H0, c, tileSize) {
       isW[k] = 0; L[k] = NaN;
       for (const q of [k - 1, k + 1, k - G, k + G]) if (q >= 0 && q < G * G && high(q)) peel.push(q);
     }
+    // a stream or narrow river never flows above the ground beside it. The DEM along a small channel often
+    // reads its levee or the valley side, so the level came out a metre or more above the floodplain next to it:
+    // the water rode along a little ridge with empty hollows below it. Bring such levels down to just under the
+    // lowest bank within two cells, then even out the drops along the channel (lowering only). Lakes, wide
+    // rivers and city water keep their levels (a dam's foot or a quay would drag a whole reservoir down).
+    for (const cp of comps) { let m = 0; for (const k of cp.cells) m = Math.max(m, dist[k]); cp.maxD = m; }
+    const narrow = k => isW[k] === 1 && comp[k] >= 0 && !comps[comp[k]].urban && (thin[k] || (comps[comp[k]].river && comps[comp[k]].maxD <= 4));
+    const cl = [];
+    for (let j = 2; j < G - 2; j++) for (let i = 2; i < G - 2; i++) {
+      const k = j * G + i;
+      if (!narrow(k)) continue;
+      cl.push(k);
+      let m = Infinity;
+      for (let dj = -2; dj <= 2; dj++) for (let di = -2; di <= 2; di++) { const q = k + dj * G + di; if (!isW[q]) m = Math.min(m, H0[q]); }
+      if (m - 0.15 < L[k]) L[k] = m - 0.15;
+    }
+    for (let pass = 0; pass < 4; pass++) for (const k of cl) {
+      let s = 0, n = 0;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) { const q = k + dj * G + di; if (isW[q] === 1) { s += L[q]; n++; } }
+      L[k] = Math.min(L[k], s / n);
+    }
   }
-  return { isW, L, cov, flowSegs };
+  // the fine outline travels with this tile's mask: tiles are built concurrently (there are awaits between the
+  // mask and the mesh), and a shared variable let one tile draw its water with another tile's outline - streams
+  // came out see-through wherever the other tile had none
+  return { isW, L, cov, flowSegs, covHi, thin: thinW };
 }
 // carve the bed and build the surface; roads crossing a stream keep the ground (a culvert runs under them)
 function buildWater(wm, H, infl, c) {
-  const { isW, L, cov, flowSegs } = wm;
+  const { isW, L, cov, flowSegs, covHi, thin } = wm;
+  const Hn = Float32Array.from(H);     // the ground before any channel is cut
+  const GS = G * WSS;
+  // fine coverage at a point given in grid vertex units (vertex gi sits at hi-res pixel (gi + 0.5) * WSS - 0.5)
+  const fine = (gx, gz) => {
+    if (!covHi) return 1;
+    const fx = Math.min(GS - 1.001, Math.max(0, (gx + 0.5) * WSS - 0.5)), fz = Math.min(GS - 1.001, Math.max(0, (gz + 0.5) * WSS - 0.5));
+    const x0 = Math.floor(fx), z0 = Math.floor(fz), u = fx - x0, v = fz - z0, o = z0 * GS + x0;
+    return (covHi[o] * (1 - u) + covHi[o + 1] * u) * (1 - v) + (covHi[o + GS] * (1 - u) + covHi[o + GS + 1] * u) * v;
+  };
   if (infl) for (let k = 0; k < G * G; k++) if (isW[k] === 1 && infl[k] > 0.6) { isW[k] = 0; L[k] = NaN; }
   // distance from the shore (in cells) for every water vertex
   const dist = new Float32Array(G * G).fill(1e9), queue = [];
@@ -1444,9 +2077,11 @@ function buildWater(wm, H, infl, c) {
     for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) { const q = k + dj * G + di; if (isW[q]) m = Math.min(m, L[q]); }
     if (m < Infinity) { L[k] = m; ring[k] = 1; }
   }
-  // carve the bed (roads keep priority)
+  // carve the bed (roads keep priority; water mapped only as a line gets its channel shaped from the line below,
+  // except right where it meets a lake or river area)
+  const areaNear = k => { for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) { const q = k + dj * G + di; if (q >= 0 && q < G * G && (isW[q] === 2 || (isW[q] === 1 && !thin[q]))) return true; } return false; };
   for (let k = 0; k < G * G; k++) {
-    if (!isW[k] || (infl && infl[k] > 0.5)) continue;
+    if (!isW[k] || (thin[k] && !areaNear(k)) || (infl && infl[k] > 0.5)) continue;
     const dm = Math.min(dist[k], 60) * c;
     const edge = 0.35 + 0.65 * Math.min(1, (cov[k] - 0.5) * 2);           // shallower right at the edge
     const depth = (isW[k] === 2 ? Math.min(25, 1 + dm * 0.06) : Math.min(4.5, 0.4 + dm * 0.22)) * (dist[k] <= 1 ? edge : 1);
@@ -1459,10 +2094,41 @@ function buildWater(wm, H, infl, c) {
     const target = L[k] + 0.3 - cov[k] * 0.9;
     if (H[k] > target) H[k] += (target - H[k]) * Math.min(1, cov[k] * 2.2);
   }
+  // water mapped only as a line (streams, ditches, small rivers): the channel is shaped from the line itself. The
+  // ground runs down through the water's level exactly where its edge is drawn (half its width out from the line),
+  // deeper towards the middle, and back up to the natural ground beyond. (Carving the grid cells the line touched
+  // left a channel two or three cells wide under the water level - the grid is far coarser than a stream - with a
+  // thin ribbon of water down the middle of an empty trench.) Mapped water areas keep their own beds and banks.
+  const nearE = new Float32Array(G * G).fill(Infinity), nearL = new Float32Array(G * G);
+  for (let o = 0; o < flowSegs.length; o += 7) {
+    const x0 = flowSegs[o], z0 = flowSegs[o + 1], dx = flowSegs[o + 2] - x0, dz = flowSegs[o + 3] - z0, l2 = dx * dx + dz * dz;
+    if (l2 < 1e-9) continue;
+    const hw = flowSegs[o + 6], R = Math.ceil(hw + 1.5);
+    for (let j = Math.floor(Math.min(z0, z0 + dz)) - R; j <= Math.ceil(Math.max(z0, z0 + dz)) + R; j++)
+      for (let i = Math.floor(Math.min(x0, x0 + dx)) - R; i <= Math.ceil(Math.max(x0, x0 + dx)) + R; i++) {
+        if (i < 1 || j < 1 || i >= G - 1 || j >= G - 1) continue;
+        const k = j * G + i;
+        if ((infl && infl[k] > 0.5) || areaNear(k)) continue;
+        const t = Math.max(0, Math.min(1, ((i - x0) * dx + (j - z0) * dz) / l2)), e = Math.hypot(x0 + dx * t - i, z0 + dz * t - j) - hw;
+        if (e > 1.5 || e >= nearE[k]) continue;
+        // the water level where the line passes
+        const pi = Math.round(x0 + dx * t), pj = Math.round(z0 + dz * t);
+        let lv = pi >= 0 && pj >= 0 && pi < G && pj < G ? L[pj * G + pi] : NaN;
+        if (Number.isNaN(lv)) lv = L[k];
+        if (Number.isNaN(lv)) continue;
+        nearE[k] = e; nearL[k] = lv;
+      }
+  }
+  for (let k = 0; k < G * G; k++) {
+    const e = nearE[k];
+    if (e === Infinity) continue;
+    const lv = nearL[k], prof = lv + 1.6 * e;          // banks of 1.6 m per cell, down to 2.5 m deep at most
+    H[k] = e < 0 ? Math.max(prof, lv - 2.5) : Math.min(Hn[k], prof);
+  }
   // current: stamp each waterway line's direction into the cells around it, then spread it across the
   // rest of the river polygon (nearest line wins), slower near the banks and faster down steep reaches
   const flow = new Float32Array(G * G * 2), fw = new Float32Array(G * G), fq = [], fd = new Uint8Array(G * G);
-  for (let o = 0; o < flowSegs.length; o += 6) {
+  for (let o = 0; o < flowSegs.length; o += 7) {
     const x0 = flowSegs[o], z0 = flowSegs[o + 1], dx = flowSegs[o + 2] - x0, dz = flowSegs[o + 3] - z0, len = Math.hypot(dx, dz);
     if (len < 1e-6) continue;
     const ux = dx / len, uz = dz / len, sp = flowSegs[o + 4], r = flowSegs[o + 5], R = Math.ceil(r), n = Math.ceil(len * 2);
@@ -1499,7 +2165,7 @@ function buildWater(wm, H, infl, c) {
     turb[k] = Math.min(1, Math.max(0, grad - 0.03) * 10);   // DEM ripples under a few % are not rapids
   }
   // surface mesh over this tile's own cells
-  const vid = new Int32Array(G * G).fill(-1), pos = [], dep = [], wfl = [], idx = [];
+  const vid = new Int32Array(G * G).fill(-1), pos = [], dep = [], wfl = [], cvr = [], idx = [];
   for (let j = M; j <= M + 256; j++) for (let i = M; i <= M + 256; i++) {
     const k = j * G + i;
     if (Number.isNaN(L[k])) continue;
@@ -1509,11 +2175,34 @@ function buildWater(wm, H, infl, c) {
     let sea = isW[k] === 2 ? 1 : 0;
     if (!isW[k]) for (const q of [k - 1, k + 1, k - G, k + G, k - G - 1, k - G + 1, k + G - 1, k + G + 1]) if (isW[q] === 2) sea = 1;
     wfl.push(flow[k * 2], flow[k * 2 + 1], sea, turb[k]);
+    cvr.push(fine(i, j));
   }
+  const SUB = 4;
   for (let j = M; j < M + 256; j++) for (let i = M; i < M + 256; i++) {
-    const a = vid[j * G + i], b = vid[j * G + i + 1], cc = vid[(j + 1) * G + i], d = vid[(j + 1) * G + i + 1];
+    const ka = j * G + i, kb = ka + 1, kc = ka + G, kd = kc + 1;
+    const a = vid[ka], b = vid[kb], cc = vid[kc], d = vid[kd];
     if (a < 0 || b < 0 || cc < 0 || d < 0) continue;
-    idx.push(a, cc, d, a, d, b);
+    const shore = !isW[ka] || !isW[kb] || !isW[kc] || !isW[kd] || cvr[a] < 0.97 || cvr[b] < 0.97 || cvr[cc] < 0.97 || cvr[d] < 0.97
+      || fine(i + 0.5, j + 0.5) < 0.97;
+    if (!shore || !covHi) { idx.push(a, cc, d, a, d, b); continue; }
+    // split along the shore: corner values interpolated, coverage sampled at every new vertex
+    const base = pos.length / 3, lerp4 = (arr, st, comp, u, v) => {
+      const A = arr[a * st + comp], Bv = arr[b * st + comp], C = arr[cc * st + comp], D = arr[d * st + comp];
+      return (A * (1 - u) + Bv * u) * (1 - v) + (C * (1 - u) + D * u) * v;
+    };
+    const seaMax = Math.max(wfl[a * 4 + 2], wfl[b * 4 + 2], wfl[cc * 4 + 2], wfl[d * 4 + 2]);
+    for (let sv = 0; sv <= SUB; sv++) for (let su = 0; su <= SUB; su++) {
+      const u = su / SUB, v = sv / SUB;
+      pos.push((i - M + u) * c, lerp4(pos, 3, 1, u, v), (j - M + v) * c);
+      dep.push(lerp4(dep, 1, 0, u, v));
+      wfl.push(lerp4(wfl, 4, 0, u, v), lerp4(wfl, 4, 1, u, v), seaMax, lerp4(wfl, 4, 3, u, v));
+      cvr.push(fine(i + u, j + v));
+    }
+    for (let sv = 0; sv < SUB; sv++) for (let su = 0; su < SUB; su++) {
+      const p0 = base + sv * (SUB + 1) + su, p1 = p0 + 1, p2 = p0 + SUB + 1, p3 = p2 + 1;
+      if (cvr[p0] < 0.02 && cvr[p1] < 0.02 && cvr[p2] < 0.02 && cvr[p3] < 0.02) continue;   // dry: no triangles
+      idx.push(p0, p2, p3, p0, p3, p1);
+    }
   }
   const level = new Float32Array(G * G).fill(NaN), current = new Int8Array(G * G * 2);
   for (let k = 0; k < G * G; k++) if (isW[k]) {
@@ -1523,7 +2212,7 @@ function buildWater(wm, H, infl, c) {
   }
   return {
     isW, level, current,
-    mesh: idx.length ? { positions: new Float32Array(pos), depth: new Float32Array(dep), wflow: new Float32Array(wfl), indices: new Uint32Array(idx) } : null,
+    mesh: idx.length ? { positions: new Float32Array(pos), depth: new Float32Array(dep), wflow: new Float32Array(wfl), cover: new Float32Array(cvr), indices: new Uint32Array(idx) } : null,
   };
 }
 
@@ -2177,6 +2866,21 @@ function detectTrees(im, ctx, H0, c, tileSize, lat, lon, gx0, gz0) {
   }
   // accept with spacing, via a 4 m hash grid
   const CELL = 4, GW = Math.ceil(tileSize / CELL) + 1, occ = new Map(), out = [];
+  // snow on the trees: near snow and ice on the ground (the land map, blurred over a few hundred metres) - so it
+  // follows real snowfields and glaciers, not a guessed altitude. Carried as a fraction (0..0.4) on the species
+  // number, which still rounds to the species.
+  const SB = 32, sgrid = new Float32Array(SB * SB), bs = N / SB;
+  let anySnow = false;
+  for (let i = 0; i < N * N; i++) if (im.mat[i] === SNOW) { sgrid[Math.floor(Math.floor(i / N) / bs) * SB + Math.floor((i % N) / bs)] += 1 / (bs * bs); anySnow = true; }
+  if (anySnow) for (let pass = 0; pass < 12; pass++) {           // spreads ~600 m from the snow, fading
+    const tmp = new Float32Array(sgrid);
+    for (let j = 0; j < SB; j++) for (let i = 0; i < SB; i++) {
+      let s = 0, n = 0;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) { const jj = j + dj, ii = i + di; if (jj >= 0 && ii >= 0 && jj < SB && ii < SB) { s += tmp[jj * SB + ii]; n++; } }
+      sgrid[j * SB + i] = Math.max(tmp[j * SB + i], s / n);
+    }
+  }
+  const snowAt = (x, z) => anySnow ? sm(0.004, 0.08, sgrid[Math.min(SB - 1, Math.floor(z / tileSize * SB)) * SB + Math.min(SB - 1, Math.floor(x / tileSize * SB))]) : 0;
   for (const q of order) {
     const x = (cand[q] + 0.5) * px, z = (cand[q + 1] + 0.5) * px, r = cand[q + 2], fs = dense.has(q) ? 0.55 : 0.75;
     const cx = Math.floor(x / CELL), cz = Math.floor(z / CELL), reach = Math.ceil((r + 6.5) * 0.75 / CELL);
@@ -2203,7 +2907,7 @@ function detectTrees(im, ctx, H0, c, tileSize, lat, lon, gx0, gz0) {
     }
     // crown colour: halfway between the photo and the species tone, with a little per-tree variation
     const jit = 0.9 + hash2(ix + 5, iy * 3) * 0.2, tn = SPc[6];
-    out.push(x, z, r, h, (cr / n / 255 * 0.5 + tn[0] * 0.5) * jit, (cg / n / 255 * 0.5 + tn[1] * 0.5) * jit, (cb / n / 255 * 0.5 + tn[2] * 0.5) * jit, sp);
+    out.push(x, z, r, h, (cr / n / 255 * 0.5 + tn[0] * 0.5) * jit, (cg / n / 255 * 0.5 + tn[1] * 0.5) * jit, (cb / n / 255 * 0.5 + tn[2] * 0.5) * jit, sp + snowAt(x, z) * 0.4);
     if (out.length >= 320000 * TREE) break;
   }
   const res = new Float32Array(out), tmp = new Float32Array(TREE), nT = res.length / TREE;
@@ -2223,17 +2927,34 @@ onmessage = async e => {
   try {
     const vtP = lod === 1 ? getVectorLayers(url, tx, ty) : Promise.resolve(null);
     const usaP = lod === 1 && img && img.us ? fetchUsaStructures(tx, ty, tileSize).catch(() => []) : Promise.resolve([]);
-    H0 = await assembleHeights(tx, ty);
+    const nbP = lod === 1 ? Promise.all([-1, 0, 1].flatMap(dy => [-1, 0, 1].map(dx => dx || dy ? getVectorLayers(url, tx + dx, ty + dy).catch(() => null) : vtP))) : Promise.resolve(null);
+    const HE = await assembleHeights(tx, ty, ME, lod >= 8);
+    H0 = cropHeights(HE);
     const H = new Float32Array(H0);
     const vt = await vtP;
     if (lod === 1 && !vt) throw new Error('vector tile failed');
     const layers = vt && !vt.empty ? vt : null;
-    const wm = layers ? waterMask(layers, H0, c, tileSize) : null;
-    if (lms) padLandmarks(H0, lms, c, wm);
-    const roads = layers && layers.transportation ? extractRoads(layers.transportation, tileSize, H0, c, lms) : [];
-    const conn = roads.length ? connectRoads(roads) : { junctions: [], stops: [], rings: [] };
-    gradeSeparate(roads, wm, c);
-    if (lms) alignBridgeLandmarks(lms, roads);
+    // cities outside the US: take the towers' radar bumps out of the ground (see urbanFlatten)
+    let urb = null;
+    if (lod === 1 && layers && !(img && img.us)) {
+      const nb0 = await nbP, u = nb0 ? urbanFlatten(HE, nb0, c, tileSize) : null;
+      if (u) { H0 = cropHeights(HE); H.set(H0); urb = cropHeights(u); }
+    }
+    const wm = layers ? waterMask(layers, H0, c, tileSize, urb) : null;
+    // landmark pads: levelled on the wide grid (so roads in neighbouring tiles meet them the same way), then into
+    // both the reference heights and the terrain itself (the terrain copy used to be taken before the pads)
+    if (lms) { padLandmarks(HE, lms, c, wm, GE, ME); H0.set(cropHeights(HE)); H.set(H0); }
+    const W = Math.min((ME - 2) * c, 520), nbs = await nbP;   // ~520 m: longer than any ramp or junction blend
+    const allRoads = layers && layers.transportation ? extractRoads(gatherRoadLines(nbs || [null, null, null, null, vt, null, null, null, null], tileSize, W), tileSize, HE, c, lms, W) : [];
+    const conn0 = allRoads.length ? connectRoads(allRoads) : { junctions: [], stops: [], rings: [] };
+    gradeSeparate(allRoads, layers ? wideWater(nbs || [null, null, null, null, vt, null, null, null, null], HE, c, tileSize) : null, c);
+    levelTunnels(allRoads, tileSize, W);
+    if (lms) alignBridgeLandmarks(lms, allRoads);
+    // keep what this tile needs (its own area plus the usual margin)
+    const olo = -M * c, ohi = tileSize + M * c, inOut = (x, z) => x >= olo && x <= ohi && z >= olo && z <= ohi;
+    const roads = allRoads.flatMap(r => trimRoad(r, olo, ohi));
+    const keep = (a, st) => { const o = []; for (let q = 0; q < a.length; q += st) if (inOut(a[q], a[q + 1])) for (let k = 0; k < st; k++) o.push(a[q + k]); return o; };
+    const conn = { junctions: keep(conn0.junctions, 3), stops: keep(conn0.stops, 8), rings: keep(conn0.rings, 5) };
     roads.sort((a, b) => a.rank - b.rank);
     const infl = roads.length ? flatten(roads, H0, H, c) : null;
     // landmarks sunk into the ground (memorial pools, plazas): cut the terrain under each pit; the model
@@ -2252,7 +2973,7 @@ onmessage = async e => {
     const terrain = buildTerrain(H, infl, lod, c, tx, ty, ox, oz);
     if (lod === 1) bctx = { layers, H: new Float32Array(H), usaP };
     const roadMesh = roads.length ? buildRoads(roads, H, c, tileSize) : null;
-    const structures = layers ? buildStructures(roads, layers.waterway, H, c, tileSize) : null;
+    const structures = layers ? buildStructures(roads, layers.waterway, H, c, tileSize, lms) : null;
     const segs = buildSegs(roads);
     const transfer = [H.buffer, segs.buffer, ...Object.values(terrain).map(a => a.buffer)];
     if (roadMesh) for (const part of [roadMesh.road, roadMesh.verge]) transfer.push(...Object.values(part).map(a => a.buffer));
@@ -2281,7 +3002,7 @@ onmessage = async e => {
     try { trees = detectTrees(im, ctx, H0, c, tileSize, lat, lon, tx * tileSize, ty * tileSize); } catch (err) { trees = null; }
   }
   const transfer = [im.photo.buffer];
-  for (const k of ['wa', 'wb', 'mat', 'code']) if (im[k]) transfer.push(im[k].buffer);
+  for (const k of ['wa', 'wb', 'wc', 'mat', 'code']) if (im[k]) transfer.push(im[k].buffer);
   if (trees) transfer.push(trees.buffer);
   postMessage({ type: 'imagery', id, tx, ty, lod, ...im, trees }, transfer);
 };

@@ -58,10 +58,15 @@ body = "\n".join(lines[m0 + 1:car]) + "\n" + "\n".join(lines[v0:v1 + 1]) + "\n"
 
 REPL = [
     # where the map starts: given by chase mode
+    # (OpenDrive, 2026-11-09: comment lines, DEFAULT_START and START_FACE round it -- a default start on
+    # Going-to-the-Sun Road that only its own car and welcome toast read)
     (r"const params = new URLSearchParams\(location\.search\);\n"
+     r"(?://[^\n]*\n)*(?:const DEFAULT_START = [^\n]*\n)?"
      r"const START_LAT = parseFloat\(params\.get\('lat'\) \?\? '[-\d.]+'\);\n"
-     r"const START_LON = parseFloat\(params\.get\('lon'\) \?\? '[-\d.]+'\);",
-     "const CW = globalThis.CHASE_WORLD;\nconst START_LAT = CW.lat, START_LON = CW.lon;"),
+     r"const START_LON = parseFloat\(params\.get\('lon'\) \?\? '[-\d.]+'\);"
+     r"(?:\nconst START_FACE = [^\n]*)?",
+     "const CW = globalThis.CHASE_WORLD;\nconst START_LAT = CW.lat, START_LON = CW.lon;\n"
+     "const DEFAULT_START = false, START_FACE = null;"),
     # the renderer: chase mode's canvas and WebGL context, drawn into a target chase mode composites
     (r"const renderer = new THREE\.WebGLRenderer\(\{ antialias: true \}\);\n"
      r"renderer\.setPixelRatio\([^\n]*\);\n"

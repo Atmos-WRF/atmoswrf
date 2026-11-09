@@ -278,6 +278,7 @@ const Chase = (() => {
       const d = await getJSON(`/api/c/air?grid=1&p=${c.p[0].toFixed(1)},${c.p[1].toFixed(1)}`);
       air.now = d.air && d.air[0] ? d.air[0] : air.now; air.err = '';
       air.grid = air.now && air.now.grid ? air.now.grid : null;
+      if (d.air && d.air[0]) Mesonet.record(d.air[0], d.t, c.p[0], c.p[1], wx.rainI);     // the mesonet probe's log
     } catch (e) { air.err = e.message; }
     air.busy = false;
   }
@@ -927,6 +928,7 @@ const Chase = (() => {
     const glc = Render.gl() && Render.gl().canvas;
     g.fillText(`${Math.round(st.fps)} fps · ${st.gpu ? st.gpu + ' · ' : ''}${glc ? `${glc.width}×${glc.height} · ` : ''}${st.cam.mode} camera (C) · H: help`, W - 16, 22);
     routeHud(g, W);
+    Mesonet.draw(g, 14, H - 134 - Math.min(300, H - 330), Math.min(380, W * 0.42), Math.min(300, H - 330), st.units);
     if (st.msg && now < st.msgT) {
       g.font = '600 16px Segoe UI'; g.textAlign = 'center';
       const w = g.measureText(st.msg).width + 30;
@@ -1493,6 +1495,11 @@ const Chase = (() => {
       if (e.code === 'KeyG' && !e.repeat) { goSomewhere(); return; }
       if (e.code === 'KeyF' && !e.repeat) { toggleFoot(); return; }
       if (e.code === 'KeyO' && !e.repeat) { toggleRoute(); return; }
+      if (e.code === 'KeyJ' && !e.repeat) {
+        if (e.shiftKey) say(Mesonet.save() ? 'Mesonet log saved (CSV)' : 'Nothing logged yet', 2000);
+        else say(Mesonet.toggle() ? 'Mesonet probe: the model’s air where you are, logged every second' : 'Mesonet graphs hidden (still logging)', 2000);
+        return;
+      }
       if (e.code === 'KeyL' && !e.repeat) {
         st.lights = st.lights === 'on' ? 'off' : st.lights === 'off' ? 'auto' : 'on';
         say(`Headlights ${st.lights}`, 1200); return;

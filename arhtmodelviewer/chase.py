@@ -394,7 +394,8 @@ GRID_SPAN = 2400.0
 
 def air(sim, pts, grid: bool = False) -> list:
     """The model's air at ground points pts [(x, y) world m]: per point {"u", "v" (m/s at 10 m, ground-relative),
-    "gust" (m/s), "t" (deg C), "td" (dew point, deg C), "inside" (a storm patch holds it)}, the finest grid holding
+    "gust" (m/s), "t" (deg C), "td" (dew point, deg C), "p" (hPa at the ground), "inside" (a storm patch holds it)},
+    the finest grid holding
     the point (the tornado zoom where it is), the environment's lowest level elsewhere.  ``grid``: the first point's
     also carries "grid" {x0, y0 (its first cell's centre, world m), dx, nx, ny, u, v (row by row from the south,
     m/s at 10 m)}: that grid's lowest level round it, taken down to 10 m as the point is.  Caller holds sim.lock."""
@@ -456,9 +457,11 @@ def air(sim, pts, grid: bool = False) -> list:
         tk = th * (pp / 1e5) ** 0.2857
         e = max(qv, 1e-7) * pp / (0.622 + max(qv, 1e-7)) / 100.0        # vapour pressure, hPa
         td = 243.5 * math.log(e / 6.112) / (17.67 - math.log(e / 6.112))
-        ok = all(math.isfinite(c) for c in (u10, v10, gust, tk, td))
+        # the pressure at the ground: the lowest level's, taken down its height hydrostatically (virtual temperature)
+        ps = pp * math.exp(9.80665 * max(z1, 0.0) / (287.04 * tk * (1.0 + 0.61 * max(qv, 0.0))))
+        ok = all(math.isfinite(c) for c in (u10, v10, gust, tk, td, ps))
         d = {"u": round(u10, 2), "v": round(v10, 2), "gust": round(gust, 2), "t": round(tk - 273.15, 2),
-             "td": round(min(td, tk - 273.15), 2), "inside": bool(inside)} if ok else None
+             "td": round(min(td, tk - 273.15), 2), "p": round(ps / 100.0, 2), "inside": bool(inside)} if ok else None
         if d is not None and near is not None and s is sts[0]:
             p, dx, i0, j0, nx, ny, gu, gv = near
             gu, gv = np.nan_to_num(gu * fac), np.nan_to_num(gv * fac)          # down to 10 m as the point is

@@ -1021,6 +1021,13 @@ const Render = (() => {
     blds.n = mesh.length / 9; blds.origin = origin;
   }
 
+  // a part's buffers let go (stations.js: a station or the route's ribbon rebuilt or out of range)
+  function dropPart(data) {
+    const b = partBufs.get(data);
+    if (!b) return;
+    gl.deleteVertexArray(b.vao); if (b.buf) gl.deleteBuffer(b.buf);
+    partBufs.delete(data);
+  }
   function meshBuffer(arr) {
     const v = gl.createVertexArray(), b = gl.createBuffer();
     gl.bindVertexArray(v); gl.bindBuffer(gl.ARRAY_BUFFER, b);
@@ -1029,7 +1036,7 @@ const Render = (() => {
     gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 36, 12);
     gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 36, 24);
     gl.bindVertexArray(null);
-    return { vao: v, n: arr.length / 9 };
+    return { vao: v, buf: b, n: arr.length / 9 };
   }
   function carMeshes(kind, color) {
     // (built again once the car's model has come in: carmesh.js)
@@ -1345,6 +1352,6 @@ const Render = (() => {
     return { nx: h.nx, ny: h.ny, data: out };
   }
   return { init, setVolume, setFar, farInfo: () => farV.map(s => s.head && { box: s.head.box, nx: s.head.nx, ny: s.head.ny, nz: s.head.nz }), blending: () => mixSt.f < 1, motion, _gb: () => gb, _peek,
-           _step: () => { mixSt.dirty = true; advance(geometry(), [0.5, 0.3, 0.81], 1, 1); }, setRoads, setTrees, setBuildings, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
+           _step: () => { mixSt.dirty = true; advance(geometry(), [0.5, 0.3, 0.81], 1, 1); }, setRoads, setTrees, setBuildings, dropPart, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
 })();
 window.Render = Render;

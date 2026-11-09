@@ -236,6 +236,74 @@ def buildings(proj, box_km) -> dict:
     return {"b": out, "pending": pending, "busy": bool(pending) and osmfetch.busy()}
 
 
+# ---------------------------------------------------------------- the gas stations
+# OpenStreetMap's fuel stations (amenity=fuel: OpenMapTiles' poi layer, class "fuel", subclass "fuel" -- not the EV
+# chargers), from OpenFreeMap's z14 tiles in FUEL_CELL-degree cells, kept in output/cache/osm/fuel: chase mode builds
+# a station at each (a canopy over the pumps, a store you can walk into) and routes to the nearest
+FUEL_CELL = 0.1
+FUEL_DIR = OSM_CACHE / "fuel"
+
+
+def _f_file(la: float, lo: float):
+    return FUEL_DIR / f"{la:+08.2f}_{lo:+08.2f}.json"
+
+
+def _f_fetch(la: float, lo: float) -> None:
+    out, seen = [], set()
+    for x, y, L, ext, box in osmfetch._cell_tiles(la, lo, FUEL_CELL, 14, {"poi"}):
+        for f in L.get("poi", {}).get("features", []):
+            t = f["tags"]
+            if f["type"] != 1 or t.get("class") != "fuel" or t.get("subclass", "fuel") != "fuel":
+                continue
+            for part in f["parts"]:
+                for px, py in part:
+                    if not (0 <= px < ext and 0 <= py < ext and box[0] <= px < box[2] and box[1] <= py < box[3]):
+                        continue                             # in another tile's or cell's share
+                    lat, lon = osmfetch._lonlat(14, x + px / ext, y + py / ext)
+                    key = (round(lat, 5), round(lon, 5))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append([round(lat, 6), round(lon, 6), str(t.get("name") or t.get("brand") or "")[:40]])
+    f = _f_file(la, lo)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    part = f.with_name(f.name + ".part")
+    part.write_text(json.dumps(out))
+    part.replace(f)
+
+
+_FUEL = osmfetch.CellQueue("fuel", _f_fetch)
+
+
+def fuel(proj, box_km) -> dict:
+    """The gas stations in the box (world km): {"fuel": [[x, y km, name], ...], "pending": n}."""
+    x0, y0, x1, y1 = (float(v) for v in box_km)
+    xs = np.array([x0, x1, x0, x1]) * 1000.0
+    ys = np.array([y0, y0, y1, y1]) * 1000.0
+    lat, lon = (np.asarray(v) for v in proj.inv(xs, ys))
+    S = FUEL_CELL
+    cells = [(round(a * S, 2), round(b * S, 2))
+             for a in range(int(math.floor(lat.min() / S)), int(math.floor(lat.max() / S)) + 1)
+             for b in range(int(math.floor(lon.min() / S)), int(math.floor(lon.max() / S)) + 1)]
+    if len(cells) > 120:
+        raise ValueError("the box is too big for the gas stations")
+    out, pending = [], 0
+    for c in cells:
+        f = _f_file(*c)
+        if not f.is_file():
+            pending += _FUEL.want(c)
+            continue
+        items = json.loads(f.read_text())
+        if not items:
+            continue
+        X, Y = proj.fwd(np.array([it[0] for it in items]), np.array([it[1] for it in items]))
+        for it, xx, yy in zip(items, np.atleast_1d(X), np.atleast_1d(Y)):
+            xk, yk = float(xx) / 1000.0, float(yy) / 1000.0
+            if x0 <= xk <= x1 and y0 <= yk <= y1:
+                out.append([round(xk, 5), round(yk, 5), it[2]])
+    return {"fuel": out, "pending": pending}
+
+
 # ---------------------------------------------------------------- the air at the cars
 AIR_MAX = 16                     # points per request
 
@@ -332,7 +400,7 @@ _NEXT = [1]
 STALE = 6.0                                     # s without a sync: gone from the others' lists
 # what a joined page on another computer may read (GET) with its token while hosting is on
 READ = ("/api/state", "/api/pmw/targets", "/api/c/air", "/api/volume", "/api/volume/times", "/api/volume/roads",
-        "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/frames", "/api/frame", "/api/ppi")
+        "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/volume/fuel", "/api/frames", "/api/frame", "/api/ppi")
 # (and the detailed map's module, tile worker and landmarks, and the cars' models)
 STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|colors)\.js|static/js/chase/[a-z0-9_]+\.js"
                     r"|static/js/chase/world/(world|tileworker)\.js|static/js/chase/world/landmarks\.json"

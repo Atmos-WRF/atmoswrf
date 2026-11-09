@@ -55,6 +55,8 @@ const Net = (() => {
     // height above the sender's own ground: each page's ground can sit at its own level (the detailed map's
     // offset is taken where that page started, and the basic map is another surface), so heights go by this
     if (Number.isFinite(me.hg)) s.hg = r2(me.hg);
+    // on foot: [x, y, height above the ground, yaw, stride phase, gait, down, lean, lean direction, in the air, speed]
+    if (me.f) s.f = me.f;
     const t0 = performance.now();
     try {
       const d = await post('/api/c/sync', { s, name: me.name, kind: me.kind, color: me.color });
@@ -102,7 +104,10 @@ const Net = (() => {
         s = { p: A.s.p.map((v, k) => lerp(v, B.s.p[k], t)), q: q.map(v => v / ql), v: A.s.v.map((v, k) => lerp(v, B.s.v[k], t)),
               st: A.s.st.map((v, k) => lerp(v, B.s.st[k], t)), sp: A.s.sp.map((v, k) => lerp(v, B.s.sp[k] < v - 500 ? B.s.sp[k] + 1000 : B.s.sp[k], t)),
               L: A.s.L.map((v, k) => lerp(v, B.s.L[k], t)), g: B.s.g, b: B.s.b,
-              hg: Number.isFinite(A.s.hg) && Number.isFinite(B.s.hg) ? lerp(A.s.hg, B.s.hg, t) : B.s.hg };
+              hg: Number.isFinite(A.s.hg) && Number.isFinite(B.s.hg) ? lerp(A.s.hg, B.s.hg, t) : B.s.hg,
+              f: A.s.f && B.s.f ? B.s.f.map((v, k) => (k < 3 ? lerp(A.s.f[k], v, t)
+                                                     : k === 3 ? A.s.f[3] + Math.atan2(Math.sin(v - A.s.f[3]), Math.cos(v - A.s.f[3])) * t
+                                                     : k === 4 && v >= A.s.f[4] ? lerp(A.s.f[4], v, t) : v)) : B.s.f };
       }
       out.push({ id: o.id, name: o.name, kind: o.kind, color: o.color, ...s });
     }

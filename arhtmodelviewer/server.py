@@ -396,6 +396,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(chase.buildings(sim.proj, [float(q[k]) for k in ("x0", "y0", "x1", "y1")]))
                 except (KeyError, ValueError) as e:
                     return self._error(400, str(e))
+            if path == "/api/volume/fuel":
+                # chase mode's gas stations (chase.py): OpenStreetMap's in the box, fetched in the background
+                from . import chase
+                sim = APP.sim
+                if sim is None:
+                    return self._error(404, "no run")
+                try:
+                    return self._json(chase.fuel(sim.proj, [float(q[k]) for k in ("x0", "y0", "x1", "y1")]))
+                except (KeyError, ValueError) as e:
+                    return self._error(400, str(e))
             if path == "/api/c/host":
                 from . import chase
                 if not self._is_local():

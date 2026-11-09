@@ -95,6 +95,8 @@ const Chase = (() => {
   }
   const detailed = () => st.vis && st.vis.map !== 'basic';
   function surfAt(x, y) {
+    const ap = Stations.apron(x, y);                   // a gas station's concrete (stations.js)
+    if (ap !== null) return { h: ap, s: st.wet > 0.3 ? SURF.wet : SURF.asphalt };
     const w = worldSurf(x, y);
     if (w) return w;
     const r = Roads.at(x, y);
@@ -479,7 +481,7 @@ const Chase = (() => {
       if (Array.isArray(p)) [sx, sy] = p;
     }
     st.car = new CarPhys.Car(st.kind, ground);
-    st.car.solid = Scenery.solid;
+    st.car.solid = (x, y, z) => Stations.solid(x, y, z) || Scenery.solid(x, y, z);
     st.car.windAt = windAt;     // the model's wind at the car, every physics step
     st.extraCars = remoteCars; st.extraMap = remoteMap;
     st.car.reset(sx, sy, 0);
@@ -498,6 +500,17 @@ const Chase = (() => {
       Roads.update(c.p[0], c.p[1], Render.terrain, () => Render.setRoads(Roads.state.mesh, Roads.state.origin));
       loadVolume(false);
       Scenery.updateBuildings(c.p[0], c.p[1], Render.terrain, () => Render.setBuildings(Scenery.state.bMesh, Scenery.state.bOrigin));
+      Stations.update(c.p[0], c.p[1]);
+      const wl = detailed() && WorldLink.ready();
+      if (Stations.near(c.p[0], c.p[1], stationGround, wl ? 'world' : 'basic')) Scenery.setSkip(Stations.covers);
+      const me = st.foot || c;
+      Stations.follow(me.p[0], me.p[1]);
+      if (Stations.route.arrived && !st.arriveSaid) {
+        st.arriveSaid = true;
+        const d = Stations.route.dest;
+        say(`Arrived at ${d ? d.name : 'the gas station'}${st.foot ? '' : ' · F to get out and walk into the store'}`, 6000);
+        Stations.clear();
+      }
     };
     stream();
     setInterval(stream, 500);
@@ -506,10 +519,26 @@ const Chase = (() => {
     // the car to the others on its own clock: it keeps going while this tab is in the background
     setInterval(() => {
       if (!st.car) return;
-      const c = st.car, hg = c.p[2] - surfAt(c.p[0], c.p[1]).h;
-      Net.tick(c, { name: st.name, kind: st.kind, color: st.color, hg });
+      const c = st.car, hg = c.p[2] - surfAt(c.p[0], c.p[1]).h, f = st.foot;
+      const r2 = v => Math.round(v * 100) / 100;
+      const fs = f ? [f.p[0], f.p[1], f.p[2] - surfAt(f.p[0], f.p[1]).h, f.yaw, f.phase % 1000, f.gait, f.down, f.lean, f.leanDir || 0, f.air ? 1 : 0, f.speed].map(r2) : null;
+      Net.tick(c, { name: st.name, kind: st.kind, color: st.color, hg, f: fs });
     }, 40);
   }
+
+  // the ground a gas station is built on (stations.js): the detailed map's, or the model's terrain (NaN: not loaded)
+  function stationGround(x, y) {
+    if (detailed() && WorldLink.ready()) { const g = WorldLink.ground(x, y); return g ? g.h : NaN; }
+    return Render.terrain(x, y);
+  }
+  // O: the way to the nearest gas station, on and off
+  function toggleRoute() {
+    const on = Stations.toggle();
+    st.arriveSaid = false;
+    if (on) { const c = st.foot || st.car; Stations.follow(c.p[0], c.p[1]); }
+    say(on ? (Stations.route.pts ? `Route to ${Stations.route.dest.name}: ${fmtDist(Stations.route.len)}` : 'Finding the nearest gas station…') : 'Route off', 2500);
+  }
+  const fmtDist = m => (st.units === 'mph' ? (m < 400 ? `${Math.round(m * 3.281 / 10) * 10} ft` : `${(m / 1609.34).toFixed(1)} mi`) : (m < 1000 ? `${Math.round(m / 10) * 10} m` : `${(m / 1000).toFixed(1)} km`));
 
   // ---------------------------------------------------------------- on foot (walker.js)
   // F: out of the car by the driver's door (stopped or nearly), and back in when close to it
@@ -563,8 +592,11 @@ const Chase = (() => {
   }
   // a person against walls and trunks: the detailed map's, or chase mode's own buildings
   function footPush(x, y, rad) {
-    if (detailed() && WorldLink.ready()) return WorldLink.pushOut(x, y, rad);
     const z = st.foot ? st.foot.p[2] + 0.6 : 0;
+    const sp = Stations.push(x, y, z, rad);
+    if (sp) return sp;
+    if (Stations.covers(x, y)) return null;
+    if (detailed() && WorldLink.ready()) return WorldLink.pushOut(x, y, rad);
     let s = null;
     for (const [ox, oy] of [[rad, 0], [-rad, 0], [0, rad], [0, -rad], [0, 0]]) {
       s = Scenery.solid(x + ox, y + oy, z);
@@ -720,6 +752,11 @@ const Chase = (() => {
     const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
     if (st.foot && !(st.cam.mode !== 'chase')) cars.push({ parts: st.foot.figure(st.color) });   // (first person: not yourself)
     if (st.extraCars) cars.push(...st.extraCars());
+    {
+      const sp = Stations.parts(), rb = Stations.ribbon((x, y) => surfAt(x, y).h);
+      if (rb) sp.push(rb);
+      if (sp.length) cars.push({ parts: sp });
+    }
     const sun = sunDir();
     const tw = treeWind();
     if (detailed() && WorldLink.ready() && WorldLink.wind) WorldLink.wind(tw);
@@ -741,7 +778,7 @@ const Chase = (() => {
     const g = cv.getContext('2d');
     g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
     const c = st.car, now = performance.now();
-    if (st.cam.mode === 'driver') dash(g, W, H);
+    if (st.cam.mode === 'driver' && !st.foot) dash(g, W, H);
     // the tornadoes on the screen (and on the minimap, and the nearest's distance in the HUD): only with Settings ->
     // Tornado markers on; off, you find them as a chaser does, by the radar, the warnings and your own eyes
     const marks = st.vis.markers === 'on', tors = marks ? tornadoes() : [];
@@ -756,11 +793,12 @@ const Chase = (() => {
     }
     // the other chasers' names over their cars
     if (fr) for (const o of st.lastOthers || []) {
-      const s = Render.project(fr.VP, fr.G, [o.p[0], o.p[1], o.p[2] + 2.4]);
+      const at = o.fp ? [o.fp[0], o.fp[1], o.fp[2] - 0.4] : o.p;
+      const s = Render.project(fr.VP, fr.G, [at[0], at[1], at[2] + 2.4]);
       if (!s || s[0] < 0 || s[0] > W || s[1] < 0 || s[1] > H) continue;
-      const d = Math.hypot(o.p[0] - c.p[0], o.p[1] - c.p[1]);
+      const me = st.foot || c, d = Math.hypot(at[0] - me.p[0], at[1] - me.p[1]);
       g.font = '600 13px Segoe UI'; g.textAlign = 'center';
-      const label = `${o.name} · ${d < 1000 ? Math.round(d) + ' m' : (d / 1000).toFixed(1) + ' km'}`;
+      const label = `${o.name}${o.fp ? ' (on foot)' : ''} · ${d < 1000 ? Math.round(d) + ' m' : (d / 1000).toFixed(1) + ' km'}`;
       const w = g.measureText(label).width + 12;
       g.fillStyle = 'rgba(8,12,18,.55)'; roundRect(g, s[0] - w / 2, s[1] - 18, w, 20, 6); g.fill();
       g.fillStyle = `rgb(${o.color.map(v => Math.min(255, v + 90)).join(',')})`; g.fillText(label, s[0], s[1] - 4);
@@ -826,6 +864,7 @@ const Chase = (() => {
     }
     const glc = Render.gl() && Render.gl().canvas;
     g.fillText(`${Math.round(st.fps)} fps · ${st.gpu ? st.gpu + ' · ' : ''}${glc ? `${glc.width}×${glc.height} · ` : ''}${st.cam.mode} camera (C) · H: help`, W - 16, 22);
+    routeHud(g, W);
     if (st.msg && now < st.msgT) {
       g.font = '600 16px Segoe UI'; g.textAlign = 'center';
       const w = g.measureText(st.msg).width + 30;
@@ -833,6 +872,48 @@ const Chase = (() => {
       g.fillStyle = '#fff'; g.fillText(st.msg, W / 2, 82);
     }
     minimap(g, W, H, tors);
+  }
+
+  // the route's next turn, top middle: an arrow, how far, onto what; the station and how far to it
+  function routeHud(g, W) {
+    const R = Stations.route;
+    if (!R.on) return;
+    const n = Stations.next(), y = 104;
+    g.save();
+    if (!n) {
+      g.font = '600 14px Segoe UI'; g.textAlign = 'center';
+      const t = `Gas station: ${R.msg || 'finding the way…'}`, w = g.measureText(t).width + 28;
+      g.fillStyle = 'rgba(8,12,18,.65)'; roundRect(g, W / 2 - w / 2, y, w, 30, 8); g.fill();
+      g.fillStyle = '#9fe8ff'; g.fillText(t, W / 2, y + 20);
+      g.restore(); return;
+    }
+    const what = n.dir === 'arrive' ? `${n.dest.name} on the ${n.side}` : `${n.sharp ? 'Sharp ' : n.slight ? 'Bear ' : 'Turn '}${n.dir} onto ${Roads.NAMES[n.cls].toLowerCase()}`;
+    const big = fmtDist(n.dist), sub = n.dir === 'arrive' ? 'Gas station' : `${n.dest.name} · ${fmtDist(n.total)}`;
+    g.font = '700 22px Segoe UI'; const w1 = g.measureText(big).width;
+    g.font = '600 14px Segoe UI'; const w2 = Math.max(g.measureText(what).width, g.measureText(sub).width);
+    const w = 62 + Math.max(w1, w2) + 20, x = W / 2 - w / 2;
+    g.fillStyle = 'rgba(8,12,18,.72)'; roundRect(g, x, y, w, 64, 10); g.fill();
+    g.strokeStyle = 'rgba(79,195,255,.6)'; g.lineWidth = 1.5; g.stroke();
+    // the arrow
+    g.save();
+    g.translate(x + 32, y + 32);
+    g.strokeStyle = '#4fd8ff'; g.fillStyle = '#4fd8ff'; g.lineWidth = 4; g.lineCap = 'round'; g.lineJoin = 'round';
+    if (n.dir === 'arrive') {
+      g.beginPath(); g.arc(0, -4, 9, Math.PI, 0); g.lineTo(0, 16); g.closePath(); g.fill();
+      g.fillStyle = '#04121c'; g.beginPath(); g.arc(0, -4, 3.5, 0, 7); g.fill();
+    } else {
+      const a = (n.dir === 'left' ? -1 : 1) * (n.sharp ? 2.4 : n.slight ? 0.6 : Math.PI / 2);
+      const ex = Math.sin(a) * 13, ey = -Math.cos(a) * 13;
+      g.beginPath(); g.moveTo(0, 16); g.lineTo(0, 0); g.lineTo(ex, ey); g.stroke();
+      g.translate(ex, ey); g.rotate(a);
+      g.beginPath(); g.moveTo(0, -7); g.lineTo(-7, 2); g.lineTo(7, 2); g.closePath(); g.fill();
+    }
+    g.restore();
+    g.textAlign = 'left';
+    g.font = '700 22px Segoe UI'; g.fillStyle = '#fff'; g.fillText(big, x + 62, y + 26);
+    g.font = '600 14px Segoe UI'; g.fillStyle = '#cfe9f5'; g.fillText(what, x + 62, y + 44);
+    g.font = '12px Segoe UI'; g.fillStyle = '#8fb3c4'; g.fillText(sub, x + 62, y + 59);
+    g.restore();
   }
 
   function activeWarnings(xk, yk) {
@@ -989,6 +1070,25 @@ const Chase = (() => {
       s = [Math.max(x0 + 8, Math.min(x0 + S - 8, s[0])), Math.max(y0 + 8, Math.min(y0 + S - 8, s[1]))];
       g.fillStyle = off ? 'rgba(255,60,60,.6)' : '#ff3b3b'; g.beginPath(); g.arc(s[0], s[1], 6, 0, 7); g.fill();
       g.strokeStyle = '#fff'; g.lineWidth = 1.5; g.stroke();
+    }
+    // the gas stations (close in) and the route to one
+    {
+      const R = Stations.route;
+      if (R.pts) {
+        g.strokeStyle = 'rgba(4,18,28,.8)'; g.lineWidth = 6; g.lineCap = 'round'; g.lineJoin = 'round';
+        const line = () => { g.beginPath(); R.pts.forEach((q, i) => { const s = P(q[0], q[1]); if (i) g.lineTo(s[0], s[1]); else g.moveTo(s[0], s[1]); }); };
+        line(); g.stroke();
+        g.strokeStyle = '#3fd4ff'; g.lineWidth = 3.5; line(); g.stroke();
+      }
+      if (st.mapKm <= 25) for (const sn of Stations.state.list) {
+        const s = P(sn.x, sn.y);
+        if (s[0] < x0 - 8 || s[0] > x0 + S + 8 || s[1] < y0 - 8 || s[1] > y0 + S + 8) continue;
+        const dest = R.dest === sn;
+        g.fillStyle = dest ? '#3fd4ff' : '#f0a020'; g.strokeStyle = '#fff'; g.lineWidth = 1.2;
+        roundRect(g, s[0] - 5, s[1] - 5, 10, 10, 2); g.fill(); g.stroke();
+        g.fillStyle = '#1a1206'; g.fillRect(s[0] - 2.2, s[1] - 2.8, 3.4, 5.6);
+        if (st.mapKm <= 3 || dest) { g.font = '600 10px Segoe UI'; g.textAlign = 'left'; g.fillStyle = '#fff'; g.fillText(sn.name, s[0] + 8, s[1] + 3); }
+      }
     }
     if (st.extraMap) st.extraMap(g, P);
     // the car (at the edge, pointing, when the map is dragged away from it)
@@ -1205,11 +1305,20 @@ const Chase = (() => {
                  steer: i < 2 ? o.st[i] : 0, spin: o.sp[i], left: i % 2 === 0 };
       });
       return { kind, color: o.color, p, M, wheels, hidden: false };
-    });
+    }).concat(list.filter(o => o.f).map(o => {
+      let w = walkers.get(o.id);
+      if (!w) walkers.set(o.id, w = new Walker.Person(0, 0, 0, 0));
+      const f = o.f;
+      w.p = [f[0], f[1], surfAt(f[0], f[1]).h + f[2]];
+      Object.assign(w, { yaw: f[3], phase: f[4], gait: f[5], down: f[6], lean: f[7], leanDir: f[8], air: !!f[9], v: [f[10], 0, 0] });
+      o.fp = w.p;                                        // the name tag and the minimap go by this
+      return { parts: w.figure(o.color) };
+    }));
   }
+  const walkers = new Map();                         // the others on foot: id -> a Walker.Person posed from theirs
   function remoteMap(g, P) {
     for (const o of st.lastOthers || []) {
-      const s = P(o.p[0], o.p[1]);
+      const s = o.fp ? P(o.fp[0], o.fp[1]) : P(o.p[0], o.p[1]);
       g.fillStyle = `rgb(${o.color.join(',')})`; g.strokeStyle = '#fff'; g.lineWidth = 1.5;
       g.beginPath(); g.arc(s[0], s[1], 5, 0, 7); g.fill(); g.stroke();
       g.font = '600 10px Segoe UI'; g.fillStyle = '#fff'; g.textAlign = 'left'; g.fillText(o.name, s[0] + 7, s[1] + 3);
@@ -1320,6 +1429,7 @@ const Chase = (() => {
       if (pick.open) { if (e.code === 'Escape') closePicker(null); return; }       // the big map has the keys
       if (e.code === 'KeyG' && !e.repeat) { goSomewhere(); return; }
       if (e.code === 'KeyF' && !e.repeat) { toggleFoot(); return; }
+      if (e.code === 'KeyO' && !e.repeat) { toggleRoute(); return; }
       if (tag === 'SELECT' || tag === 'INPUT' || tag === 'BUTTON') { t.blur(); e.preventDefault(); }
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
       if (e.repeat) return;

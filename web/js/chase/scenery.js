@@ -93,6 +93,11 @@ const Scenery = (() => {
       for (let i = 0; i < xy.length; i += 2) P.push(xy[i] * 1000 - origin[0], xy[i + 1] * 1000 - origin[1]);
       if (P.length >= 4 && Math.hypot(P[0] - P[P.length - 2], P[1] - P[P.length - 1]) < 0.05) P.splice(P.length - 2, 2);
       if (P.length < 6) continue;
+      if (skip) {                                // under a gas station (stations.js builds its own store there)
+        let cx = 0, cy = 0;
+        for (let i = 0; i < P.length; i += 2) { cx += P[i]; cy += P[i + 1]; }
+        if (skip(cx / (P.length / 2) + origin[0], cy / (P.length / 2) + origin[1])) continue;
+      }
       let A = 0;
       for (let i = 0, j = P.length - 2; i < P.length; j = i, i += 2) A += P[j] * P[i + 1] - P[i] * P[j + 1];
       A /= 2;
@@ -164,8 +169,9 @@ const Scenery = (() => {
     if (st.bBusy) return;
     const far = !st.bCentre || Math.hypot(x - st.bCentre[0], y - st.bCentre[1]) > B_REFETCH_KM * 1000;
     const now = performance.now();
-    if (!far && !(st.bPending && now - st.bLast > 7000)) return;
-    st.bBusy = true; st.bLast = now;
+    if (!far && !st.bForce && !(st.bPending && now - st.bLast > 7000)) return;
+    const forced = st.bForce;
+    st.bBusy = true; st.bLast = now; st.bForce = false;
     try {
       const h = B_FETCH_KM / 2, cx = x / 1000, cy = y / 1000;
       const b = [cx - h, cy - h, cx + h, cy + h].map(v => v.toFixed(3));
@@ -173,7 +179,7 @@ const Scenery = (() => {
       if (!r.ok) throw new Error(r.status === 404 ? 'buildings need the viewer restarted (new in this version)' : await r.text());
       const d = await r.json();
       st.bPending = d.pending; st.bOsmBusy = !!d.busy;
-      if (far || d.b.length !== st.bN) {
+      if (far || forced || d.b.length !== st.bN) {
         const origin = [Math.round(x), Math.round(y)];
         const out = buildBuildings(d.b, origin, terrain);
         Object.assign(st, { bOrigin: origin, bMesh: out.mesh, polys: out.polys, bGrid: out.grid, bN: d.b.length });
@@ -226,7 +232,7 @@ const Scenery = (() => {
           const tx = px + (hash(gi, gj, 10 + t) - 0.5) * dx, ty = py + (hash(gi, gj, 20 + t) - 0.5) * dy;
           const rd = Roads.at(tx, ty);
           if (rd.raise > 0.005 || rd.seg >= 0) continue;
-          if (building(tx, ty)) continue;
+          if (building(tx, ty) || (skip && skip(tx, ty))) continue;
           const s = hash(gi, gj, 30 + t);
           const big = Math.min(2.2, 1 / Math.sqrt(lod));
           const hgt = (c === 10 || c === 95 ? 9 + 9 * s : c === 20 ? 3.5 + 3 * s : 6 + 7 * s) * Math.min(1.3, Math.sqrt(big));
@@ -284,6 +290,9 @@ const Scenery = (() => {
     return null;
   }
 
-  return { updateTrees, updateBuildings, solid, building, state: st };
+  // what to leave out (skip(x, y) world m: true under a gas station), the buildings and trees built again
+  let skip = null;
+  function setSkip(f) { skip = f; st.bForce = true; st.treeKey = ''; }
+  return { updateTrees, updateBuildings, solid, building, setSkip, state: st };
 })();
 window.Scenery = Scenery;

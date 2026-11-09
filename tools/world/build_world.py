@@ -55,6 +55,13 @@ car = find(r"^// =+ car$", m0)
 v0 = find(r"^// Arcade vehicle\.", car)
 v1 = find(r"^const DRAFT", v0)
 body = "\n".join(lines[m0 + 1:car]) + "\n" + "\n".join(lines[v0:v1 + 1]) + "\n"
+# and the car-hit helpers the world's collisions call (collideTrees, collideBuildings, collideProps: carHitCircle and
+# carImpulse, OpenDrive's impulse on the car's mass and yaw inertia), from the car section: HIT_MU to the end of
+# carHitCircle; they read CAR and FOC, which chase mode sets (world_api.js)
+h0 = find(r"^const HIT_MU", car)
+h1 = find(r"^function carHitCircle", h0)
+h2 = next(i for i in range(h1 + 1, len(lines)) if lines[i] == "}")
+body += "\n".join(lines[h0:h2 + 1]) + "\n"
 
 REPL = [
     # where the map starts: given by chase mode
@@ -87,6 +94,11 @@ REPL = [
     (r"new Worker\(URL\.createObjectURL\(new Blob\(\[document\.getElementById\('tileWorker'\)\.textContent\], "
      r"\{ type: 'text/javascript' \}\)\)\)", "new Worker(CW.workerUrl)"),
     (r"JSON\.parse\(document\.getElementById\('landmarkData'\)\.textContent\)", "(CW.landmarks || [])"),
+    # its graphics-quality switch (OpenDrive): a button chase mode's page has not got (the module threw on it) and a
+    # G key; chase mode draws the map through the API below, never through the page's own post-processing
+    (r"document\.getElementById\('gfxBtn'\)\.addEventListener\('click', \(\) => setGraphics\(!gfx\.high\)\);\n", ""),
+    (r"addEventListener\('keydown', e => \{ if \(e\.target\.tagName !== 'INPUT' && e\.code === 'KeyG'\) "
+     r"setGraphics\(!gfx\.high\); \}\);\n", ""),
 ]
 for pat, rep in REPL:
     body, n = re.subn(pat, rep, body)

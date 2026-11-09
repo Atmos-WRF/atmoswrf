@@ -4,6 +4,12 @@
 // renderer composites and lights), and answers what is under a point (ground) and what the car runs into (collide).
 // Coordinates here are this map's own: x east, z south, y up, metres (Web Mercator about START_LAT, START_LON);
 // toLatLon / fromLatLon convert.
+// the point the map streams in and is built round: the friend's page keeps it as FOC (its car or its walker, set in
+// the parts build_world.py leaves out); here it is chase mode's focus, V (focus() below)
+const FOC = V;
+// and the car its collisions reckon with (the friend's page keeps it with its own car): chase mode's car's size (map
+// metres), mass (kg), yaw inertia (kg m^2) and wheel radius (m), from collide()
+const CAR = { len: 4.8, wid: 1.95, kg: 2150, Iz: 4800, wheelR: 0.38 };
 const fromLatLon = (lat, lon) => [(lonToU(lon) - U0) * SCALE, (latToV(lat) - V0) * SCALE];
 let rt = null, lastNow = performance.now(), focusSet = false;
 function target(w, h) {
@@ -129,8 +135,10 @@ const ChaseWorld = {
     if (wl !== null && wl > g.h) out.water = wl - g.h;
     return out;
   },
-  // the car (here at V: x, z, heading, vx, vz, y) pushed out of trees, buildings, landmarks and props: V afterwards
+  // the car (here at V: x, z, heading, vx, vz, y, yawRate; len, wid, kg, Iz, wheelR its size, mass, yaw inertia and
+  // wheels) pushed out of trees, buildings, landmarks and props and turned by what it hit: V afterwards
   collide(p) {
+    for (const k of ['len', 'wid', 'kg', 'Iz', 'wheelR']) if (p[k] > 0) CAR[k] = p[k];
     Object.assign(V, p);
     collideTrees();
     collideBuildings();

@@ -118,8 +118,6 @@ async function setGraphics(high) {
   finally { gfx.loading = false; }
 }
 addEventListener('resize', () => { if (gfx.composer) gfx.composer.setSize(innerWidth, innerHeight); });
-addEventListener('keydown', e => { if (e.target.tagName !== 'INPUT' && e.code === 'KeyG') setGraphics(!gfx.high); });
-document.getElementById('gfxBtn').addEventListener('click', () => setGraphics(!gfx.high));
 { let saved = null; try { saved = localStorage.getItem('rrd.gfx'); } catch (e) {} if (saved === 'high') setTimeout(() => setGraphics(true), 0); }
 
 // ---- the sky: a dome that always sits on the camera. Haze at the horizon (the fog colour, so distant land melts
@@ -4440,6 +4438,61 @@ const SURF_PHYS = [
 let WHEELBASE = 2.7, TRACK = 1.6;
 const GRAV = 9.81;
 const DRAFT = 0.6;   // water deeper than this lifts the car off the bed
+const HIT_MU = 0.45;                 // car body sliding along bark, brick or a fence
+function carImpulse(px, pz, nx, nz) {
+  const m = CAR.kg, I = CAR.Iz * (CAR.yawI || 1), rx = px - V.x, rz = pz - V.z, w = V.yawRate;
+  // velocity of the car's skin at the contact (the yaw turns a point r at w * (rz, -rx))
+  const vcx = V.vx + w * rz, vcz = V.vz - w * rx, vn = vcx * nx + vcz * nz;
+  if (vn >= 0) return 0;
+  const e = 0.06 + 0.2 * Math.exp(vn / 4);                         // a nudge bounces a little, a crash hardly
+  const rn = rz * nx - rx * nz, jn = -(1 + e) * vn / (1 / m + rn * rn / I);
+  const tx = -nz, tz = nx, vt = vcx * tx + vcz * tz, rt = rz * tx - rx * tz, lim = HIT_MU * jn;
+  const jt = Math.max(-lim, Math.min(lim, -vt / (1 / m + rt * rt / I)));
+  const Jx = nx * jn + tx * jt, Jz = nz * jn + tz * jt;
+  V.vx += Jx / m; V.vz += Jz / m;
+  V.yawRate = Math.max(-4, Math.min(4, V.yawRate + (rz * Jx - rx * Jz) / I));
+  if (vn < -2) V.wd = (V.vx * Math.sin(V.heading) + V.vz * Math.cos(V.heading)) / CAR.wheelR;
+  V.hit = Math.max(V.hit || 0, -vn);
+  return -vn;
+}
+/** The car against a circle (x, z, radius). probe: only say whether they touch. */
+function carHitCircle(cx, cz, r, dt, probe = false) {
+  const fx = Math.sin(V.heading), fz = Math.cos(V.heading), lx = fz, lz = -fx, hl = CAR.len / 2, hw = CAR.wid / 2;
+  const ex = cx - V.x, ez = cz - V.z, a = ex * fx + ez * fz, b = ex * lx + ez * lz;
+  const va = V.vx * fx + V.vz * fz, vb = V.vx * lx + V.vz * lz, sw = Math.abs(va) * dt;
+  if (Math.abs(b) >= hw + r || a >= hl + r + (va < 0 ? sw : 0) || a <= -hl - r - (va > 0 ? sw : 0)) return false;
+  // the box has rounded corners (a car's are): a trunk caught just inside a corner glances off it instead of
+  // stopping the car as if it had hit a brick. Inner box shrunk by RC, circle grown by RC.
+  const RC = Math.min(0.35, hw * 0.6), il = hl - RC, iw = hw - RC, R2 = r + RC;
+  const qa = Math.max(-il, Math.min(il, a)), qb = Math.max(-iw, Math.min(iw, b));
+  let na, nb, depth, pa, pb;
+  const d = Math.hypot(qa - a, qb - b);
+  if (d > 1e-4 && d < R2 && Math.abs(a) <= hl + r) {
+    // touching from outside (a side, or a corner): straight out from the circle, touching the car's skin
+    na = (qa - a) / d; nb = (qb - b) / d; depth = R2 - d; pa = qa - na * RC; pb = qb - nb * RC;
+  } else if (d > 1e-4 && Math.abs(a) <= hl + r) return false;      // near a corner but clear of it
+  else {
+    // inside the box, or swept past: out through the face it came in by (the one it crossed most recently,
+    // going by how the car is moving), not just the nearest - a trunk deep in the bonnet goes out the front
+    const faces = [];
+    if (va > 0.05) faces.push([(hl + r - a) / va, 0]);
+    if (va < -0.05) faces.push([(a + hl + r) / -va, 1]);
+    if (vb > 0.05) faces.push([(hw + r - b) / vb, 2]);
+    if (vb < -0.05) faces.push([(b + hw + r) / -vb, 3]);
+    if (!faces.length) faces.push([hl + r - a, 0], [a + hl + r, 1], [hw + r - b, 2], [b + hw + r, 3]);
+    faces.sort((p, q) => p[0] - q[0]);
+    const f = faces[0][1];
+    if (f === 0) { na = -1; nb = 0; depth = hl + r - a; pa = hl; pb = qb; }
+    else if (f === 1) { na = 1; nb = 0; depth = a + hl + r; pa = -hl; pb = qb; }
+    else if (f === 2) { na = 0; nb = -1; depth = hw + r - b; pa = qa; pb = hw; }
+    else { na = 0; nb = 1; depth = b + hw + r; pa = qa; pb = -hw; }
+  }
+  if (probe) return true;
+  const nx = na * fx + nb * lx, nz = na * fz + nb * lz;
+  carImpulse(V.x + pa * fx + pb * lx, V.z + pa * fz + pb * lz, nx, nz);
+  V.x += nx * depth; V.z += nz * depth;
+  return true;
+}
 
 // ===================================================================== chase mode's API
 // Chase mode keeps its own car and camera and draws the storm; this map streams in around the point it is given
@@ -4447,6 +4500,12 @@ const DRAFT = 0.6;   // water deeper than this lifts the car off the bed
 // renderer composites and lights), and answers what is under a point (ground) and what the car runs into (collide).
 // Coordinates here are this map's own: x east, z south, y up, metres (Web Mercator about START_LAT, START_LON);
 // toLatLon / fromLatLon convert.
+// the point the map streams in and is built round: the friend's page keeps it as FOC (its car or its walker, set in
+// the parts build_world.py leaves out); here it is chase mode's focus, V (focus() below)
+const FOC = V;
+// and the car its collisions reckon with (the friend's page keeps it with its own car): chase mode's car's size (map
+// metres), mass (kg), yaw inertia (kg m^2) and wheel radius (m), from collide()
+const CAR = { len: 4.8, wid: 1.95, kg: 2150, Iz: 4800, wheelR: 0.38 };
 const fromLatLon = (lat, lon) => [(lonToU(lon) - U0) * SCALE, (latToV(lat) - V0) * SCALE];
 let rt = null, lastNow = performance.now(), focusSet = false;
 function target(w, h) {
@@ -4572,8 +4631,10 @@ const ChaseWorld = {
     if (wl !== null && wl > g.h) out.water = wl - g.h;
     return out;
   },
-  // the car (here at V: x, z, heading, vx, vz, y) pushed out of trees, buildings, landmarks and props: V afterwards
+  // the car (here at V: x, z, heading, vx, vz, y, yawRate; len, wid, kg, Iz, wheelR its size, mass, yaw inertia and
+  // wheels) pushed out of trees, buildings, landmarks and props and turned by what it hit: V afterwards
   collide(p) {
+    for (const k of ['len', 'wid', 'kg', 'Iz', 'wheelR']) if (p[k] > 0) CAR[k] = p[k];
     Object.assign(V, p);
     collideTrees();
     collideBuildings();

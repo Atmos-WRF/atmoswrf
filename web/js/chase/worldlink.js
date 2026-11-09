@@ -80,8 +80,13 @@ const WorldLink = (() => {
     if (!st.W || st.zOff === null || !car) return false;
     const p = car.p, [wx, wz] = toW(p[0], p[1]);
     const f = [Math.cos(car.yaw || 0), Math.sin(car.yaw || 0), 0], fw = dirToW(p, f), vw = dirToW(p, [car.v[0], car.v[1], 0]);
-    const V = st.W.collide({ x: wx, z: wz, y: p[2] + st.zOff, heading: Math.atan2(fw[0], fw[2]), vx: vw[0], vz: vw[2] });
+    const sc = scaleAt(p[0], p[1]), S = car.spec || {}, dims = S.dims || [4.8, 1.95];
+    const yr = car.w ? car.w[2] : 0;                  // counter-clockwise from above: the map's +heading turns left too
+    const V = st.W.collide({ x: wx, z: wz, y: p[2] + st.zOff, heading: Math.atan2(fw[0], fw[2]), vx: vw[0], vz: vw[2],
+                             yawRate: yr, len: dims[0] / sc, wid: dims[1] / sc, kg: S.mass || 2150,
+                             Iz: car.I ? car.I[2] / (sc * sc) : 4800, wheelR: S.wheelR || 0.38 });
     const moved = Math.hypot(V.x - wx, V.z - wz) > 1e-4 || Math.hypot(V.vx - vw[0], V.vz - vw[2]) > 1e-4;
+    if (car.w && Math.abs(V.yawRate - yr) > 1e-6) car.w[2] = V.yawRate;   // a corner clipped: the car turned
     if (!moved) return false;
     const np = fromW(V.x, V.z), nv = fromW(V.x + V.vx, V.z + V.vz);
     car.p[0] = np[0]; car.p[1] = np[1];

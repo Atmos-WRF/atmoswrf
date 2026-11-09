@@ -64,9 +64,70 @@ for (const mat of [treeMat, farMat, plantMat]) {
     Object.assign(sh.uniforms, { uWind: windU, uWT: windTU });
     sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\n' + SWAY_GLSL)
       .replace('#include <project_vertex>', projectSway('position.y'));
+    // the trees broken where the damage is (ChaseWorld.damage): snapped to stubs, their branches stripped
+    if (mat !== plantMat) {
+      Object.assign(sh.uniforms, dmgU);
+      sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\n' + DMG_HEAD)
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\n' + TREE_DMG);
+    }
   };
-  mat.customProgramCacheKey = () => key + '-wind2';
+  mat.customProgramCacheKey = () => key + '-wind2-dmg';
   mat.needsUpdate = true;
+}
+// ---- the damage (chase mode's damage.js, through ChaseWorld.damage): each building's fragments above what is left
+// standing at its degree of damage (EF scale, from the model's peak gusts) cut away, its roof stripped to the deck
+// before that -- a texture over the ground round the car: r the degree / 10, g the ground's height there
+const dmgU = { uDmg: { value: null }, uDmgBox: { value: new THREE.Vector4(0, 0, 1, 0) } };
+const DMG_HEAD = `
+uniform sampler2D uDmg; uniform vec4 uDmgBox;
+`;
+const DMG_MAIN = `
+  if (uDmgBox.w > 0.5) {
+    vec2 duv = (vWorldP.xz - uDmgBox.xy) / uDmgBox.z;
+    if (all(greaterThan(duv, vec2(0.0))) && all(lessThan(duv, vec2(1.0)))) {
+      vec4 dm = texture2D(uDmg, duv);
+      float dg = dm.r * 10.0, hg = vWorldP.y - dm.g;
+      if (dg >= 5.5) {
+        float keep = dg >= 9.5 ? 0.15 : dg >= 8.5 ? 0.6 : dg >= 7.5 ? 1.2 : dg >= 6.5 ? 2.0 : 3.0;
+        if (hg > keep + 0.35 * sin(vWorldP.x * 1.7) + 0.3 * sin(vWorldP.z * 2.3)) discard;
+      }
+      vec3 fn = normalize(cross(dFdx(vWorldP), dFdy(vWorldP)));
+      if (dg >= 1.5 && abs(fn.y) > 0.6) diffuseColor.rgb = mix(diffuseColor.rgb, vec3(0.42, 0.33, 0.24), clamp((dg - 1.0) / 3.0, 0.0, 1.0));
+      if (dg >= 3.0) diffuseColor.rgb *= 0.85;
+    }
+  }
+`;
+// a tree (instanced, its height the instance's y scale) at its degree of damage: from 5 (trunks snapped, ~100 mph)
+// a stub of 2.6 m (1.2 m from 9), from 3 its big branches gone
+const TREE_DMG = `
+#ifdef USE_INSTANCING
+  {
+    vec3 ipd = (modelMatrix * vec4(instanceMatrix[3].xyz, 1.0)).xyz;
+    float hd = max(length(instanceMatrix[1].xyz), 0.5);
+    vec2 duv = (ipd.xz - uDmgBox.xy) / uDmgBox.z;
+    if (uDmgBox.w > 0.5 && all(greaterThan(duv, vec2(0.0))) && all(lessThan(duv, vec2(1.0)))) {
+      float dg = texture2D(uDmg, duv).r * 10.0;
+      if (dg >= 4.5) { float cut = (dg >= 8.5 ? 1.2 : 2.6) / hd; if (transformed.y > cut) { transformed.xz *= 0.1; transformed.y = cut; } }
+      else if (dg >= 2.5 && transformed.y > 3.0 / hd) transformed.xz *= 0.6;
+    }
+  }
+#endif
+`;
+{
+  const own = buildingMaterial;
+  // (a function declaration: the tiles built from now on take this one)
+  buildingMaterial = o => {
+    const m = own(o), ob = m.onBeforeCompile;
+    m.side = THREE.DoubleSide;                     // a building cut open shows its inside walls
+    m.onBeforeCompile = (sh, r) => {
+      if (ob) ob.call(m, sh, r);
+      Object.assign(sh.uniforms, dmgU);
+      sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\n' + DMG_HEAD)
+        .replace('#include <alphatest_fragment>', DMG_MAIN + '#include <alphatest_fragment>');
+    };
+    m.customProgramCacheKey = () => 'building-v2-dmg';
+    return m;
+  };
 }
 const ChaseWorld = {
   START_LAT, START_LON, TILE_SIZE, SURF, SURF_NAMES, LAND, LAND_SURFACE, CLASS_LIST, SEG,
@@ -167,6 +228,23 @@ const ChaseWorld = {
   wind(o) {
     windU.value.set(o.u || 0, o.z || 0, o.gust || 1);
     windTU.value = performance.now() / 1000 % 3600;
+  },
+  // the damage round the car: o { x0, z0 (this map's corner), size (its side), n (texels a side), deg: Float32Array
+  // n * n (row by row along x, then z: the degree of damage / 10) }; the ground's height is put in here
+  damage(o) {
+    const N = o.n, a = new Float32Array(N * N * 4), c = o.size / N;
+    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+      const k = j * N + i, d = o.deg[k];
+      if (!(d > 0)) continue;
+      const g = groundAt(o.x0 + (i + 0.5) * c, o.z0 + (j + 0.5) * c, Infinity);
+      if (!g) continue;
+      a[4 * k] = d; a[4 * k + 1] = g.h;
+    }
+    const t = new THREE.DataTexture(a, N, N, THREE.RGBAFormat, THREE.FloatType);
+    t.minFilter = t.magFilter = THREE.NearestFilter; t.needsUpdate = true;
+    if (dmgU.uDmg.value) dmgU.uDmg.value.dispose();
+    dmgU.uDmg.value = t;
+    dmgU.uDmgBox.value.set(o.x0, o.z0, o.size, 1);
   },
   // the landmark close by (within 400 m), its name
   landmarkNear: () => (lmNear ? lmNear.name : null),

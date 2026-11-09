@@ -127,6 +127,27 @@ const WorldLink = (() => {
     st.W.wind({ u: tw.u, z: -tw.v, gust: tw.gust });
   }
 
-  return { st, start, update, moved, ground, collide, pushOut, drawer, wind, toW, fromW, ready: () => !!(st.W && st.ready && st.zOff !== null) };
+  // the damage round x, y (world m) into the map's buildings (damage.js: each texel's degree for a house)
+  function damage(x, y) {
+    if (!st.W || !st.W.damage || !window.Damage || st.zOff === null) return false;
+    const D = Damage.state;
+    if (st.dGen === D.gen && st.dAt && Math.hypot(x - st.dAt[0], y - st.dAt[1]) < 800) return false;
+    st.dGen = D.gen; st.dAt = [x, y];
+    if (!D.fine.size && !D.coarse.size) { st.W.damage({ x0: 0, z0: 0, size: 1, n: 1, deg: new Float32Array(1) }); return true; }
+    // this map's axes against ours here (nearly a turn and a scale over a few km)
+    const o = toW(x, y), ex = toW(x + 100, y), ey = toW(x, y + 100);
+    const a = (ex[0] - o[0]) / 100, b = (ey[0] - o[0]) / 100, c = (ex[1] - o[1]) / 100, d = (ey[1] - o[1]) / 100, det = a * d - b * c;
+    const N = 256, size = 4096 * Math.sqrt(Math.abs(det)), cell = size / N, x0 = o[0] - size / 2, z0 = o[1] - size / 2;
+    const deg = new Float32Array(N * N);
+    for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+      const mx = x0 + (i + 0.5) * cell - o[0], mz = z0 + (j + 0.5) * cell - o[1];
+      const dx = (d * mx - b * mz) / det, dy = (-c * mx + a * mz) / det;
+      const g = Damage.gustAt(x + dx, y + dy);
+      if (g > 0) deg[j * N + i] = Damage.degree(0, g) / 10;
+    }
+    st.W.damage({ x0, z0, size, n: N, deg });
+    return true;
+  }
+  return { st, start, update, moved, ground, collide, pushOut, drawer, wind, toW, fromW, damage, ready: () => !!(st.W && st.ready && st.zOff !== null) };
 })();
 window.WorldLink = WorldLink;

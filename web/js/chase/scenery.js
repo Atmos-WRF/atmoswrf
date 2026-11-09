@@ -78,8 +78,25 @@ const Scenery = (() => {
   const ROOFS = [[62, 62, 66], [80, 72, 66], [96, 64, 52], [48, 50, 54], [110, 104, 96], [70, 80, 92]];
   const srgb = c => c.map(v => v / 255);
 
+  const mix3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
   function buildBuildings(list, origin, terrain) {
     const V = [], polys = [], grid = new Map();
+    // heaps of what fell (degree 6 up): boxes of roof, wall and timber over the footprint (C(a, b, z): its frame)
+    const rubble = (C, la, lb, z0, dg, roofC, wallC, id) => {
+      const n = 3 + Math.min(9, Math.round((la * lb) / 12)) + (dg - 6) * 2;
+      for (let k = 0; k < n; k++) {
+        const a = (hash(id, k, 70) * 2 - 1) * la * 0.85, b = (hash(id, k, 71) * 2 - 1) * lb * 0.85;
+        const w = 0.6 + 1.6 * hash(id, k, 72), d = 0.5 + 1.2 * hash(id, k, 73), hgt = 0.25 + (dg >= 9 ? 0.5 : 0.9) * hash(id, k, 74);
+        const col = [roofC, wallC, [0.5, 0.4, 0.28], [0.36, 0.33, 0.3]][Math.floor(hash(id, k, 75) * 4)];
+        const p = [C(a - w, b - d, z0), C(a + w, b - d, z0), C(a + w, b + d, z0), C(a - w, b + d, z0)];
+        const q = p.map(v => [v[0], v[1], v[2] + hgt]);
+        quad(q[0], q[1], q[2], q[3], [0, 0, 1], col.map(v => v * 0.85));
+        for (let i = 0; i < 4; i++) {
+          const j = (i + 1) % 4, ex = p[j][0] - p[i][0], ey = p[j][1] - p[i][1], l = Math.hypot(ex, ey) || 1;
+          quad(p[i], p[j], q[j], q[i], [ey / l, -ex / l, 0], col.map(v => v * 0.7));
+        }
+      }
+    };
     const tri = (a, b, c, n, col) => { for (const p of [a, b, c]) V.push(p[0], p[1], p[2], n[0], n[1], n[2], col[0], col[1], col[2]); };
     const quad = (a, b, c, d, n, col) => { tri(a, b, c, n, col); tri(a, c, d, n, col); };
     const norm = (a, b, c) => {
@@ -104,12 +121,22 @@ const Scenery = (() => {
       if (Math.abs(A) < 6) continue;
       if (A < 0) { const Q = []; for (let i = P.length - 2; i >= 0; i -= 2) Q.push(P[i], P[i + 1]); P.splice(0, P.length, ...Q); }
       const s = hash(Math.round(P[0] * 10), Math.round(P[1] * 10), 3);
+      let bx0 = 1e9, bx1 = -1e9, by0 = 1e9, by1 = -1e9;
+      for (let i = 0; i < P.length; i += 2) { bx0 = Math.min(bx0, P[i]); bx1 = Math.max(bx1, P[i]); by0 = Math.min(by0, P[i + 1]); by1 = Math.max(by1, P[i + 1]); }
+      const gust = window.Damage ? Damage.gustOver(bx0 + origin[0], by0 + origin[1], bx1 + origin[0], by1 + origin[1]) : 0;
       let zb = 1e9;
       for (let i = 0; i < P.length; i += 2) zb = Math.min(zb, terrain(P[i] + origin[0], P[i + 1] + origin[1]));
       zb -= 0.3;
       const barn = kind === 2 && Math.abs(A) < 1500 && s < 0.45;
       const wall = srgb(barn ? [150, 42, 34] : kind === 2 ? [178, 182, 186] : kind === 3 ? [184, 176, 166] : kind === 1 ? WALLS[Math.floor(s * 3) + 4] || WALLS[5] : WALLS[Math.floor(s * WALLS.length)]);
-      const roof = srgb(kind === 2 && !barn ? [150, 156, 162] : ROOFS[Math.floor(hash(id, 9) * ROOFS.length)]);
+      let roof = srgb(kind === 2 && !barn ? [150, 156, 162] : ROOFS[Math.floor(hash(id, 9) * ROOFS.length)]);
+      const roof0 = roof;
+      // its degree of damage (EF scale, damage.js): roof cover stripped (2-3), decking gone (4-5), roof off (6), walls
+      // down (7-9), swept off its slab (10)
+      const dg = gust > 0 && window.Damage ? Damage.degree(barn ? 4 : kind, gust) : 0;
+      if (dg >= 2) roof = mix3(roof, [0.42, 0.33, 0.24], Math.min(1, (dg - 1) / 3));
+      const keep = [1, 1, 1, 1, 1, 1, 1, 0.6, 0.32, 0.12, 0][dg];      // the walls' share still standing
+      const lit = dg < 3;                                               // the power's out where it is damaged
       let top = zb + 0.3 + h;
       const R = (kind === 0 || kind === 4 || barn) && Math.abs(A) < (barn ? 1500 : 450) ? rect(P) : null;
       if (R && R.ha > 0.8 && R.hb > 0.8) {
@@ -120,37 +147,46 @@ const Scenery = (() => {
         const ze = zb + 0.3 + eave, zr = ze + rise, ov = kind === 4 ? 0.15 : 0.45;
         const C = (a, b, z) => [R.cx + ux * a + vx * b, R.cy + uy * a + vy * b, z];
         const c0 = C(-la, -lb, zb), c1 = C(la, -lb, zb), c2 = C(la, lb, zb), c3 = C(-la, lb, zb);
-        const e0 = C(-la, -lb, ze), e1 = C(la, -lb, ze), e2 = C(la, lb, ze), e3 = C(-la, lb, ze);
-        quad(c0, c1, e1, e0, [vx * -1, vy * -1, 0], wall);
-        quad(c2, c3, e3, e2, [vx, vy, 0], wall);
-        quad(c1, c2, e2, e1, [ux, uy, 0], wall);
-        quad(c3, c0, e0, e3, [-ux, -uy, 0], wall);
-        const g0 = C(-la, 0, zr), g1 = C(la, 0, zr);
-        tri(e1, e2, g1, [ux, uy, 0], wall); tri(e3, e0, g0, [-ux, -uy, 0], wall);
-        const o0 = C(-la - ov, -lb - ov, ze - ov * rise / lb), o1 = C(la + ov, -lb - ov, ze - ov * rise / lb);
-        const o2 = C(la + ov, lb + ov, ze - ov * rise / lb), o3 = C(-la - ov, lb + ov, ze - ov * rise / lb);
-        const r0 = C(-la - ov, 0, zr), r1 = C(la + ov, 0, zr);
-        const upn = n => (n[2] < 0 ? n.map(v => -v) : n);
-        quad(o0, o1, r1, r0, upn(norm(o0, o1, r1)), roof);
-        quad(o2, o3, r0, r1, upn(norm(o2, o3, r0)), roof);
+        // walls standing to their share (each its own, broken unevenly), the roof as far as it is left
+        const zw = k => zb + 0.3 + Math.max(0, eave * keep * (dg >= 7 ? 0.6 + 0.8 * hash(id, k, 65) : 1));
+        const e0 = C(-la, -lb, zw(0)), e1 = C(la, -lb, zw(0)), e2 = C(la, lb, zw(1)), e3 = C(-la, lb, zw(1));
+        const e1b = C(la, -lb, zw(2)), e2b = C(la, lb, zw(2)), e3b = C(-la, lb, zw(3)), e0b = C(-la, -lb, zw(3));
+        if (keep > 0) {
+          quad(c0, c1, e1, e0, [vx * -1, vy * -1, 0], wall);
+          quad(c2, c3, e3, e2, [vx, vy, 0], wall);
+          quad(c1, c2, e2b, e1b, [ux, uy, 0], wall);
+          quad(c3, c0, e0b, e3b, [-ux, -uy, 0], wall);
+        }
+        if (dg < 6) {
+          const g0 = C(-la, 0, zr), g1 = C(la, 0, zr);
+          tri(e1, e2, g1, [ux, uy, 0], wall); tri(e3, e0, g0, [-ux, -uy, 0], wall);
+          const o0 = C(-la - ov, -lb - ov, ze - ov * rise / lb), o1 = C(la + ov, -lb - ov, ze - ov * rise / lb);
+          const o2 = C(la + ov, lb + ov, ze - ov * rise / lb), o3 = C(-la - ov, lb + ov, ze - ov * rise / lb);
+          const r0 = C(-la - ov, 0, zr), r1 = C(la + ov, 0, zr);
+          const upn = n => (n[2] < 0 ? n.map(v => -v) : n);
+          // the decking gone (4-5): one side's roof off
+          if (dg < 4 || hash(id, 7, 66) < 0.5) quad(o0, o1, r1, r0, upn(norm(o0, o1, r1)), roof);
+          if (dg < 4 || hash(id, 7, 66) >= 0.5) quad(o2, o3, r0, r1, upn(norm(o2, o3, r0)), roof);
+        }
+        if (dg >= 6) rubble(C, la, lb, zb + 0.3, dg, roof0, wall, id);
         // its windows on the long sides, some lit at night (scenery's colour + 10: render.js MESH_FS)
-        if (kind === 0) for (const sb of [-1, 1]) for (const fa of [-0.5, 0.5]) {
+        if (kind === 0 && lit) for (const sb of [-1, 1]) for (const fa of [-0.5, 0.5]) {
           if (hash(id, sb * 3 + fa * 4 + 9, 61) > 0.5) continue;
           const a0 = fa * la - 0.6, a1 = fa * la + 0.6, b = sb * (lb + 0.04), wz0 = zb + 0.3 + 0.9, wz1 = zb + 0.3 + 2.1;
           const wc = hash(id, 5, 62) < 0.8 ? [11.0, 10.78, 10.45] : [10.85, 10.9, 11.0];
           quad(C(a0, b, wz0), C(a1, b, wz0), C(a1, b, wz1), C(a0, b, wz1), [vx * sb, vy * sb, 0], wc);
         }
-        top = zr;
+        top = dg < 6 ? zr : zb + 0.3 + Math.max(0.35, eave * keep);
       } else {
         // walls round the footprint, a flat roof (with a parapet colour band on big ones)
-        const zt = zb + 0.3 + h;
+        const kf = dg >= 6 ? [0.85, 0.85, 0.6, 0.32, 0.12, 0][dg - 5] : 1, zt = zb + 0.3 + h * kf;
         // the windows (lit ones only: colour + 10), floor by floor, on the bigger buildings' walls
-        const floors = Math.min(6, Math.floor((h - 0.6) / 3.2)), litP = kind === 2 || kind === 4 ? 0.04 : kind === 0 ? 0.4 : 0.28;
+        const floors = lit ? Math.min(6, Math.floor((h - 0.6) / 3.2)) : 0, litP = kind === 2 || kind === 4 ? 0.04 : kind === 0 ? 0.4 : 0.28;
         const wc = hash(id, 1, 63) < 0.6 ? [11.0, 10.8, 10.5] : [10.86, 10.92, 11.0];
         for (let i = 0; i < P.length; i += 2) {
           const j = (i + 2) % P.length, ex = P[j] - P[i], ey = P[j + 1] - P[i + 1], l = Math.hypot(ex, ey) || 1;
           const n = [ey / l, -ex / l, 0];
-          quad([P[i], P[i + 1], zb], [P[j], P[j + 1], zb], [P[j], P[j + 1], zt], [P[i], P[i + 1], zt], n, wall);
+          if (kf > 0) quad([P[i], P[i + 1], zb], [P[j], P[j + 1], zb], [P[j], P[j + 1], zt], [P[i], P[i + 1], zt], n, wall);
           const nw = floors > 0 ? Math.floor(l / 3.4) : 0, ox = n[0] * 0.05, oy = n[1] * 0.05;
           for (let w = 0; w < nw; w++) for (let f = 0; f < floors; f++) {
             if (hash(id * 7 + i, w * 13 + f, 64) > litP) continue;
@@ -159,17 +195,22 @@ const Scenery = (() => {
             quad([A[0], A[1], z0], [Bq[0], Bq[1], z0], [Bq[0], Bq[1], z1], [A[0], A[1], z1], n, wc);
           }
         }
-        const T = earcut(P);
+        // the roof (off from degree 6: then the floor slab, and the rubble on it)
+        const T = earcut(P), zr = dg >= 6 ? zb + 0.32 : zt, rc = dg >= 6 ? [0.5, 0.49, 0.47] : kind === 0 ? roof : dg >= 2 ? mix3(srgb([128, 128, 124]), [0.4, 0.33, 0.26], Math.min(1, (dg - 1) / 3)) : srgb([128, 128, 124]);
         for (let k = 0; k < T.length; k += 3) {
-          const a = [P[2 * T[k]], P[2 * T[k] + 1], zt], b = [P[2 * T[k + 1]], P[2 * T[k + 1] + 1], zt], c = [P[2 * T[k + 2]], P[2 * T[k + 2] + 1], zt];
-          tri(a, b, c, [0, 0, 1], kind === 0 ? roof : srgb([128, 128, 124]));
+          const a = [P[2 * T[k]], P[2 * T[k] + 1], zr], b = [P[2 * T[k + 1]], P[2 * T[k + 1] + 1], zr], c = [P[2 * T[k + 2]], P[2 * T[k + 2] + 1], zr];
+          tri(a, b, c, [0, 0, 1], rc);
         }
-        top = zt;
+        if (dg >= 6) {
+          const cx = (bx0 + bx1) / 2, cy = (by0 + by1) / 2, la = (bx1 - bx0) / 2, lb = (by1 - by0) / 2;
+          rubble((a, b, z) => [cx + a, cy + b, z], la * 0.8, lb * 0.8, zb + 0.3, dg, roof0, wall, id);
+        }
+        top = dg >= 6 ? zb + 0.3 + Math.max(0.35, h * kf) : zt;
       }
       // for the car: the footprint, hashed
       let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
       for (let i = 0; i < P.length; i += 2) { x0 = Math.min(x0, P[i]); x1 = Math.max(x1, P[i]); y0 = Math.min(y0, P[i + 1]); y1 = Math.max(y1, P[i + 1]); }
-      const b = { P, top, zb, x0, x1, y0, y1 };
+      const b = { P, top, zb, x0, x1, y0, y1, dg, kind: barn ? 4 : kind, roof: roof0, wall, id: `${Math.round(bx0 + origin[0])},${Math.round(by0 + origin[1])}` };
       polys.push(b);
       for (let i = Math.floor(x0 / CELL); i <= Math.floor(x1 / CELL); i++) for (let j = Math.floor(y0 / CELL); j <= Math.floor(y1 / CELL); j++) {
         const k = key(i, j);
@@ -199,7 +240,8 @@ const Scenery = (() => {
       if (far || forced || d.b.length !== st.bN) {
         const origin = [Math.round(x), Math.round(y)];
         const out = buildBuildings(d.b, origin, terrain);
-        Object.assign(st, { bOrigin: origin, bMesh: out.mesh, polys: out.polys, bGrid: out.grid, bN: d.b.length });
+        Object.assign(st, { bOrigin: origin, bMesh: out.mesh, polys: out.polys, bGrid: out.grid, bN: d.b.length, bList: d.b, bTerrain: terrain });
+        st.dGen = window.Damage ? Damage.state.gen : 0;
         st.bGen++;
         st.treeKey = '';                       // the trees again, out of the new buildings
         if (done) done();
@@ -252,8 +294,12 @@ const Scenery = (() => {
           if (building(tx, ty) || (skip && skip(tx, ty))) continue;
           const s = hash(gi, gj, 30 + t);
           const big = Math.min(2.2, 1 / Math.sqrt(lod));
-          const hgt = (c === 10 || c === 95 ? 9 + 9 * s : c === 20 ? 3.5 + 3 * s : 6 + 7 * s) * Math.min(1.3, Math.sqrt(big));
-          const crown = hgt * (0.3 + 0.14 * hash(gi, gj, 40 + t)) * Math.min(1.6, big);
+          let hgt = (c === 10 || c === 95 ? 9 + 9 * s : c === 20 ? 3.5 + 3 * s : 6 + 7 * s) * Math.min(1.3, Math.sqrt(big));
+          let crown = hgt * (0.3 + 0.14 * hash(gi, gj, 40 + t)) * Math.min(1.6, big);
+          const tg = window.Damage && Damage.state.fine.size ? Damage.gustAt(tx, ty) * 2.23694 : 0;
+          if (tg >= 143) { hgt *= 0.3; crown = 0.01; }                              // debarked stubs
+          else if (tg >= 91 - 12 * hash(gi, gj, 80 + t)) { hgt *= 0.35 + 0.2 * hash(gi, gj, 81 + t); crown *= 0.18; }   // snapped
+          else if (tg >= 74) crown *= 0.55;                                         // large branches gone
           out[6 * n] = tx - origin[0]; out[6 * n + 1] = ty - origin[1]; out[6 * n + 2] = terrain(tx, ty);
           out[6 * n + 3] = hgt; out[6 * n + 4] = crown; out[6 * n + 5] = hash(gi, gj, 50 + t);
           if (hgt > 6 && Math.hypot(tx - x, ty - y) < 1200) {
@@ -307,9 +353,31 @@ const Scenery = (() => {
     return null;
   }
 
+  // the buildings built again as the damage rises (damage.js gen): true when rebuilt; each that lost more near
+  // (x, y) sheds its pieces (Damage.shed)
+  function damageUpdate(x, y) {
+    if (!window.Damage || !st.bList || st.bBusy || st.dGen === Damage.state.gen) return false;
+    const now = performance.now();
+    if (now - (st.dAt || 0) < 1500) return false;
+    st.dAt = now; st.dGen = Damage.state.gen;
+    const before = new Map(st.polys.map(b => [b.id, b.dg]));
+    const out = buildBuildings(st.bList, st.bOrigin, st.bTerrain);
+    Object.assign(st, { bMesh: out.mesh, polys: out.polys, bGrid: out.grid });
+    st.bGen++;
+    for (const b of out.polys) {
+      const d0 = before.get(b.id) || 0;
+      if (b.dg > d0) {
+        const cx = st.bOrigin[0] + (b.x0 + b.x1) / 2, cy = st.bOrigin[1] + (b.y0 + b.y1) / 2;
+        const dd = Math.hypot(cx - x, cy - y);
+        if (dd < 3000) Damage.shed(b, st.bOrigin, d0, b.dg, b.kind, b.roof, b.wall, dd < 1500);
+      }
+    }
+    if (now - (st.treeDmgAt || 0) > 4000) { st.treeKey = ''; st.treeDmgAt = now; }   // the trees broken too
+    return true;
+  }
   // what to leave out (skip(x, y) world m: true under a gas station), the buildings and trees built again
   let skip = null;
   function setSkip(f) { skip = f; st.bForce = true; st.treeKey = ''; }
-  return { updateTrees, updateBuildings, solid, building, setSkip, state: st };
+  return { updateTrees, updateBuildings, damageUpdate, solid, building, setSkip, state: st };
 })();
 window.Scenery = Scenery;

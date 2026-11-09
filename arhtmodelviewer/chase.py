@@ -236,6 +236,121 @@ def buildings(proj, box_km) -> dict:
     return {"b": out, "pending": pending, "busy": bool(pending) and osmfetch.busy()}
 
 
+# ---------------------------------------------------------------- the damage
+# The run's peak 3-s gust at 10 m where it reached DMG_MIN, from the model's own fields: each grid's lowest level
+# (ground-relative) taken down to 10 m with the log law, plus GUST_SIGMA standard deviations of its turbulence (its
+# TKE), at least GUST_MIN over the wind -- as the cars' gusts (air()).  Kept on two sparse grids that outlive the
+# patches: DMG_FINE m cells from the grids of DMG_FINE_DX m or finer (the tornado nests), DMG_COARSE m cells from the
+# rest.  A thread samples the model about once a second of wall time while chase mode asks for it; chase mode turns
+# each building's peak gust into its degree of damage (the EF scale's, by the kind of building).
+DMG_MIN = 26.0                   # m/s: the weakest gust that does visible damage (EF0's lower end ~29 m/s)
+DMG_FINE, DMG_COARSE, DMG_FINE_DX = 25.0, 250.0, 150.0
+_DMG = {"run": None, "t": -1.0, "fine": {}, "coarse": {}, "ver": 0, "thread": None, "asked": 0.0}
+_DMG_LOCK = threading.Lock()
+
+
+def _damage_scan(sim) -> list:
+    """One look at the model: every grid's gusts at DMG_MIN or more, [(fine, x0, y0, dx, jj, ii, gusts)] for
+    _damage_merge (on the host: the merge runs without the model's lock).  Caller holds sim.lock."""
+    import cupy as cp
+    from . import products
+    from .metars import GUST_MIN, GUST_SIGMA
+    eng, env = sim.engine, sim.env
+    if eng is None:
+        return []
+    if _DMG["run"] != sim.run_id or eng.t < _DMG["t"] - 1.0:        # a new run, or rolled back: start again
+        with _DMG_LOCK:
+            _DMG.update(run=sim.run_id, fine={}, coarse={}, t=-1.0)
+            _DMG["ver"] += 1
+    if eng.t == _DMG["t"]:
+        return []
+    _DMG["t"] = float(eng.t)
+    z0 = max(float(env.physics.z0), 1e-4)
+    out = []
+    for p in list(eng.patches) + list(eng.nest_patches()):
+        st, pe = p.state, p.env
+        if st is None:
+            continue
+        dx = float(pe.grid.dx)
+        W = products.low_wind(p)[0]
+        z1 = float(pe.z_h[0])
+        fac = 1.0 if z1 <= 10.0 else min(max(math.log(10.0 / z0) / math.log(z1 / z0), 0.4), 1.0)
+        spd = W * fac
+        tke = getattr(st, "tke", None)
+        sig = cp.sqrt(cp.maximum(tke[0], 0.0) * (2.0 / 3.0)) * fac if tke is not None else 0.0 * spd
+        gust = spd + cp.maximum(GUST_SIGMA * sig, GUST_MIN * spd)
+        jj, ii = cp.nonzero(gust >= DMG_MIN)
+        if jj.size == 0:
+            continue
+        out.append((dx <= DMG_FINE_DX, p.world_x0(), p.world_y0(), dx, cp.asnumpy(jj), cp.asnumpy(ii),
+                    cp.asnumpy(gust[jj, ii]).astype(float)))
+    return out
+
+
+def _damage_merge(samples) -> None:
+    """_damage_scan's gusts into the peak maps: each cell's peak and the version it last rose in."""
+    changed = False
+    with _DMG_LOCK:
+        ver = _DMG["ver"] + 1
+        for fine, x0, y0, dx, jj, ii, g in samples:
+            cell, store = (DMG_FINE, _DMG["fine"]) if fine else (DMG_COARSE, _DMG["coarse"])
+            n = max(1, int(round(dx / cell)))
+            for j, i, v in zip(jj.tolist(), ii.tolist(), g.tolist()):
+                ci = int(math.floor((x0 + i * dx) / cell))
+                cj = int(math.floor((y0 + j * dx) / cell))
+                for a in range(n):
+                    for b in range(n):
+                        k = (ci + a, cj + b)
+                        if v > store.get(k, (0.0, 0))[0] + 0.05:
+                            store[k] = (v, ver)
+                            changed = True
+        if changed:
+            _DMG["ver"] = ver
+
+
+def _damage_loop(sim) -> None:
+    while _DMG["thread"] is threading.current_thread():
+        if time.time() - _DMG["asked"] > 120:                  # nobody chasing: stop until asked again
+            _DMG["thread"] = None
+            return
+        try:
+            with sim.lock:
+                samples = _damage_scan(sim)
+            _damage_merge(samples)
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+
+def damage(sim, box_km, since: int = -1) -> dict:
+    """The run's peak gusts in the box (world km): {"ver", "fine": [[i, j, gust m/s x10], ...] (DMG_FINE m cells:
+    x = i * cell), "coarse": [...] (DMG_COARSE m), "cell": [fine, coarse]}: the cells that rose after version
+    ``since`` (all with -1); "reset": true when a new run or a rollback started the maps again."""
+    _DMG["asked"] = time.time()
+    th = _DMG["thread"]
+    if th is None or not th.is_alive():
+        th = threading.Thread(target=_damage_loop, args=(sim,), name="chase-damage", daemon=True)
+        _DMG["thread"] = th
+        th.start()
+    if _DMG["run"] != sim.run_id:
+        return {"ver": -1, "fine": [], "coarse": [], "cell": [DMG_FINE, DMG_COARSE], "reset": True}
+    ver = _DMG["ver"]
+    if since == ver:
+        return {"ver": ver}
+    reset = since > ver
+    if reset:
+        since = -1
+    x0, y0, x1, y1 = (float(v) * 1000.0 for v in box_km)
+    out = {"ver": ver, "cell": [DMG_FINE, DMG_COARSE], "reset": reset or since < 0}
+    for name, cell in (("fine", DMG_FINE), ("coarse", DMG_COARSE)):
+        i0, i1, j0, j1 = x0 / cell, x1 / cell, y0 / cell, y1 / cell
+        with _DMG_LOCK:
+            items = list(_DMG[name].items())
+        out[name] = [[i, j, int(round(v * 10))] for (i, j), (v, vv) in items
+                     if vv > since and i0 <= i <= i1 and j0 <= j <= j1]
+    return out
+
+
 # ---------------------------------------------------------------- the lightning
 # McCaul et al. (2009, Wea. Forecasting 24, 709-729): the total flash rate density from the model's own fields, per
 # column of each storm patch (the parent grids; the nests are too small a share of a storm to matter):
@@ -479,7 +594,7 @@ _FAILS: dict[str, list[float]] = {}
 _NEXT = [1]
 STALE = 6.0                                     # s without a sync: gone from the others' lists
 # what a joined page on another computer may read (GET) with its token while hosting is on
-READ = ("/api/state", "/api/pmw/targets", "/api/c/air", "/api/c/lightning", "/api/volume", "/api/volume/times", "/api/volume/roads",
+READ = ("/api/state", "/api/pmw/targets", "/api/c/air", "/api/c/lightning", "/api/c/damage", "/api/volume", "/api/volume/times", "/api/volume/roads",
         "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/volume/fuel", "/api/frames", "/api/frame", "/api/ppi")
 # (and the detailed map's module, tile worker and landmarks, and the cars' models)
 STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|colors)\.js|static/js/chase/[a-z0-9_]+\.js"

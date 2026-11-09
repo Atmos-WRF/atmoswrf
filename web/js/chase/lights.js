@@ -43,6 +43,7 @@ const Lights = (() => {
           const nx = -dy / l * side, ny = dx / l * side, off = Roads.HALF[k] + 1.6;
           const fx = px + nx * off, fy = py + ny * off;
           if (Scenery.building(fx, fy) || (Stations.covers && Stations.covers(fx, fy))) continue;
+          if (window.Damage && Damage.gustAt(fx, fy) > 35) continue;           // the power's out (or the pole down)
           const reach = Math.min(2.6, Roads.HALF[k] * 0.6);
           out.push({ x: fx, y: fy, z: h(fx, fy), hx: fx - nx * reach, hy: fy - ny * reach, yaw: Math.atan2(-ny, -nx),
                      led: hash(Math.round(fx / 400), Math.round(fy / 400)) < 0.7 });

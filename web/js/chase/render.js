@@ -40,7 +40,8 @@ const Render = (() => {
   const trees = { mesh: null, near: 0, far: 0, inst: null, count: 0, nearCount: 0, origin: [0, 0], vao: null };
   const blds = { buf: null, vao: null, n: 0, origin: [0, 0] };
   const lamps = { buf: null, vao: null, n: 0, origin: [0, 0] };
-  let lampProg = null, boltProg = null;
+  let lampProg = null, boltProg = null, debrisProg = null, dustProg = null;
+  const debris = { vao: null, inst: null, cube: 0, n: 0, origin: [0, 0] };
   const bolts = { vao: null, buf: null };
 
   // ---------------------------------------------------------------- shaders
@@ -140,6 +141,59 @@ const Render = (() => {
     if (g > 0.0 && g < length(wpos - eye)) discard;
     float f = 1.0 - vv * vv;
     frag = vec4(vec3(0.82, 0.88, 1.0) * va * f * f + vec3(1.0) * va * smoothstep(0.55, 0.95, f), 1.0);
+  }`;
+  // debris (damage.js): a unit box per piece, its place, turn (x, y, z angles), size and colour per instance, into
+  // the geometry buffer like any mesh
+  const DEBRIS_VS = `#version 300 es
+  layout(location = 0) in vec3 p; layout(location = 1) in vec3 n;
+  layout(location = 3) in vec3 ip; layout(location = 4) in vec3 ia; layout(location = 5) in vec3 isz; layout(location = 6) in vec3 ic;
+  uniform mat4 VP; uniform vec3 org; uniform float s;
+  out vec3 wpos; out vec3 nw; out vec3 col;
+  void main() {
+    float cx = cos(ia.x), sx = sin(ia.x), cy = cos(ia.y), sy = sin(ia.y), cz = cos(ia.z), sz = sin(ia.z);
+    mat3 X = mat3(1.0, 0.0, 0.0, 0.0, cx, sx, 0.0, -sx, cx);
+    mat3 Y = mat3(cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy);
+    mat3 Z = mat3(cz, sz, 0.0, -sz, cz, 0.0, 0.0, 0.0, 1.0);
+    mat3 R = Z * Y * X;
+    wpos = org + (ip + R * (p * isz)) * s; nw = R * n; col = ic;
+    gl_Position = VP * vec4(wpos, 1.0);
+  }`;
+  // dust the model's wind raises (game.js dustView): soft brown puffs in a band over the ground round the eye,
+  // blown with the wind, thinning with height, behind whatever is nearer (the geometry pass's distance)
+  const DUST_VS = `#version 300 es
+  uniform mat4 VP; uniform vec3 eye, right, upv, wind; uniform float s, t, cube, band, gz, k;
+  out vec2 q; out float va; out float vd;
+  float h(float n) { return fract(sin(n) * 43758.5453); }
+  void main() {
+    float id = float(gl_InstanceID);
+    vec3 r = vec3(h(id * 1.13 + 0.1), h(id * 2.71 + 0.3), h(id * 3.97 + 0.7));
+    vec3 eyeM = eye / s;
+    vec2 p0 = r.xy * cube + wind.xy * (0.8 + 0.4 * h(id * 5.3)) * t + 3.0 * vec2(sin(t * 0.7 + id), cos(t * 0.5 + id * 1.3));
+    vec2 rel = mod(p0 - eyeM.xy, cube) - 0.5 * cube;
+    float z = gz + band * r.z * r.z + 1.0 * sin(t * 0.9 + id * 2.1);
+    vec3 c = vec3(rel, z - eyeM.z);
+    float size = 2.5 + 5.0 * h(id * 6.1);
+    int vi = gl_VertexID;
+    vec2 corner = vec2(vi == 1 || vi == 2 || vi == 4 ? 1.0 : -1.0, vi >= 2 && vi != 3 ? 1.0 : -1.0);
+    vec3 w = eye + (c + (right * corner.x + upv * corner.y) * size) * s;
+    gl_Position = VP * vec4(w, 1.0);
+    q = corner;
+    float d = length(c);
+    vd = d * s;
+    float edge = smoothstep(0.5 * cube, 0.3 * cube, max(abs(rel.x), abs(rel.y)));
+    va = k * edge * smoothstep(2.0, 8.0, d) * exp(-(z - gz) / (0.35 * band));
+  }`;
+  const DUST_FS = `#version 300 es
+  precision highp float;
+  in vec2 q; in float va; in float vd;
+  uniform sampler2D geoT; uniform vec2 res; uniform vec3 col;
+  out vec4 frag;
+  void main() {
+    float g = abs(texture(geoT, gl_FragCoord.xy / res).r);
+    float a = va * smoothstep(1.0, 0.0, length(q));
+    if (g > 0.0 && g < vd) a *= 0.0;
+    if (a < 0.003) discard;
+    frag = vec4(col, a * 0.35);
   }`;
   const MESH_VS = `#version 300 es
   layout(location = 0) in vec3 p; layout(location = 1) in vec3 n; layout(location = 2) in vec3 c;
@@ -852,6 +906,22 @@ const Render = (() => {
     gb.light = gl.createTexture();
     lampProg = program(LAMP_VS, LAMP_FS);
     boltProg = program(BOLT_VS, BOLT_FS);
+    debrisProg = program(DEBRIS_VS, MESH_FS);
+    dustProg = program(DUST_VS, DUST_FS);
+    {
+      const cube = [];
+      CarMesh.box(cube, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, [1, 1, 1]);
+      debris.vao = gl.createVertexArray(); debris.inst = gl.createBuffer();
+      const cb = gl.createBuffer();
+      gl.bindVertexArray(debris.vao); gl.bindBuffer(gl.ARRAY_BUFFER, cb);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cube), gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 36, 0);
+      gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 36, 12);
+      gl.bindBuffer(gl.ARRAY_BUFFER, debris.inst);
+      for (let i = 0; i < 4; i++) { gl.enableVertexAttribArray(3 + i); gl.vertexAttribPointer(3 + i, 3, gl.FLOAT, false, 48, 12 * i); gl.vertexAttribDivisor(3 + i, 1); }
+      gl.bindVertexArray(null);
+      debris.cube = cube.length / 9;
+    }
     bolts.vao = gl.createVertexArray(); bolts.buf = gl.createBuffer();
     gl.bindVertexArray(bolts.vao); gl.bindBuffer(gl.ARRAY_BUFFER, bolts.buf);
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 20, 0);
@@ -1144,6 +1214,13 @@ const Render = (() => {
     gl.bufferData(gl.ARRAY_BUFFER, inst, gl.STATIC_DRAW);
     trees.count = n; trees.nearCount = nearCount; trees.origin = origin;
   }
+  // the debris (damage.js): n instances of 12 floats (x, y, z from origin m, angles, size m, colour)
+  function setDebris(inst, n, origin) {
+    debris.n = n; debris.origin = origin || [0, 0];
+    if (!n) return;
+    gl.bindBuffer(gl.ARRAY_BUFFER, debris.inst);
+    gl.bufferData(gl.ARRAY_BUFFER, inst.subarray(0, n * 12), gl.DYNAMIC_DRAW);
+  }
   // the lamps' pools (lights.js): per lamp x, y, z (m from origin), radius m, r, g, b, intensity
   function setLamps(inst, origin) {
     gl.bindBuffer(gl.ARRAY_BUFFER, lamps.buf);
@@ -1318,6 +1395,15 @@ const Render = (() => {
         gl.drawArrays(gl.TRIANGLES, 0, m.wheel.n);
       }
     }
+    // the debris in the air and on the ground
+    if (debris.n) {
+      gl.useProgram(debrisProg);
+      gl.uniformMatrix4fv(debrisProg.u.VP, false, VP);
+      gl.uniform3f(debrisProg.u.org, ...toBox(G, [debris.origin[0], debris.origin[1], 0]));
+      gl.uniform1f(debrisProg.u.s, s); gl.uniform3f(debrisProg.u.eye, ...eye); gl.uniform3f(debrisProg.u.sunDir, ...sun);
+      gl.bindVertexArray(debris.vao);
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, debris.cube, debris.n);
+    }
     gl.disable(gl.CULL_FACE);
     // the lamps' pools of light, at night, added into the light target over what is drawn
     if (lamps.n && lampK > 0.01) {
@@ -1472,12 +1558,34 @@ const Render = (() => {
       gl.activeTexture(gl.TEXTURE13); gl.bindTexture(gl.TEXTURE_2D, gb.light); gl.uniform1i(u.geoE, 13);
     }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    drawDust(view, G, VPr, eye, W, H);
     drawPrecip(view, G, VPr, eye, W, H);
     drawBolts(view, G, VPr, eye, W, H);
     gl.disable(gl.BLEND);
     return { G, VP: VPc, W, H };
   }
 
+  // the dust over the finished picture: view.dust { k 0..1, col, gz (the ground under the eye, world m), wind [u, v] }
+  function drawDust(view, G, VP, eye, W, H) {
+    const d = view.dust;
+    if (!dustProg || !d || d.k < 0.01) return;
+    const u = dustProg.u, f = view.target.map((v, i) => v - view.eye[i]), fl = Math.hypot(...f) || 1;
+    const fw = f.map(v => v / fl), up = view.up || [0, 0, 1];
+    let r = [fw[1] * up[2] - fw[2] * up[1], fw[2] * up[0] - fw[0] * up[2], fw[0] * up[1] - fw[1] * up[0]];
+    const rl = Math.hypot(...r) || 1; r = r.map(v => v / rl);
+    const uv = [r[1] * fw[2] - r[2] * fw[1], r[2] * fw[0] - r[0] * fw[2], r[0] * fw[1] - r[1] * fw[0]];
+    const s = G.k / 1000;
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(dustProg); gl.bindVertexArray(vao);
+    gl.uniformMatrix4fv(u.VP, false, VP); gl.uniform3f(u.eye, ...eye); gl.uniform1f(u.s, s);
+    gl.uniform3f(u.right, ...r); gl.uniform3f(u.upv, ...uv); gl.uniform3f(u.wind, d.wind[0], d.wind[1], 0);
+    gl.uniform1f(u.t, performance.now() / 1000 % 900); gl.uniform1f(u.cube, 260); gl.uniform1f(u.band, 45);
+    gl.uniform1f(u.gz, toBox(G, [view.eye[0], view.eye[1], d.gz])[2] / s); gl.uniform1f(u.k, d.k);
+    gl.uniform2f(u.res, W, H); gl.uniform3f(u.col, ...d.col);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, gb.dist); gl.uniform1i(u.geoT, 7);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, Math.round(5000 * Math.min(1, d.k * 1.5)));
+    gl.disable(gl.BLEND);
+  }
   // lightning's channels over the finished picture: view.bolts [{ pts: [[x, y, z] world m], I 0..1, w m (the core's
   // half width) }]
   function drawBolts(view, G, VP, eye, W, H) {
@@ -1551,6 +1659,6 @@ const Render = (() => {
     return { nx: h.nx, ny: h.ny, data: out };
   }
   return { init, setVolume, setFar, farInfo: () => farV.map(s => s.head && { box: s.head.box, nx: s.head.nx, ny: s.head.ny, nz: s.head.nz }), blending: () => mixSt.f < 1, motion, _gb: () => gb, _peek,
-           _step: () => { mixSt.dirty = true; advance(geometry(), [0.5, 0.3, 0.81], 1, 1); }, setRoads, setTrees, setBuildings, setLamps, dropPart, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
+           _step: () => { mixSt.dirty = true; advance(geometry(), [0.5, 0.3, 0.81], 1, 1); }, setRoads, setTrees, setBuildings, setLamps, setDebris, dropPart, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
 })();
 window.Render = Render;

@@ -550,9 +550,12 @@ const Chase = (() => {
       Scenery.updateBuildings(c.p[0], c.p[1], Render.terrain, () => Render.setBuildings(Scenery.state.bMesh, Scenery.state.bOrigin));
       Stations.update(c.p[0], c.p[1]);
       Lightning.poll(c.p[0], c.p[1]);
+      Damage.poll(c.p[0], c.p[1]);
       const wl = detailed() && WorldLink.ready();
       if (Stations.near(c.p[0], c.p[1], stationGround, wl ? 'world' : 'basic')) Scenery.setSkip(Stations.covers);
       const me = st.foot || c;
+      if (Scenery.damageUpdate(me.p[0], me.p[1])) Render.setBuildings(Scenery.state.bMesh, Scenery.state.bOrigin);
+      if (wl) WorldLink.damage(me.p[0], me.p[1]);
       if (Lights.update(me.p[0], me.p[1], (x, y) => surfAt(x, y).h)) Render.setLamps(Lights.state.inst, Lights.state.origin);
       Stations.follow(me.p[0], me.p[1]);
       if (Stations.route.arrived && !st.arriveSaid) {
@@ -580,6 +583,20 @@ const Chase = (() => {
   function stationGround(x, y) {
     if (detailed() && WorldLink.ready()) { const g = WorldLink.ground(x, y); return g ? g.h : NaN; }
     return Render.terrain(x, y);
+  }
+  // the dust the model's wind raises round you: past ~8 m/s off bare fields, crops and gravel (less off grass and
+  // lawns, little off woods, none off wet ground or water); and in a tornado's or a downburst's winds off anything
+  const DUSTY = { bare: 1, crops: 0.85, gravel: 0.8, verge: 0.4, grass: 0.35, town: 0.45, asphalt: 0.25, wet: 0.05, wood: 0.12, marsh: 0.05, water: 0, mud: 0.05 };
+  function dustView(view, night) {
+    const me = st.foot || st.car, sf = surfAt(me.p[0], me.p[1]);
+    const name = Object.keys(SURF).find(k => SURF[k] === sf.s) || 'grass';
+    const W = Math.hypot(wx.u, wx.v), dry = 1 - 0.85 * Math.min(1, st.wet * 1.2 + wx.rainI);
+    const lift = Math.max(0, Math.min(1, (W - 8) / 16)) * (DUSTY[name] === undefined ? 0.3 : DUSTY[name]) * dry;
+    const tor = Math.max(0, Math.min(1, (wx.gust - 38) / 30));
+    const k = Math.max(lift, tor);
+    if (k < 0.01) return null;
+    const L = 0.18 + 0.72 * night.dayK + Math.min(0.5, (Lightning.light(performance.now(), view.eye).amb[0]) * 0.3);
+    return { k, gz: sf.h, wind: [wx.u, wx.v], col: [0.52 * L, 0.45 * L, 0.35 * L] };
   }
   // O: the way to the nearest gas station, on and off
   function toggleRoute() {
@@ -809,13 +826,17 @@ const Chase = (() => {
     }
     const sun = sunDir();
     const night = nightView();
+    // the debris flying in the model's wind and coming to rest (damage.js)
+    Damage.step(dt, windAt, (x, y) => surfAt(x, y).h, [Math.round(c.p[0]), Math.round(c.p[1])]);
+    Render.setDebris(Damage.state.inst, Damage.state.n, Damage.state.origin);
     Lightning.step(now, c.p, (x, y) => surfAt(x, y).h, (x, y) => Render.cloudBase(x, y), f => Sound.thunder(f.d, f.cg));
     st.night = night;
     const tw = treeWind();
     if (detailed() && WorldLink.ready() && WorldLink.wind) WorldLink.wind(tw);
     const world = detailed() && WorldLink.ready() ? WorldLink.drawer(view, sun) : null;
     const fr = Render.frame({ ...view, sun, world, treeWind: tw, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view),
-                              night, flash: Lightning.light(now, view.eye), heads: headlights(night), bolts: Lightning.bolts(now, view.eye, wx.rainI) }, cars);
+                              night, flash: Lightning.light(now, view.eye), heads: headlights(night), bolts: Lightning.bolts(now, view.eye, wx.rainI),
+                              dust: dustView(view, night) }, cars);
     hud(fr, view);
     requestAnimationFrame(tick);
   }
@@ -902,6 +923,9 @@ const Chase = (() => {
         for (const m of Ls.marks) { const d = Math.hypot(m.x - c.p[0], m.y - c.p[1]); if (m.cg && now - m.t < 60000 && d < nd) { nd = d; nm = m; } }
         lines.push(`Lightning ${Math.round(Ls.total * 60)} flashes/min in the area${nm ? ` · nearest strike ${fmtDist(nd)} ${bearing(nm.x - c.p[0], nm.y - c.p[1])}` : ''}`);
       } else if (Ls.err) lines.push(`Lightning: ${Ls.err}`);
+      const dg = Damage.gustAt(c.p[0], c.p[1]);
+      if (dg >= 29) { const e = Damage.ef(dg); lines.push(`Damage here: peak gust ${Math.round(dg * (st.units === 'mph' ? 2.23694 : 3.6))} ${st.units === 'mph' ? 'mph' : 'km/h'}${e >= 0 ? ` (EF${e})` : ''}`); }
+      else if (Damage.state.err) lines.push(`Damage: ${Damage.state.err}`);
       if (st.night && st.night.dayK < 0.6) lines.push(`Headlights ${st.lights === 'on' ? 'on' : st.lights === 'off' ? 'off' : 'auto'} (L)`);
     }
     const wr = activeWarnings(c.p[0] / 1000, c.p[1] / 1000);

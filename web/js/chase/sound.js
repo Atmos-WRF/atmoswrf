@@ -139,7 +139,37 @@ const Sound = (() => {
     }
   }
 
+  // thunder from a flash d m away, heard d / 343 s later: close ones a crack first, then the rumble rolling for
+  // several seconds, darker and weaker with distance (nothing past ~25 km); in the cloud quieter than to the ground
+  let thBrown = null, thWhite = null;
+  function thunder(d, cg) {
+    if (!ac || ac.state !== 'running' || d > 25000) return;
+    if (!thBrown) { thBrown = noise('brown', 12); thWhite = noise('white', 2); }
+    const t0 = ac.currentTime + d / 343, len = 5 + Math.min(7, d / 2200) + Math.random() * 2;
+    const A = Math.min(1.1, 1.5 / (1 + d / 1600)) * (cg ? 1 : 0.6);
+    const r = ac.createBufferSource(); r.buffer = thBrown;
+    const lp = filt('lowpass', Math.max(110, 2600 / (1 + d / 1500)), 0.5), g = gain(0);
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(A * 0.8, t0 + 0.06 + d / 9000);
+    let t = t0 + 0.2 + d / 9000;
+    for (let k = 0; k < 5 && t < t0 + len - 0.5; k++) {
+      t += 0.3 + Math.random() * 1.3;
+      g.gain.linearRampToValueAtTime(A * (0.2 + 0.7 * Math.random()) * Math.exp(-(t - t0) / (len * 0.5)), Math.min(t, t0 + len - 0.4));
+    }
+    g.gain.linearRampToValueAtTime(0, t0 + len);
+    chain(r, lp, g, cabin);
+    r.start(t0, Math.random() * 5); r.stop(t0 + len + 0.1);
+    if (cg && d < 3000) {                                 // the crack of a close strike
+      const c = ac.createBufferSource(); c.buffer = thWhite;
+      const hp = filt('highpass', 600, 0.5), gc = gain(0), Ac = 0.9 / (1 + d / 500);
+      gc.gain.setValueAtTime(0, t0); gc.gain.linearRampToValueAtTime(Ac, t0 + 0.004);
+      gc.gain.exponentialRampToValueAtTime(0.001, t0 + 0.35);
+      chain(c, hp, gc, cabin);
+      c.start(t0, Math.random()); c.stop(t0 + 0.4);
+    }
+  }
+
   function toggle() { if (!ac) return true; if (ac.state === 'running') { ac.suspend(); return false; } ac.resume(); return true; }
-  return { start, update, toggle, levels: lvl, ctx: () => ac, nodes: n };
+  return { start, update, toggle, thunder, levels: lvl, ctx: () => ac, nodes: n };
 })();
 window.Sound = Sound;

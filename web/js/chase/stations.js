@@ -120,7 +120,7 @@ const Stations = (() => {
     part(CAN[0] - 0.1, CAN[1] + 0.1, CAN[2] - 0.1, CAN[3] + 0.1, zt + 0.25, zt + 1.05, c1);
     part(CAN[0] - 0.12, CAN[1] + 0.12, CAN[2] - 0.12, CAN[3] + 0.12, zt + 0.42, zt + 0.62, c2);
     for (let u = -9; u <= 9; u += 6) for (let w = 7; w <= 17; w += 10) {
-      part(u - 0.4, u + 0.4, w - 0.4, w + 0.4, zt - 0.06, zt, [1, 1, 0.95]);       // the lights in its underside
+      part(u - 0.4, u + 0.4, w - 0.4, w + 0.4, zt - 0.06, zt, [11, 11, 10.95]);    // the lights in its underside (lit)
     }
     // two islands of pumps, cars on both sides of each
     for (const w of [9.5, 14.5]) for (const uc of [-5.5, 5.5]) {
@@ -141,10 +141,10 @@ const Stations = (() => {
       part(14.8, 15.2, 1.8, 2.2, zs - 0.5, zs + 6.0, [0.4, 0.4, 0.42], true, true);
       part(13.2, 16.8, 1.7, 2.3, zs + 6.0, zs + 8.2, wall);
       part(13.1, 16.9, 1.65, 2.35, zs + 7.4, zs + 8.3, c1);
-      for (let i = 0; i < 3; i++) part(13.5, 16.5, 1.62, 2.38, zs + 6.25 + i * 0.37, zs + 6.52 + i * 0.37, [0.06, 0.06, 0.07]);
+      for (let i = 0; i < 3; i++) part(13.5, 16.5, 1.62, 2.38, zs + 6.25 + i * 0.37, zs + 6.52 + i * 0.37, [10.95, 10.25, 10.15]);
     }
     // the store
-    const S = STORE, T = 0.25, zr = z0 + 4.6, wallC = [0.86, 0.83, 0.77], glass = [0.16, 0.22, 0.27], trim = c1;
+    const S = STORE, T = 0.25, zr = z0 + 4.6, wallC = [0.86, 0.83, 0.77], glassLit = [10.8, 10.82, 10.78], trim = c1;
     const zf = z0 + 0.15;                        // the floor's top
     part(S[0], S[1], S[2], S[3], z0 - 1.2, zf, [0.8, 0.79, 0.76]);        // the floor slab
     part(S[0], S[1], S[3] - T, S[3], z0 - 1.2, zr, wallC, false, true);       // back
@@ -156,7 +156,7 @@ const Stations = (() => {
     part(S[1] - 1.5, S[1], fw[0], fw[1], z0 - 1.2, zr, wallC, false, true);
     for (const [a, b] of [[S[0] + 1.5, DOOR[0]], [DOOR[1], S[1] - 1.5]]) {
       part(a, b, fw[0], fw[1], z0 - 1.2, zf + 0.6, wallC, false, true);
-      part(a, b, fw[0] + 0.05, fw[1] - 0.05, zf + 0.6, zf + 2.9, glass, false, true);
+      part(a, b, fw[0] + 0.05, fw[1] - 0.05, zf + 0.6, zf + 2.9, glassLit, false, true);
       for (let u = a + 2.4; u < b - 0.5; u += 2.4) part(u - 0.06, u + 0.06, fw[0] - 0.02, fw[1] + 0.02, zf + 0.6, zf + 2.9, [0.25, 0.25, 0.27]);
     }
     part(S[0] + 1.5, S[1] - 1.5, fw[0], fw[1], zf + 2.9, zr, wallC, false, true);
@@ -166,7 +166,7 @@ const Stations = (() => {
     part(S[0] - 0.3, S[1] + 0.3, S[2] - 0.3, S[3] + 0.3, zr, zr + 0.35, [0.45, 0.45, 0.47]);  // the roof
     part(S[0], S[1], S[2] + T, S[3] - T, zr - 0.9, zr - 0.8, [0.93, 0.93, 0.9]);          // the ceiling
     for (let u = S[0] + 3; u < S[1] - 1; u += 4) for (let w = S[2] + 3; w < S[3] - 1; w += 4)
-      part(u - 0.6, u + 0.6, w - 0.25, w + 0.25, zr - 0.93, zr - 0.9, [1, 1, 0.97]);
+      part(u - 0.6, u + 0.6, w - 0.25, w + 0.25, zr - 0.93, zr - 0.9, [11, 11, 10.97]);
     // the counter and register, left of the door, a walkway behind it
     part(S[0] + 1.6, S[0] + 6.5, S[2] + 1.6, S[2] + 2.5, zf, zf + 1.0, [0.5, 0.36, 0.24], false, true);
     part(S[0] + 1.55, S[0] + 6.55, S[2] + 1.55, S[2] + 2.55, zf + 1.0, zf + 1.05, [0.2, 0.2, 0.2]);
@@ -191,7 +191,7 @@ const Stations = (() => {
       const w0 = S[3] - T - 0.9, w1 = S[3] - T;
       part(S[0] + 1, S[1] - 1, w0, w1, zf, zf + 2.2, [0.85, 0.85, 0.87], false, true);
       for (let u = S[0] + 1.1; u < S[1] - 1.6; u += 1.0) {
-        part(u, u + 0.9, w0 - 0.04, w0, zf + 0.15, zf + 2.05, [0.75, 0.88, 0.95]);
+        part(u, u + 0.9, w0 - 0.04, w0, zf + 0.15, zf + 2.05, [10.75, 10.88, 10.95]);
         for (let lv = 0; lv < 4; lv++) B(V, u + 0.1, u + 0.8, w0 - 0.03, w0 - 0.01, zf + 0.35 + lv * 0.45, zf + 0.5 + lv * 0.45, goods[Math.floor(rand() * goods.length)]);
       }
     }

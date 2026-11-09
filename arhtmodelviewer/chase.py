@@ -236,6 +236,83 @@ def buildings(proj, box_km) -> dict:
     return {"b": out, "pending": pending, "busy": bool(pending) and osmfetch.busy()}
 
 
+# ---------------------------------------------------------------- the lightning
+# McCaul et al. (2009, Wea. Forecasting 24, 709-729): the total flash rate density from the model's own fields, per
+# column of each storm patch (the parent grids; the nests are too small a share of a storm to matter):
+#   F1 = 0.042 w qg   at the -15 C level (w m/s, graupel + hail g/kg)  -- the graupel flux, the storm's charging
+#   F2 = 0.20 VII     (vertically integrated ice: graupel, hail, snow and cloud ice, kg/m2) -- its anvil's spread
+#   F  = 0.95 F1 + 0.05 F2   flashes per km2 per 5 min
+# Chase mode draws flashes at these rates (a Poisson process in each column), in cloud or to the ground.
+LTG_MIN = 0.02          # flashes per km2 per 5 min: weaker columns left out
+LTG_MAX = 3000          # columns sent at most (the strongest)
+
+
+def lightning(sim, box_km) -> dict:
+    """{"t", "cells": [[x km, y km, flashes/s, z of -15 C m, z of the cloud top m], ...], "total": flashes/s} in the
+    box (world km).  Caller holds sim.lock."""
+    import cupy as cp
+    x0, y0, x1, y1 = (float(v) * 1000.0 for v in box_km)
+    eng = sim.engine
+    cells, total = [], 0.0
+    for p in list(eng.patches):
+        st, env = p.state, p.env
+        if st is None or getattr(st, "w", None) is None:
+            continue
+        dx = float(env.grid.dx)
+        px0, py0, nx, ny = p.world_x0(), p.world_y0(), p.rect.nx, p.rect.ny
+        if px0 > x1 or py0 > y1 or px0 + nx * dx < x0 or py0 + ny * dx < y0:
+            continue
+        nz = len(env.z_h)
+        zh = cp.asarray(np.asarray(env.z_h, np.float32))
+        zw = np.asarray(env.z_w, np.float32)
+        dz = cp.asarray(zw[1:nz + 1] - zw[:nz])[:, None, None]
+        thb = st.thb if getattr(st, "thb", None) is not None and st.thb.ndim == 3 else \
+            cp.asarray(np.asarray(env.base.thb, np.float32)[:nz])[:, None, None]
+        pr = st.p[:nz]
+        T = (st.thp[:nz] + thb) * (pr / 1e5) ** 0.2857
+        rho = pr / (287.04 * T)
+        rimed = None
+        for name in ("qg", "qh"):
+            a = getattr(st, name, None)
+            if a is not None:
+                rimed = a[:nz] if rimed is None else rimed + a[:nz]
+        if rimed is None:
+            continue                                   # a warm-rain scheme: no graupel, no charging
+        ice = rimed
+        for name in ("qi", "qs"):
+            a = getattr(st, name, None)
+            if a is not None:
+                ice = ice + a[:nz]
+        vii = (rho * ice * dz).sum(axis=0)
+        cold = T <= 258.15
+        has = cold.any(axis=0)
+        k = cp.argmax(cold, axis=0)
+        w = 0.5 * (st.w[:nz] + st.w[1:nz + 1])
+        wk = cp.take_along_axis(w, k[None], axis=0)[0]
+        gk = cp.take_along_axis(rimed, k[None], axis=0)[0] * 1000.0
+        F = 0.95 * 0.042 * cp.maximum(wk, 0.0) * gk + 0.05 * 0.20 * vii
+        F = cp.where(has, F, 0.0)
+        cloud = ice >= 1e-5
+        top = cp.where(cloud.any(axis=0), zh[nz - 1 - cp.argmax(cloud[::-1], axis=0)], 0.0)
+        jj, ii = cp.nonzero(F >= LTG_MIN)
+        if jj.size == 0:
+            continue
+        xs = px0 + (ii.astype(cp.float64) + 0.5) * dx
+        ys = py0 + (jj.astype(cp.float64) + 0.5) * dx
+        inb = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+        rate = F[jj, ii] * (dx / 1000.0) ** 2 / 300.0
+        z15 = zh[k[jj, ii]]
+        tp = top[jj, ii]
+        a = cp.asnumpy(cp.stack([xs / 1000.0, ys / 1000.0, rate, z15, tp])[:, inb]).T
+        total += float(a[:, 2].sum()) if a.size else 0.0
+        cells.extend(a.tolist())
+    if len(cells) > LTG_MAX:
+        cells.sort(key=lambda c: -c[2])
+        cells = cells[:LTG_MAX]
+    out = [[round(c[0], 3), round(c[1], 3), round(c[2], 5), round(c[3]), round(c[4])] for c in cells]
+    return {"t": float(eng.t), "cells": out, "total": round(total, 4)}
+
+
 # ---------------------------------------------------------------- the gas stations
 # OpenStreetMap's fuel stations (amenity=fuel: OpenMapTiles' poi layer, class "fuel", subclass "fuel" -- not the EV
 # chargers), from OpenFreeMap's z14 tiles in FUEL_CELL-degree cells, kept in output/cache/osm/fuel: chase mode builds
@@ -399,7 +476,7 @@ _FAILS: dict[str, list[float]] = {}
 _NEXT = [1]
 STALE = 6.0                                     # s without a sync: gone from the others' lists
 # what a joined page on another computer may read (GET) with its token while hosting is on
-READ = ("/api/state", "/api/pmw/targets", "/api/c/air", "/api/volume", "/api/volume/times", "/api/volume/roads",
+READ = ("/api/state", "/api/pmw/targets", "/api/c/air", "/api/c/lightning", "/api/volume", "/api/volume/times", "/api/volume/roads",
         "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/volume/fuel", "/api/frames", "/api/frame", "/api/ppi")
 # (and the detailed map's module, tile worker and landmarks, and the cars' models)
 STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|colors)\.js|static/js/chase/[a-z0-9_]+\.js"

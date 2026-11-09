@@ -320,6 +320,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._state()
             if path == "/api/c/air":
                 return self._chase_air(q)
+            if path == "/api/c/lightning":
+                # chase mode's lightning: McCaul et al. (2009) flash rates from the model's columns (chase.py)
+                from . import chase
+                sim = APP.sim
+                if sim is None or sim.engine is None:
+                    return self._error(404, "no run")
+                try:
+                    box = [float(q[k]) for k in ("x0", "y0", "x1", "y1")]
+                except (KeyError, ValueError):
+                    return self._error(400, "x0, y0, x1, y1 (world km)")
+                with sim.lock:
+                    return self._json(chase.lightning(sim, box))
             if path == "/api/defaults":
                 from . import backend
                 from .engine import CELL_BYTES

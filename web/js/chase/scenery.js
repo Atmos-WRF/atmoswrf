@@ -133,14 +133,31 @@ const Scenery = (() => {
         const upn = n => (n[2] < 0 ? n.map(v => -v) : n);
         quad(o0, o1, r1, r0, upn(norm(o0, o1, r1)), roof);
         quad(o2, o3, r0, r1, upn(norm(o2, o3, r0)), roof);
+        // its windows on the long sides, some lit at night (scenery's colour + 10: render.js MESH_FS)
+        if (kind === 0) for (const sb of [-1, 1]) for (const fa of [-0.5, 0.5]) {
+          if (hash(id, sb * 3 + fa * 4 + 9, 61) > 0.5) continue;
+          const a0 = fa * la - 0.6, a1 = fa * la + 0.6, b = sb * (lb + 0.04), wz0 = zb + 0.3 + 0.9, wz1 = zb + 0.3 + 2.1;
+          const wc = hash(id, 5, 62) < 0.8 ? [11.0, 10.78, 10.45] : [10.85, 10.9, 11.0];
+          quad(C(a0, b, wz0), C(a1, b, wz0), C(a1, b, wz1), C(a0, b, wz1), [vx * sb, vy * sb, 0], wc);
+        }
         top = zr;
       } else {
         // walls round the footprint, a flat roof (with a parapet colour band on big ones)
         const zt = zb + 0.3 + h;
+        // the windows (lit ones only: colour + 10), floor by floor, on the bigger buildings' walls
+        const floors = Math.min(6, Math.floor((h - 0.6) / 3.2)), litP = kind === 2 || kind === 4 ? 0.04 : kind === 0 ? 0.4 : 0.28;
+        const wc = hash(id, 1, 63) < 0.6 ? [11.0, 10.8, 10.5] : [10.86, 10.92, 11.0];
         for (let i = 0; i < P.length; i += 2) {
           const j = (i + 2) % P.length, ex = P[j] - P[i], ey = P[j + 1] - P[i + 1], l = Math.hypot(ex, ey) || 1;
           const n = [ey / l, -ex / l, 0];
           quad([P[i], P[i + 1], zb], [P[j], P[j + 1], zb], [P[j], P[j + 1], zt], [P[i], P[i + 1], zt], n, wall);
+          const nw = floors > 0 ? Math.floor(l / 3.4) : 0, ox = n[0] * 0.05, oy = n[1] * 0.05;
+          for (let w = 0; w < nw; w++) for (let f = 0; f < floors; f++) {
+            if (hash(id * 7 + i, w * 13 + f, 64) > litP) continue;
+            const c0 = (w + 0.5) / nw - 0.65 / l, c1 = (w + 0.5) / nw + 0.65 / l, z0 = zb + 1.3 + f * 3.2, z1 = z0 + 1.4;
+            const A = [P[i] + ex * c0 + ox, P[i + 1] + ey * c0 + oy], Bq = [P[i] + ex * c1 + ox, P[i + 1] + ey * c1 + oy];
+            quad([A[0], A[1], z0], [Bq[0], Bq[1], z0], [Bq[0], Bq[1], z1], [A[0], A[1], z1], n, wc);
+          }
         }
         const T = earcut(P);
         for (let k = 0; k < T.length; k += 3) {

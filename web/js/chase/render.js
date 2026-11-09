@@ -32,13 +32,16 @@ const Render = (() => {
   const farV = [0, 1].map(() => ({ tex: null, A: null, B: null, raw: null, head: null, from: null, key: '', litAt: 0, t0: 0, dur: 0, f: 1, at: 0, dirty: false }));
   const FAR_MIX_EVERY = 250;                     // ms: they change slowly
   const FAR_RELIGHT = 20000;                     // ms: at most this often for the sun's own motion
-  const gb ={ fbo: null, col: null, dist: null, depth: null, w: 0, h: 0 };
+  const gb ={ fbo: null, col: null, dist: null, light: null, depth: null, w: 0, h: 0 };
   const roads = { buf: null, vao: null, n: 0, origin: [0, 0] };
   const meshes = new Map();                      // car kind/colour -> { body, wheel }
   const partBufs = new WeakMap();                // a figure's part (its vertex data) -> its buffer
   let treeProg = null, precipProg = null, mergeProg = null, farLightProg = null;
   const trees = { mesh: null, near: 0, far: 0, inst: null, count: 0, nearCount: 0, origin: [0, 0], vao: null };
   const blds = { buf: null, vao: null, n: 0, origin: [0, 0] };
+  const lamps = { buf: null, vao: null, n: 0, origin: [0, 0] };
+  let lampProg = null, boltProg = null;
+  const bolts = { vao: null, buf: null };
 
   // ---------------------------------------------------------------- shaders
   const ROAD_VS = `#version 300 es
@@ -53,7 +56,7 @@ const Render = (() => {
   precision highp float;
   in vec3 wpos; in vec2 vuv; flat in vec2 vk; in vec2 wm;
   uniform vec3 eye, sunDir; uniform float wet;
-  layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1;
+  layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1; layout(location = 2) out vec4 o2;
   const float HALF[8] = float[8](5.6, 5.0, 4.4, 3.9, 3.5, 3.0, 3.1, 1.8);
   float h21(vec2 p) { p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
   float vn(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
@@ -95,6 +98,48 @@ const Render = (() => {
     }
     o0 = vec4(c, lam);
     o1 = vec4(length(wpos - eye), 0.0, 0.0, 1.0);
+    o2 = vec4(0.0);
+  }`;
+  // a street lamp's pool of light: a disc at its foot (radius r m) a little over the ground, its colour x intensity
+  // added into the geometry buffer's light target where it lies over what was drawn (the cloud pass lights the
+  // surfaces there with it)
+  const LAMP_VS = `#version 300 es
+  layout(location = 0) in vec4 pr; layout(location = 1) in vec4 ci;
+  uniform mat4 VP; uniform vec3 org; uniform float s;
+  out vec2 q; out vec3 lc;
+  void main() {
+    vec2 c = vec2(gl_VertexID == 1 || gl_VertexID == 2 || gl_VertexID == 4 ? 1.0 : -1.0, gl_VertexID >= 2 && gl_VertexID != 3 ? 1.0 : -1.0);
+    q = c; lc = ci.rgb * ci.a;
+    vec3 w = org + vec3(pr.xy + c * pr.w, pr.z) * s;
+    gl_Position = VP * vec4(w, 1.0);
+  }`;
+  const LAMP_FS = `#version 300 es
+  precision highp float;
+  in vec2 q; in vec3 lc;
+  layout(location = 2) out vec4 o2;
+  void main() {
+    float r2 = dot(q, q);
+    if (r2 > 1.0) discard;
+    float f = (1.0 - r2) * (1.0 - r2);
+    o2 = vec4(lc * f, 0.0);
+  }`;
+  // lightning's channels (lightning.js bolts): ribbons facing the eye, a white core in a blue-white glow, added over
+  // the finished picture where nothing drawn is nearer (the geometry pass's distance, as the rain)
+  const BOLT_VS = `#version 300 es
+  layout(location = 0) in vec4 pv; layout(location = 1) in float a;
+  uniform mat4 VP;
+  out float vv; out float va; out vec3 wpos;
+  void main() { wpos = pv.xyz; vv = pv.w; va = a; gl_Position = VP * vec4(pv.xyz, 1.0); }`;
+  const BOLT_FS = `#version 300 es
+  precision highp float;
+  in float vv; in float va; in vec3 wpos;
+  uniform sampler2D geoT; uniform vec2 res; uniform vec3 eye;
+  out vec4 frag;
+  void main() {
+    float g = abs(texture(geoT, gl_FragCoord.xy / res).r);
+    if (g > 0.0 && g < length(wpos - eye)) discard;
+    float f = 1.0 - vv * vv;
+    frag = vec4(vec3(0.82, 0.88, 1.0) * va * f * f + vec3(1.0) * va * smoothstep(0.55, 0.95, f), 1.0);
   }`;
   const MESH_VS = `#version 300 es
   layout(location = 0) in vec3 p; layout(location = 1) in vec3 n; layout(location = 2) in vec3 c;
@@ -105,14 +150,18 @@ const Render = (() => {
   precision highp float;
   in vec3 wpos; in vec3 nw; in vec3 col;
   uniform vec3 eye, sunDir;
-  layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1;
+  layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1; layout(location = 2) out vec4 o2;
   void main() {
     vec3 n = normalize(nw);
     float lam = max(dot(n, sunDir), 0.0);
+    // a light (colour + 10: a lit window, a lamp, a canopy's lights): dark glass by day, its colour glowing at night
+    bool em = col.r > 9.5;
+    vec3 cc = em ? vec3(0.13, 0.15, 0.18) : col;
     // the sky's light on faces turned up, less on the sides and under (the cloud pass adds one flat ambient)
-    vec3 c = col * (0.72 + 0.28 * n.z);
+    vec3 c = cc * (0.72 + 0.28 * n.z);
     o0 = vec4(c, lam);
     o1 = vec4(length(wpos - eye), 0.0, 0.0, 1.0);
+    o2 = em ? vec4(col - 10.0, 1.0) : vec4(0.0);
   }`;
 
   // The rain and snow falling round the camera (setPrecip's amounts): drops and flakes fixed in the world, falling
@@ -321,6 +370,54 @@ const Render = (() => {
     return bounce * 0.6 * vec3(0.17, 0.19, 0.13) * E * exp(-0.35 * td);
   }`;
 
+  // Night (game.js sky()): dayK 1 by day, 0 at night (the real sun's height, civil twilight between); expo the eye's
+  // adaptation; the moon's direction and how much of it is lit (moonK, 0 under the horizon).  Lightning
+  // (lightning.js): a flash at flashP (box coords; w: its brightness) lighting the cloud round it, and flashC the
+  // light it throws on everything near.  Headlights: up to 4 (headP: box coords, w: on; headD: where they point).
+  // lampK: the lamps and lit windows on (lights.js), the geometry buffer's light target (geoE) the light they throw.
+  const NIGHT_UNI = `
+  uniform float dayK, expo, moonK, lampK; uniform vec3 moonDir;
+  uniform vec4 flashP; uniform vec3 flashC;
+  uniform vec4 headP[4]; uniform vec3 headD[4]; uniform int headN;
+  uniform sampler2D geoE;
+`;
+  const NIGHT_GLSL = `
+  vec3 nightAmb() { return vec3(0.006, 0.008, 0.016) + vec3(0.010, 0.011, 0.013) * moonK; }
+  vec3 nightSky(vec3 rd) {
+    float h = max(rd.z, 0.0);
+    vec3 c = mix(vec3(0.011, 0.012, 0.018), vec3(0.002, 0.003, 0.008), pow(h, 0.35));
+    c += vec3(0.006, 0.008, 0.014) * moonK * (1.0 - h);
+    // the stars: one in a few hundred cells of the sky, a soft dot, dimmed near the horizon and by moonlight
+    vec3 q = rd * 320.0, cell = floor(q), f = fract(q) - 0.5;
+    float hs = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    float star = step(0.986, hs) * smoothstep(0.32, 0.05, length(f)) * pow((hs - 0.986) / 0.014, 2.0);
+    c += vec3(0.85, 0.9, 1.0) * star * 0.09 * smoothstep(0.02, 0.2, rd.z) * (1.0 - 0.6 * moonK);
+    // the moon: its disc (half a degree) and a glow round it
+    float md = dot(rd, moonDir), up = step(-0.01, moonDir.z);
+    c += vec3(0.95, 0.93, 0.86) * up * (smoothstep(0.999955, 0.99997, md) * (0.25 + 1.2 * moonK) + pow(max(md, 0.0), 300.0) * 0.01 * moonK);
+    return c;
+  }
+  vec3 flashAt(vec3 p) {
+    if (flashP.w <= 0.0) return flashC;
+    vec3 d = (p - flashP.xyz) * toKm;
+    return flashC + flashP.w * vec3(0.82, 0.86, 1.0) / (1.0 + dot(d, d) / 1.6);
+  }
+  vec3 headLight(vec3 g, vec3 n) {
+    vec3 L = vec3(0.0);
+    for (int h = 0; h < 4; h++) {
+      if (h >= headN) break;
+      vec3 dv = (g - headP[h].xyz) * toKm * 1000.0;
+      float dd = length(dv);
+      if (dd > 160.0 || headP[h].w <= 0.0) continue;
+      vec3 l = dv / max(dd, 1e-3);
+      float cs = dot(l, headD[h]);
+      float beam = smoothstep(0.9, 0.985, cs) + 0.08 * smoothstep(0.6, 0.9, cs);
+      L += vec3(1.0, 0.94, 0.84) * headP[h].w * beam * 34.0 / (dd * dd + 9.0) * max(dot(n, -l), 0.3);
+    }
+    return L;
+  }
+`;
+
   // The rain's extinction per km from its g/kg (x the Rain slider): as the model's (1.2 a g/kg) for heavy rain, from
   // RAIN_HEAVY g/kg up, and much less below it -- light rain is a thin veil, not a grey wall (0.3 g/kg: a quarter of
   // the linear, 0.1 g/kg: a ninth)
@@ -456,7 +553,7 @@ const Render = (() => {
       float skyv = exp(-0.45 * tu);
       float hgt = clamp(p.z / size.z * 2.0, 0.0, 1.0);
       float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));
-      vec3 S = albedo * (SUN * max(sunDir.z, 0.0) * 1.1 * fdiff(ts) + amb * 0.9 * fdiff(tu) + SUN * L * 4.5 +
+      vec3 S = albedo * (flashAt(p) + SUN * max(sunDir.z, 0.0) * 1.1 * fdiff(ts) + amb * 0.9 * fdiff(tu) + SUN * L * 4.5 +
                          amb * (0.18 + 0.42 * skyv) * (0.55 + 0.45 * hgt) * (0.45 + 0.55 * exp(-0.12 * ts)));
       S = mix(S, haze * mix(0.5, 1.0, skyv), 1.0 - exp(-dk / hazeKm));
       float al = 1.0 - exp(-sg * sk);
@@ -475,7 +572,7 @@ const Render = (() => {
     const head = 'in vec2 ndc; out vec4 frag;', tail = 'vec3 c = col + T * bg;';
     if (!src.includes(head) || !src.includes(tail)) return src;
     // geoWins: with the detailed map the geometry (the map, the cars on it) is never hidden by the model's coarser ground
-    src = src.replace(head, head + '\n  uniform float cloudContrast; uniform int geoWins;' + RAIN_GLSL);
+    src = src.replace(head, head + '\n  uniform float cloudContrast; uniform int geoWins;' + NIGHT_UNI + RAIN_GLSL);
     // the cloud's detail carried with the storm (FLOW_GLSL): media() as volume.js's, its detail from flowK's coordinates
     const media = 'vec2 media(vec3 p, int mode) {', ret = '    return s;\n  }\n  float sig(vec2 s)';
     const m0 = src.indexOf(media), m1 = src.indexOf('\n  float sig(vec2 s)');
@@ -497,11 +594,33 @@ const Render = (() => {
     ];
     if (geoHooks.every(([a]) => src.includes(a))) for (const [a, b] of geoHooks) src = src.replace(a, b);
     else console.warn('chase: geometry hooks not found; the detailed map is drawn as plain geometry');
+    // night: the sun's light and the sky's faded out under a night sky, the eye adapted (expo); lightning lighting
+    // the cloud from inside and everything round; headlights, lamps and lit windows on what is drawn
+    const nightHooks = [
+      ['  vec3 sky(vec3 rd) {', NIGHT_GLSL + '  vec3 sky(vec3 rd) {'],
+      ['    c *= mix(0.45, 1.0, smoothstep(-0.02, 0.3, sunDir.z));\n', '    c *= mix(0.45, 1.0, smoothstep(-0.02, 0.3, sunDir.z));\n    c = mix(nightSky(rd), c, dayK);\n'],
+      ['    SUN = mix(vec3(1.0, 0.55, 0.28) * 2.4, vec3(1.0, 0.95, 0.88) * 3.4, low);\n',
+       '    SUN = mix(vec3(1.0, 0.55, 0.28) * 2.4, vec3(1.0, 0.95, 0.88) * 3.4, low) * dayK;\n'],
+      ['    vec3 amb = vec3(0.40, 0.50, 0.68);\n', '    vec3 amb = mix(nightAmb(), vec3(0.40, 0.50, 0.68), dayK) + flashC;\n'],
+      ['    vec3 haze = mix(vec3(0.70, 0.62, 0.55), vec3(0.64, 0.71, 0.80), low);\n',
+       '    vec3 haze = mix(vec3(0.70, 0.62, 0.55), vec3(0.64, 0.71, 0.80), low) * mix(0.025, 1.0, dayK) + flashC * 0.5;\n'],
+      ['      if (prelit) grd = pow(ga.rgb, vec3(2.2)) * (0.68 * lit + 0.32 * (0.25 + 0.75 * skyv) + 0.7 * fdiff(lt.x));',
+       '      if (prelit) grd = pow(ga.rgb, vec3(2.2)) * (0.68 * lit + 0.32 * (0.25 + 0.75 * skyv) + 0.7 * fdiff(lt.x)) * mix(0.03 + 0.03 * moonK, 1.0, dayK);\n' +
+       '      if (prelit) grd += alb * flashC * 0.4;\n' +
+       '      grd += alb * headLight(g, n);\n' +
+       '      if (tree) {\n' +
+       '        vec4 E = texture(geoE, gl_FragCoord.xy / vec2(textureSize(geoT, 0)));\n' +
+       '        grd += E.a > 0.5 ? E.rgb * E.rgb * 1.4 * lampK : alb * E.rgb * 3.0;\n' +
+       '      }'],
+      ['    c = aces(c * 0.85);', '    c = aces(c * 0.85 * expo);'],
+    ];
+    if (nightHooks.every(([a]) => src.split(a).length === 2)) for (const [a, b] of nightHooks) src = src.replace(a, b);
+    else console.warn('chase: night hooks not found:', nightHooks.filter(([a]) => src.split(a).length !== 2).map(([a]) => a.trim().slice(0, 40)));
     // the light coming up off the ground
     const sHook = 'vec3 S = albedo * (SUN * L * 4.5 + ';
     // and the light diffused down through the cloud above (fdiff): the storm's base grey, not black
     if (src.includes(sHook) && src.includes(media) && src.includes(ret)) {
-      src = src.replace(sHook, 'vec3 S = albedo * (bounceAt(p) + SUN * max(sunDir.z, 0.0) * 1.1 * fdiff(ts) + amb * 0.9 * fdiff(lt.y) + SUN * L * 4.5 + ');
+      src = src.replace(sHook, 'vec3 S = albedo * (bounceAt(p) + flashAt(p) + SUN * max(sunDir.z, 0.0) * 1.1 * fdiff(ts) + amb * 0.9 * fdiff(lt.y) + SUN * L * 4.5 + ');
     } else console.warn('chase: ground bounce hook not found');
     // the march through the nests at their own resolution (nestDt): the same step for the extinction and the advance;
     // fine only in cloud (the funnel, the wall cloud), not through rain alone, which is smooth and would cost the most
@@ -612,7 +731,7 @@ const Render = (() => {
   in vec2 ndc;
   uniform sampler2D wCol, wDep; uniform mat4 invVP, VP; uniform vec3 eye;
   uniform float n, f, tanY, aspect, mToBox;
-  layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1;
+  layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1; layout(location = 2) out vec4 o2;
   void main() {
     vec2 uv = gl_FragCoord.xy / vec2(textureSize(wDep, 0));
     float d = texture(wDep, uv).r;
@@ -626,6 +745,7 @@ const Render = (() => {
     gl_FragDepth = clamp((c.z / c.w) * 0.5 + 0.5, 0.0, 1.0);
     o0 = vec4(pow(max(texture(wCol, uv).rgb, vec3(0.0)), vec3(1.0 / 2.2)), 1.0);
     o1 = vec4(-dist, 0.0, 0.0, 1.0);
+    o2 = vec4(0.0);
   }`;
   // the down channel of chase mode's light volume: the cloud between a point and the ground (for the light the
   // ground sends back up, bounceAt)
@@ -729,6 +849,19 @@ const Render = (() => {
     for (let i = 0; i < 4; i++) { wInsA.push(gl.createTexture()); wInsB.push(gl.createTexture()); }
     noiseTex = L().makeNoise(gl);
     gb.fbo = gl.createFramebuffer(); gb.col = gl.createTexture(); gb.dist = gl.createTexture(); gb.depth = gl.createRenderbuffer();
+    gb.light = gl.createTexture();
+    lampProg = program(LAMP_VS, LAMP_FS);
+    boltProg = program(BOLT_VS, BOLT_FS);
+    bolts.vao = gl.createVertexArray(); bolts.buf = gl.createBuffer();
+    gl.bindVertexArray(bolts.vao); gl.bindBuffer(gl.ARRAY_BUFFER, bolts.buf);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 20, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 20, 16);
+    gl.bindVertexArray(null);
+    lamps.vao = gl.createVertexArray(); lamps.buf = gl.createBuffer();
+    gl.bindVertexArray(lamps.vao); gl.bindBuffer(gl.ARRAY_BUFFER, lamps.buf);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 32, 0); gl.vertexAttribDivisor(0, 1);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 32, 16); gl.vertexAttribDivisor(1, 1);
+    gl.bindVertexArray(null);
     roads.buf = gl.createBuffer(); roads.vao = gl.createVertexArray();
     Land.init(gl, () => {});
     Land.setTrees(false);                          // no trees in chase mode (yet)
@@ -1011,6 +1144,12 @@ const Render = (() => {
     gl.bufferData(gl.ARRAY_BUFFER, inst, gl.STATIC_DRAW);
     trees.count = n; trees.nearCount = nearCount; trees.origin = origin;
   }
+  // the lamps' pools (lights.js): per lamp x, y, z (m from origin), radius m, r, g, b, intensity
+  function setLamps(inst, origin) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, lamps.buf);
+    gl.bufferData(gl.ARRAY_BUFFER, inst, gl.DYNAMIC_DRAW);
+    lamps.n = inst.length / 8; lamps.origin = origin;
+  }
   function setBuildings(mesh, origin) {
     gl.bindVertexArray(blds.vao); gl.bindBuffer(gl.ARRAY_BUFFER, blds.buf);
     gl.bufferData(gl.ARRAY_BUFFER, mesh, gl.STATIC_DRAW);
@@ -1051,7 +1190,7 @@ const Render = (() => {
   function targets(w, h) {
     if (gb.w === w && gb.h === h) return;
     gb.w = w; gb.h = h;
-    for (const [t, fmt, f, ty] of [[gb.col, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE], [gb.dist, gl.R32F, gl.RED, gl.FLOAT]]) {
+    for (const [t, fmt, f, ty] of [[gb.col, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE], [gb.dist, gl.R32F, gl.RED, gl.FLOAT], [gb.light, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE]]) {
       gl.bindTexture(gl.TEXTURE_2D, t);
       gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, f, ty, null);
       texParams(gl.TEXTURE_2D, gl.NEAREST, gl.CLAMP_TO_EDGE);
@@ -1061,6 +1200,7 @@ const Render = (() => {
     gl.bindFramebuffer(gl.FRAMEBUFFER, gb.fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, gb.col, 0);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, gb.dist, 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, gb.light, 0);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, gb.depth);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
@@ -1105,11 +1245,12 @@ const Render = (() => {
     gl.depthFunc(gl.LESS);
   }
 
-  function drawGeometry(G, VP, eye, sun, cars, wet, showTrees, wimg, fov, tw) {
+  function drawGeometry(G, VP, eye, sun, cars, wet, showTrees, wimg, fov, tw, lampK) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, gb.fbo);
-    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2]);
     gl.viewport(0, 0, gb.w, gb.h);
-    gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]); gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, 0]); gl.clearBufferfv(gl.DEPTH, 0, [1]);
+    gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]); gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, 0]); gl.clearBufferfv(gl.COLOR, 2, [0, 0, 0, 0]);
+    gl.clearBufferfv(gl.DEPTH, 0, [1]);
     gl.enable(gl.DEPTH_TEST); gl.disable(gl.BLEND); gl.depthMask(true);
     const s = G.k / 1000;
     // the detailed map in place of chase mode's own roads, trees and buildings
@@ -1177,7 +1318,21 @@ const Render = (() => {
         gl.drawArrays(gl.TRIANGLES, 0, m.wheel.n);
       }
     }
-    gl.disable(gl.CULL_FACE); gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    // the lamps' pools of light, at night, added into the light target over what is drawn
+    if (lamps.n && lampK > 0.01) {
+      gl.drawBuffers([gl.NONE, gl.NONE, gl.COLOR_ATTACHMENT2]);
+      gl.useProgram(lampProg);
+      gl.uniformMatrix4fv(lampProg.u.VP, false, VP);
+      gl.uniform3f(lampProg.u.org, ...toBox(G, [lamps.origin[0], lamps.origin[1], 0]));
+      gl.uniform1f(lampProg.u.s, s);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false); gl.depthFunc(gl.LEQUAL);
+      gl.bindVertexArray(lamps.vao);
+      gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, lamps.n);
+      gl.disable(gl.BLEND); gl.depthMask(true); gl.depthFunc(gl.LESS);
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2]);
+    }
+    gl.disable(gl.DEPTH_TEST);
     gl.bindVertexArray(null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
@@ -1226,7 +1381,8 @@ const Render = (() => {
       try { wimg = view.world(W, H); } catch (e) { console.warn('chase: detailed map', e); wimg = null; }
     }
     targets(W, H);
-    drawGeometry(G, VPr, eye, view.sun, cars, view.wet, view.trees !== false, wimg, view.fov, view.treeWind);
+    const nt = view.night || { dayK: 1, expo: 1, moonDir: [0, 0, -1], moonK: 0, lampK: 0 };
+    drawGeometry(G, VPr, eye, view.sun, cars, view.wet, view.trees !== false, wimg, view.fov, view.treeWind, nt.lampK);
     advance(G, view.sun, view.density, view.rain);
     if (view.far) advanceFar(view.sun, view.density, view.rain);
     gl.viewport(0, 0, W, H);
@@ -1303,10 +1459,53 @@ const Render = (() => {
     gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, gb.col); gl.uniform1i(u.geoA, 6);
     gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, gb.dist); gl.uniform1i(u.geoT, 7);
     gl.uniform1i(u.hasGeo, 1);
+    // night, lightning, headlights, the lamps (unit 13: free in the cloud pass)
+    if (u.dayK) {
+      gl.uniform1f(u.dayK, nt.dayK); gl.uniform1f(u.expo, nt.expo); gl.uniform1f(u.moonK, nt.moonK); gl.uniform1f(u.lampK, nt.lampK);
+      gl.uniform3f(u.moonDir, ...nt.moonDir);
+      const fl = view.flash;
+      if (fl && fl.I > 0) { const fp = toBox(G, fl.p); gl.uniform4f(u.flashP, fp[0], fp[1], fp[2], fl.I); gl.uniform3f(u.flashC, ...fl.amb); }
+      else { gl.uniform4f(u.flashP, 0, 0, 0, 0); gl.uniform3f(u.flashC, ...(fl ? fl.amb : [0, 0, 0])); }
+      const hs = (view.heads || []).slice(0, 4), HP = new Float32Array(16), HD = new Float32Array(12);
+      hs.forEach((h, i) => { HP.set([...toBox(G, h.p), h.on], 4 * i); HD.set(h.d, 3 * i); });
+      gl.uniform4fv(u.headP, HP); gl.uniform3fv(u.headD, HD); gl.uniform1i(u.headN, hs.length);
+      gl.activeTexture(gl.TEXTURE13); gl.bindTexture(gl.TEXTURE_2D, gb.light); gl.uniform1i(u.geoE, 13);
+    }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     drawPrecip(view, G, VPr, eye, W, H);
+    drawBolts(view, G, VPr, eye, W, H);
     gl.disable(gl.BLEND);
     return { G, VP: VPc, W, H };
+  }
+
+  // lightning's channels over the finished picture: view.bolts [{ pts: [[x, y, z] world m], I 0..1, w m (the core's
+  // half width) }]
+  function drawBolts(view, G, VP, eye, W, H) {
+    const list = view.bolts;
+    if (!boltProg || !list || !list.length) return;
+    const V = [];
+    for (const b of list) {
+      const P = b.pts.map(q => toBox(G, q)), wk = b.w * G.k / 1000;
+      for (const [hw, a] of [[wk * 9, 0.22 * b.I], [wk, 1.0 * b.I]]) {
+        for (let i = 1; i < P.length; i++) {
+          const A = P[i - 1], B = P[i], d = [B[0] - A[0], B[1] - A[1], B[2] - A[2]];
+          const m = [(A[0] + B[0]) / 2 - eye[0], (A[1] + B[1]) / 2 - eye[1], (A[2] + B[2]) / 2 - eye[2]];
+          let sx = d[1] * m[2] - d[2] * m[1], sy = d[2] * m[0] - d[0] * m[2], sz = d[0] * m[1] - d[1] * m[0];
+          const l = Math.hypot(sx, sy, sz) || 1;
+          sx *= hw / l; sy *= hw / l; sz *= hw / l;
+          const q = [[A[0] - sx, A[1] - sy, A[2] - sz, -1], [A[0] + sx, A[1] + sy, A[2] + sz, 1], [B[0] + sx, B[1] + sy, B[2] + sz, 1], [B[0] - sx, B[1] - sy, B[2] - sz, -1]];
+          for (const k of [0, 1, 2, 0, 2, 3]) V.push(...q[k], a);
+        }
+      }
+    }
+    if (!V.length) return;
+    gl.useProgram(boltProg); gl.bindVertexArray(bolts.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, bolts.buf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(V), gl.STREAM_DRAW);
+    gl.uniformMatrix4fv(boltProg.u.VP, false, VP); gl.uniform3f(boltProg.u.eye, ...eye); gl.uniform2f(boltProg.u.res, W, H);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, gb.dist); gl.uniform1i(boltProg.u.geoT, 7);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    gl.drawArrays(gl.TRIANGLES, 0, V.length / 5);
+    gl.disable(gl.BLEND);
   }
 
   // the rain and snow round the eye, over the finished picture.  view.precip: { n drops / flakes, snow (their
@@ -1352,6 +1551,6 @@ const Render = (() => {
     return { nx: h.nx, ny: h.ny, data: out };
   }
   return { init, setVolume, setFar, farInfo: () => farV.map(s => s.head && { box: s.head.box, nx: s.head.nx, ny: s.head.ny, nz: s.head.nz }), blending: () => mixSt.f < 1, motion, _gb: () => gb, _peek,
-           _step: () => { mixSt.dirty = true; advance(geometry(), [0.5, 0.3, 0.81], 1, 1); }, setRoads, setTrees, setBuildings, dropPart, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
+           _step: () => { mixSt.dirty = true; advance(geometry(), [0.5, 0.3, 0.81], 1, 1); }, setRoads, setTrees, setBuildings, setLamps, dropPart, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
 })();
 window.Render = Render;

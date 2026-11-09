@@ -130,8 +130,54 @@ const Chase = (() => {
     const la = lat * rad;
     const el = Math.asin(Math.sin(la) * Math.sin(dec) + Math.cos(la) * Math.cos(dec) * Math.cos(H));
     const az = Math.atan2(-Math.sin(H), Math.tan(dec) * Math.cos(la) - Math.sin(la) * Math.cos(H));
-    return { az, el };
+    return { az, el, Ls };
   }
+  // the moon (low precision: its main terms, ~1 deg): where it is and how much of it is lit
+  function moonAt(ms, lat, lon) {
+    const rad = Math.PI / 180, d = ms / 86400000 + 2440587.5 - 2451545.0;
+    const L = (218.316 + 13.176396 * d) * rad, M = (134.963 + 13.064993 * d) * rad, F = (93.272 + 13.229350 * d) * rad;
+    const lam = L + 6.289 * rad * Math.sin(M), bet = 5.128 * rad * Math.sin(F), e = 23.4397 * rad;
+    const ra = Math.atan2(Math.sin(lam) * Math.cos(e) - Math.tan(bet) * Math.sin(e), Math.cos(lam));
+    const dec = Math.asin(Math.sin(bet) * Math.cos(e) + Math.cos(bet) * Math.sin(e) * Math.sin(lam));
+    const gmst = (18.697374558 + 24.06570982441908 * d) % 24, H = (gmst * 15 + lon) * rad - ra, la = lat * rad;
+    const el = Math.asin(Math.sin(la) * Math.sin(dec) + Math.cos(la) * Math.cos(dec) * Math.cos(H));
+    const az = Math.atan2(-Math.sin(H), Math.tan(dec) * Math.cos(la) - Math.sin(la) * Math.cos(H));
+    const s = sunAt(ms, lat, lon);
+    return { az, el, lit: (1 - Math.cos(lam - s.Ls)) / 2 };
+  }
+  // the night for render.js: daylight (1) to night (0) through civil twilight, the eye's adaptation, the moon,
+  // the lamps on
+  function nightView() {
+    const r = st.run, vs = st.vis;
+    let el, mo = null;
+    if (vs.sunMode === 'manual' || !(r && r.model_ms && r.settings && r.settings.map)) el = vs.sunH * Math.PI / 180;
+    else {
+      el = sunAt(r.model_ms, r.settings.map.lat0, r.settings.map.lon0).el;
+      mo = moonAt(r.model_ms, r.settings.map.lat0, r.settings.map.lon0);
+    }
+    const e = el * 180 / Math.PI, sm = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+    const dayK = sm(-9, 5, e);
+    const moonDir = mo ? [Math.sin(mo.az) * Math.cos(mo.el), Math.cos(mo.az) * Math.cos(mo.el), Math.sin(mo.el)] : [0, 0, -1];
+    const moonK = mo ? mo.lit * sm(-1, 8, mo.el * 180 / Math.PI) : 0;
+    return { dayK, expo: 1 + 7 * (1 - dayK) * (1 - dayK), moonDir, moonK, lampK: sm(0.75, 0.3, dayK), el: e };
+  }
+  // the headlights: yours (L: auto, on, off; auto: on at dusk or in heavy rain) and the nearest others'
+  function headlights(night) {
+    const auto = night.dayK < 0.6 || wx.rainI > 0.5;
+    const mine = st.lights === 'on' || (st.lights !== 'off' && auto);
+    const out = [];
+    const lamp = (p, M, len, on) => {
+      const f = M[0], h = len / 2 + 0.1;
+      out.push({ p: [p[0] + f[0] * h, p[1] + f[1] * h, p[2] + f[2] * h + 0.15], d: norm3([f[0], f[1], f[2] - 0.07]), on: on ? 1 : 0 });
+    };
+    const c = st.car;
+    lamp(c.p, c.matrix, c.spec.dims[0], mine);
+    const me = st.foot || c;
+    const others = (st.lastOthers || []).map(o => ({ o, d: Math.hypot(o.p[0] - me.p[0], o.p[1] - me.p[1]) })).sort((a, b) => a.d - b.d).slice(0, 3);
+    for (const { o } of others) if (o.q) lamp(o.p, CarPhys.qmat(o.q), (CarPhys.SPECS[o.kind] || CarPhys.SPECS.suv).dims[0], auto);
+    return out;
+  }
+  const norm3 = v => { const l = Math.hypot(...v) || 1; return v.map(x => x / l); };
   function sunDir() {
     let az = 240 * Math.PI / 180, el = 35 * Math.PI / 180;
     const r = st.run;
@@ -298,7 +344,8 @@ const Chase = (() => {
     const I = wx.rainI;
     if (I < 0.01) return null;
     const sun = sunDir(), inside = !st.foot && st.cam.mode !== 'chase';
-    const L = (0.32 + 0.5 * Math.min(1, Math.max(0, sun[2]) * 2.2)) * (1 - 0.35 * I);
+    const nk = st.night ? st.night.dayK : 1, fl = Lightning.light(performance.now(), view.eye).amb[2];
+    const L = (0.32 + 0.5 * Math.min(1, Math.max(0, sun[2]) * 2.2)) * (1 - 0.35 * I) * Math.max(0.06, nk) + 0.3 * Math.min(1, fl);
     return { n: I * (9000 * (1 - wx.snow) + 15000 * wx.snow), snow: wx.snow, cube: wx.snow > 0.5 ? 20 : 24,
              minD: inside ? 1.4 : 0.4, wind: [wx.u, wx.v], camV: wx.camV,
              col: [0.25 + 0.62 * L, 0.27 + 0.65 * L, 0.30 + 0.68 * L] };     // drops catch the light: brighter than the murk
@@ -501,9 +548,11 @@ const Chase = (() => {
       loadVolume(false);
       Scenery.updateBuildings(c.p[0], c.p[1], Render.terrain, () => Render.setBuildings(Scenery.state.bMesh, Scenery.state.bOrigin));
       Stations.update(c.p[0], c.p[1]);
+      Lightning.poll(c.p[0], c.p[1]);
       const wl = detailed() && WorldLink.ready();
       if (Stations.near(c.p[0], c.p[1], stationGround, wl ? 'world' : 'basic')) Scenery.setSkip(Stations.covers);
       const me = st.foot || c;
+      if (Lights.update(me.p[0], me.p[1], (x, y) => surfAt(x, y).h)) Render.setLamps(Lights.state.inst, Lights.state.origin);
       Stations.follow(me.p[0], me.p[1]);
       if (Stations.route.arrived && !st.arriveSaid) {
         st.arriveSaid = true;
@@ -753,15 +802,19 @@ const Chase = (() => {
     if (st.foot && !(st.cam.mode !== 'chase')) cars.push({ parts: st.foot.figure(st.color) });   // (first person: not yourself)
     if (st.extraCars) cars.push(...st.extraCars());
     {
-      const sp = Stations.parts(), rb = Stations.ribbon((x, y) => surfAt(x, y).h);
+      const sp = Stations.parts().concat(Lights.parts()), rb = Stations.ribbon((x, y) => surfAt(x, y).h);
       if (rb) sp.push(rb);
       if (sp.length) cars.push({ parts: sp });
     }
     const sun = sunDir();
+    const night = nightView();
+    Lightning.step(now, c.p, (x, y) => surfAt(x, y).h, (x, y) => Render.cloudBase(x, y), f => Sound.thunder(f.d, f.cg));
+    st.night = night;
     const tw = treeWind();
     if (detailed() && WorldLink.ready() && WorldLink.wind) WorldLink.wind(tw);
     const world = detailed() && WorldLink.ready() ? WorldLink.drawer(view, sun) : null;
-    const fr = Render.frame({ ...view, sun, world, treeWind: tw, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view) }, cars);
+    const fr = Render.frame({ ...view, sun, world, treeWind: tw, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view),
+                              night, flash: Lightning.light(now, view.eye), heads: headlights(night), bolts: Lightning.bolts(now, view.eye, wx.rainI) }, cars);
     hud(fr, view);
     requestAnimationFrame(tick);
   }
@@ -840,6 +893,15 @@ const Chase = (() => {
       const pr = wx.rainI < 0.05 ? '' : ` · ${wx.snow > 0.7 ? 'snow' : wx.snow > 0.3 ? 'sleet' : 'rain'} ${wx.rainI < 0.35 ? 'light' : wx.rainI < 0.7 ? 'moderate' : 'heavy'}`;
       if (air.now || st.fake) lines.push(`Wind ${from}${ws(W)}${wx.gust > W + 2 ? ` gusting ${ws(wx.gust)}` : ''} ${mph ? 'mph' : 'km/h'}${T}${pr}${st.fake ? ' (test values)' : ''}`);
       else if (air.err && !/no run/.test(air.err)) lines.push(`Wind at the car: ${/^404$|^unknown/.test(air.err) ? 'restart the viewer (new in this version)' : air.err}`);
+    }
+    {
+      const Ls = Lightning.state;
+      if (Ls.total > 0) {
+        let nd = Infinity, nm = null;
+        for (const m of Ls.marks) { const d = Math.hypot(m.x - c.p[0], m.y - c.p[1]); if (m.cg && now - m.t < 60000 && d < nd) { nd = d; nm = m; } }
+        lines.push(`Lightning ${Math.round(Ls.total * 60)} flashes/min in the area${nm ? ` · nearest strike ${fmtDist(nd)} ${bearing(nm.x - c.p[0], nm.y - c.p[1])}` : ''}`);
+      } else if (Ls.err) lines.push(`Lightning: ${Ls.err}`);
+      if (st.night && st.night.dayK < 0.6) lines.push(`Headlights ${st.lights === 'on' ? 'on' : st.lights === 'off' ? 'off' : 'auto'} (L)`);
     }
     const wr = activeWarnings(c.p[0] / 1000, c.p[1] / 1000);
     if (wr.length) lines.push(`You are in a ${wr.map(w => w.kind === 'TOR' ? 'TORNADO WARNING' : w.kind === 'SVR' ? 'severe thunderstorm warning' : w.kind).join(' and a ')}`);
@@ -1071,6 +1133,7 @@ const Chase = (() => {
       g.fillStyle = off ? 'rgba(255,60,60,.6)' : '#ff3b3b'; g.beginPath(); g.arc(s[0], s[1], 6, 0, 7); g.fill();
       g.strokeStyle = '#fff'; g.lineWidth = 1.5; g.stroke();
     }
+    Lightning.map(g, P, performance.now());
     // the gas stations (close in) and the route to one
     {
       const R = Stations.route;
@@ -1430,6 +1493,10 @@ const Chase = (() => {
       if (e.code === 'KeyG' && !e.repeat) { goSomewhere(); return; }
       if (e.code === 'KeyF' && !e.repeat) { toggleFoot(); return; }
       if (e.code === 'KeyO' && !e.repeat) { toggleRoute(); return; }
+      if (e.code === 'KeyL' && !e.repeat) {
+        st.lights = st.lights === 'on' ? 'off' : st.lights === 'off' ? 'auto' : 'on';
+        say(`Headlights ${st.lights}`, 1200); return;
+      }
       if (tag === 'SELECT' || tag === 'INPUT' || tag === 'BUTTON') { t.blur(); e.preventDefault(); }
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
       if (e.repeat) return;

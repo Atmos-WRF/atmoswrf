@@ -14,25 +14,16 @@ function target(w, h) {
   rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, depthTexture: depth, depthBuffer: true });
   return rt;
 }
-// ---- the wind in the trees, grass and crops (chase mode's, through ChaseWorld.wind): each one leans downwind from
-// its foot (bend ~ W^2: 1 % of its height at 10 m/s, 10 % at 30, 40 % at 60), sways and shivers about it, more in the
-// gusts; round a tornado (up to two: centre, radius, peak wind) in its turning wind, violently.  A few instructions
-// a vertex on the GPU, added to the materials' own hooks (their gentle idle sway stays).
+// ---- the wind in the trees, grass and crops (the model's at the camera, through ChaseWorld.wind): each one leans
+// downwind from its foot (bend ~ W^2: 1 % of its height at 10 m/s, 10 % at 30, 40 % at 60), sways and shivers about
+// it, more in the gusts.  A few instructions a vertex on the GPU, added to the materials' own hooks (their gentle
+// idle sway stays).
 const windU = { value: new THREE.Vector3(0, 0, 1) };              // x, z m/s (this map's axes), gust factor
-const vorU = { value: [new THREE.Vector4(0, 0, 100, 0), new THREE.Vector4(0, 0, 100, 0)] };   // x, z, R m, V (+ ccw)
-const vorNU = { value: 0 }, windTU = { value: 0 };
+const windTU = { value: 0 };
 const SWAY_GLSL = `
-uniform vec3 uWind; uniform vec4 uVor[2]; uniform int uVorN; uniform float uWT;
+uniform vec3 uWind; uniform float uWT;
 vec2 windAtW(vec2 xz) {
   vec2 w = uWind.xy;
-  for (int i = 0; i < 2; i++) {
-    if (i >= uVorN) break;
-    vec2 d = xz - uVor[i].xy; float r = max(length(d), 1.0), R = uVor[i].z, A = abs(uVor[i].w);
-    if (r > 20.0 * R) continue;
-    float vt = (r < R ? A * r / R : A * pow(R / r, 0.6)) * (1.0 - smoothstep(12.0 * R, 20.0 * R, r));
-    vec2 c = d / r;                                             // (x east, z south: counter-clockwise from above is (c.y, -c.x))
-    w = w * (0.35 + 0.65 * smoothstep(R, 6.0 * R, r)) + vec2(c.y, -c.x) * vt * sign(uVor[i].w + 1e-6) - c * 0.4 * vt;
-  }
   return w;
 }
 vec2 swayW(vec2 xz, float h, float f, float sd) {
@@ -64,11 +55,11 @@ for (const mat of [treeMat, farMat, plantMat]) {
   const own = mat.onBeforeCompile, key = mat.customProgramCacheKey ? mat.customProgramCacheKey() : 'plant';
   mat.onBeforeCompile = (sh, r) => {
     if (own) own.call(mat, sh, r);
-    Object.assign(sh.uniforms, { uWind: windU, uVor: vorU, uVorN: vorNU, uWT: windTU });
+    Object.assign(sh.uniforms, { uWind: windU, uWT: windTU });
     sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\n' + SWAY_GLSL)
       .replace('#include <project_vertex>', projectSway('position.y'));
   };
-  mat.customProgramCacheKey = () => key + '-wind1';
+  mat.customProgramCacheKey = () => key + '-wind2';
   mat.needsUpdate = true;
 }
 const ChaseWorld = {
@@ -164,12 +155,9 @@ const ChaseWorld = {
     return hit ? [mx, mz] : null;
   },
   nearestRoad,
-  // the wind for the trees, grass and crops: { u, z m/s (this map's axes), gust (factor), vort: [{ x, z, R, V }] }
+  // the wind for the trees, grass and crops: { u, z m/s (this map's axes), gust (factor) } -- the model's at the camera
   wind(o) {
     windU.value.set(o.u || 0, o.z || 0, o.gust || 1);
-    const vs = (o.vort || []).slice(0, 2);
-    vs.forEach((v, i) => vorU.value[i].set(v.x, v.z, v.R, v.V));
-    vorNU.value = vs.length;
     windTU.value = performance.now() / 1000 % 3600;
   },
   // the landmark close by (within 400 m), its name

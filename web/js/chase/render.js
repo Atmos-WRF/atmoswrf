@@ -15,7 +15,7 @@ const Render = (() => {
   let volA = null, volB = null, lightA = null, lightB = null, mixProg = null, mixFbo = null;
   const insA = [], insB = [];
   const mixSt = { t0: 0, dur: 0, f: 1, at: 0, dirty: false, fMain: 1, atMain: 0, fIns: 1, atIns: 0, insBlend: [false, false, false, false], lightB: -1,
-                  tA: null, tB: null, warp: false, insWarp: [false, false, false, false], insBoxA: [null, null, null, null], vor: [] };
+                  tA: null, tB: null, warp: false, insWarp: [false, false, false, false], insBoxA: [null, null, null, null] };
   // a blend may run on past its end, carried along the wind, by this much (x its length) while the next volume is late
   const OVERRUN = 1.75;
   // the model's wind with each volume (header.wind): the box's and each nest's, for the start of the blend (A) and
@@ -23,12 +23,8 @@ const Render = (() => {
   let windA = null, windB = null, hasWind = false, flowEpoch = 0;
   const wInsA = [], wInsB = [];
   const WARP_MAX = 240;                          // s of model time: a longer step between volumes just fades
-  const MIX_EVERY = 33;                          // ms between mixing passes (~30 a second at most): the tornado model's
+  const MIX_EVERY = 33;                          // ms between mixing passes (~30 a second at most)
   const MIX_MAIN = 125, MIX_INS = 50;            // ms: the storm's box, its nests (advance)
-  // the tornado model's frames (setLes): media and wind, the one shown (lesM, lesVt) mixed from the previous (A) and
-  // the newest (B) over the time between frames, like the storm's volume
-  let lesShader = false, lesHead = null, lesM = null, lesMA = null, lesMB = null, lesVt = null, lesVA = null, lesVB = null;
-  const lesSt = { t0: 0, dur: 0, f: 1, at: 0, dirty: false };
   let head = null, box = null, gMap = null, floatLinear = false, volData = null;
   // the far cloud (setFar, FAR_GLSL): per tier the newest as it came (raw: the codes) and lit (B: the codes and their
   // light, farLightSource), the one shown when it came (A, lit), and the one read (tex), mixed from A and B; head:
@@ -182,25 +178,13 @@ const Render = (() => {
   layout(location = 0) in vec3 p; layout(location = 1) in vec3 n; layout(location = 2) in float part;
   layout(location = 3) in vec4 a; layout(location = 4) in vec2 b;
   uniform mat4 VP; uniform vec3 org; uniform float s;
-  // the wind in the trees: uWind (u, v m/s, gust factor), up to two vortices uVor (x, y m from the trees' origin,
-  // radius m, peak wind m/s + counter-clockwise), uTime s.  A tree leans downwind (bend ~ W^2: 1 % of its height at
-  // 10 m/s, 10 % at 30, 40 % at 60), sways and shivers about it, more in the gusts; near a tornado, violently.
-  uniform vec3 uWind; uniform vec4 uVor[2]; uniform int uVorN; uniform float uTime;
+  // the wind in the trees: uWind (the model's u, v m/s at the camera, its gust factor), uTime s.  A tree leans
+  // downwind (bend ~ W^2: 1 % of its height at 10 m/s, 10 % at 30, 40 % at 60), sways and shivers about it, more in
+  // the gusts.
+  uniform vec3 uWind; uniform float uTime;
   out vec3 wpos; out vec3 nw; out vec3 col;
-  vec2 windHere(vec2 xy) {
-    vec2 w = uWind.xy;
-    for (int i = 0; i < 2; i++) {
-      if (i >= uVorN) break;
-      vec2 d = xy - uVor[i].xy; float r = max(length(d), 1.0), R = uVor[i].z, A = abs(uVor[i].w);
-      if (r > 20.0 * R) continue;
-      float vt = (r < R ? A * r / R : A * pow(R / r, 0.6)) * (1.0 - smoothstep(12.0 * R, 20.0 * R, r));
-      vec2 c = d / r;
-      w = w * (0.35 + 0.65 * smoothstep(R, 6.0 * R, r)) + vec2(-c.y, c.x) * vt * sign(uVor[i].w + 1e-6) - c * 0.4 * vt;
-    }
-    return w;
-  }
   vec2 swayAt(vec2 xy, float h, float f, float sd) {
-    vec2 w = windHere(xy); float W = length(w);
+    vec2 w = uWind.xy; float W = length(w);
     if (W < 0.3) return vec2(0.0);
     vec2 dir = w / W;
     float lean = min(0.00011 * W * W, 0.42), fr = 0.35 + 0.012 * W;
@@ -259,51 +243,16 @@ const Render = (() => {
   }
 
   // The model's own cloud, alive: its small detail (volume.js's erosion and lumps) carried with the storm (drift m/s
-  // over the model's time flowT s), and round each of the model's vortices (vorA: centre now in box units, the
-  // model's peak tangential wind m/s, + counter-clockwise, and the radius of that peak m) turned at the vortex's own
-  // rate (Rankine: solid inside the peak, falling off as 1/r^2 outside) and rising, at its real speed (spinT: wall
-  // seconds) -- in two phases that take turns (flow noise), so the turning never winds the noise up.  Close in, a
-  // finer noise on the vortex's own scale: the funnel's striations.  The cloud's shape is the model's (the volume,
-  // carried along its wind between snapshots by the blend: WARP_FS).
-  const VORTEX_GLSL = `
-  uniform int vorN; uniform vec4 vorA[4]; uniform float flowT, spinT; uniform vec2 drift;
-  float gDebris = 0.0;                                         // the debris' share of the extinction here
-  mat2 vrot2(float a) { float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }
-  // ka, kb: the detail's two phases (km), w the share of ka; fa, fb: the striations' (their own units), sv: how
-  // much of a vortex there is here
-  void flowK(vec3 p, out vec3 ka, out vec3 kb, out float w, out vec3 fa, out vec3 fb, out float sv) {
-    vec3 k = p * toKm + kmOrigin;
-    ka = k - vec3(drift * flowT / 1000.0, 0.0); kb = ka; w = 1.0; fa = vec3(0.0); fb = vec3(0.0); sv = 0.0;
-    for (int i = 0; i < 4; i++) {
-      if (i >= vorN) break;
-      vec2 d = (p.xy - vorA[i].xy) * toKm.xy * 1000.0;         // m from its centre
-      float r = length(d), V = vorA[i].z, R = vorA[i].w, zm = p.z * toKm.z * 1000.0;
-      float s = (1.0 - smoothstep(3.0 * R, 6.0 * R, r)) * (1.0 - smoothstep(3000.0, 5000.0, zm));
-      if (s <= 0.0) continue;
-      float om = r < R ? V / R : V * R / max(r * r, 1.0);      // rad/s
-      float P = clamp(2.5 / max(abs(V) / R, 0.05), 1.5, 8.0);  // s a phase lasts: about a third of a turn of the core
-      float ph = fract(spinT / P), ph2 = fract(ph + 0.5);
-      w = 1.0 - abs(2.0 * ph - 1.0);
-      vec3 o = vec3(17.3, 9.1, 0.0) * float(i + 1);
-      float up = 0.008;                                        // km/s: the air rising in it
-      vec3 va = vec3(vrot2(-om * ph * P) * d / 1000.0, k.z - up * ph * P) + o;
-      vec3 vb = vec3(vrot2(-om * ph2 * P) * d / 1000.0, k.z - up * ph2 * P) + o + vec3(0.37, 0.11, 0.53);
-      ka = mix(ka, va, s); kb = mix(kb, vb, s);
-      // the striations: stretched up the funnel, bands about a tenth of its core across (the noise repeats every
-      // 1.6 R; at 0.7 R its finest cells, ~R / 45, made a fine comb of lines), and only on the funnel and the wall
-      // cloud -- out to 2 R and 3.5 km up, not the whole low cloud 6 R round (a tail cloud km away got them)
-      // (at least 1.2 km x 3 km a repeat: a small vortex's would be features of ~10 m, which alias into a comb)
-      vec3 sc = vec3(max(1.6 * R, 1200.0), max(1.6 * R, 1200.0), max(4.0 * R, 3000.0)) / 1000.0;
-      fa = va / sc; fb = vb / sc;
-      sv = s * (1.0 - smoothstep(1.0 * R, 2.0 * R, r)) * (1.0 - smoothstep(2000.0, 3500.0, zm));
-      break;                                                    // one vortex at a time
-    }
-  }
+  // over the model's time flowT s).  The cloud's shape is the model's (the volume, carried along its own 3-D wind
+  // between snapshots by the blend: MIX_FS).
+  const FLOW_GLSL = `
+  uniform float flowT; uniform vec2 drift;
+  // k: the detail's coordinates (km), carried with the storm
+  vec3 flowK(vec3 p) { return p * toKm + kmOrigin - vec3(drift * flowT / 1000.0, 0.0); }
   // the detail's scale where media() is reading (km): the cell of the finest grid there -- a nest's own, not the
   // box's, or the box's coarse cell would shift and erode a 37 m nest's funnel (100-200 m wide) into nothing
   // and how much of it (the Detail slider's): it fades out on grids under ~150 m, which resolve the cloud's real
-  // structure -- the funnel and the wall cloud there are thin (volume.py _near_saturation, at most 0.25 g/kg) and
-  // made-up erosion and lumps break them into nothing
+  // structure -- made-up erosion and lumps there would break the model's own funnel and wall cloud into nothing
   float gDkm = 1.0, gDet = 0.0;
   // a nest's share of the detail's scale at p: 1 in its middle, down to 0 over its outer 30 % (and its top 15 %) --
   // far wider than its data's own blend (insW, 8 %): the look changes with the scale, and over a narrow band that
@@ -337,7 +286,7 @@ const Render = (() => {
     float dk = length((p - eye) * toKm);
     return mix(min(dt, cell * k * nestStep * max(1.0, dk / 1.5)), dt, fade);
   }
-  vec2 shapeDetail(vec3 k, vec2 s, vec3 kf, float sv) {
+  vec2 shapeDetail(vec3 k, vec2 s) {
     // the noise on the box's scale everywhere (detailKm): on a nest's (gDkm, down to 37 m) its ~20 m features
     // aliased into streaks and a fine comb seen from km off; in the nests only its strength fades (gDet)
     float n = texture(noiseTex, k / (detailKm * 20.0)).r * 0.55 + texture(noiseTex, k / (detailKm * 7.0) + 0.37).r * 0.45;
@@ -352,10 +301,6 @@ const Render = (() => {
     // stretch made a fine comb of streaks tens of metres wide across the rain round a tornado
     float r = texture(noiseTex, vec3(k.xy / (detailKm * 9.0), k.z / (detailKm * 90.0)) + 0.61).g;
     s.y *= max(mix(1.0, 2.4 * r - 0.2, 0.8 * gDet), 0.0);
-    if (sv > 0.0) {                                             // the funnel's striations (flowK: its core, turning)
-      float nf = texture(noiseTex, kf).r * 0.75 + texture(noiseTex, kf * 2.3 + 0.17).g * 0.25;
-      s.x *= max(mix(1.0, 0.2 + 1.6 * nf, 0.75 * sv * min(detail * 1.5, 1.0)), 0.0);
-    }
     return s;
   }
   // the light the ground sends up (bounce): the ground under and round about lit by the sun and the sky (the light
@@ -387,15 +332,16 @@ const Render = (() => {
   float fdiff(float tau) { return 1.0 / (1.0 + 0.12 * tau) - exp(-0.12 * tau); }
 `;
 
-  // volume.js's media(): the cloud and rain at box point p (extinction per km), its detail (mode > 0) from flowK
+  // volume.js's media(): the cloud and rain at box point p (extinction per km), its detail (mode > 0) carried along
+  // with the storm (flowK)
   const MEDIA_GLSL = `
   vec2 media(vec3 p, int mode) {
     vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
     if (any(lessThan(uvw, vec3(-0.01))) || any(greaterThan(uvw, vec3(1.01)))) return vec2(0.0);
-    vec3 ka = vec3(0.0), kb = vec3(0.0), fa = vec3(0.0), fb = vec3(0.0); float w = 1.0, sv = 0.0;
+    vec3 ka = vec3(0.0);
     gDkm = detailKm; gDet = detail;
     if (mode > 0 && detail > 0.0) {
-      flowK(p, ka, kb, w, fa, fb, sv);
+      ka = flowK(p);
       // the grid's cell here, as a share of the box's (1 outside the nests)
       float rc = insN > 0 ? cellAt(p) / (size.x * texel.x) : 1.0;
       gDkm = detailKm * rc;
@@ -413,132 +359,9 @@ const Render = (() => {
     vec2 e = min(uvw.xy, 1.0 - uvw.xy) / 0.03;                 // the box's sides fade: no walls of cloud
     s *= clamp(min(e.x, e.y), 0.0, 1.0);
     if (mode > 0 && detail > 0.0 && s.x + s.y > 1e-3) {
-      vec2 sa = shapeDetail(ka, s, fa, sv);
-      s = w < 0.999 ? mix(shapeDetail(kb, s, fb, sv), sa, w) : sa;
+      s = shapeDetail(ka, s);
     }
     return s;
-  }`;
-
-  // The tornado model's own volume (the Unity LES, streamed through Atmos: lestornado.py), marched in the same ray as
-  // the storm so the funnel, the wall cloud and the rain occlude and light each other.  Its shaping is the model's
-  // renderer's (VortexVolume.shader: shape_condensate, shape_dust, the shroud, the vortex-tube view), ported as is and
-  // with the model's own look settings, in the model's local axes (q: m east, up, north of the box's ground centre).
-  // Inside the box the march takes steps of a third of a model cell (lesDt), with a short shadow march of its own
-  // toward the sun (lesSunTau), so subvortices, striations and tubes show and shade one another.
-  const LES_GLSL = `
-  uniform sampler3D lesM, lesV; uniform int lesOn; uniform vec3 lesC, lesSize, lesWind; uniform float lesTime, lesStepM, lesTubes;
-  uniform float lesCloud, lesDust, lesSharp, lesThr, lesStri, lesStriScale, lesStriStretch, lesEro, lesEroScale;
-  uniform float lesDustEro, lesDustScale, lesDustClumps, lesDustGrain, lesDustStreaks, lesShroud, lesShroudW;
-  uniform vec4 lesCode;                                        // condMin, condMax, dustMax, velMax (tubes: condMin..condMax)
-  float lnoise(vec3 p) { return texture(noiseTex, p).r; }
-  float lflow(vec3 p, vec3 vel, float scale) {                 // flow_noise
-    float period = 3.0, ph = fract(lesTime / period), ph2 = fract(ph + 0.5), w = 1.0 - abs(2.0 * ph - 1.0);
-    vec3 drift = lesWind * lesTime;
-    vec3 a = (p - vel * (ph * period) - drift) / scale, b = (p - vel * (ph2 * period) - drift) / scale + vec3(0.37, 0.11, 0.53);
-    float na = lnoise(a * 0.33) * 0.55 + lnoise(a) * 0.45, nb = lnoise(b * 0.33) * 0.55 + lnoise(b) * 0.45;
-    return smoothstep(0.3, 0.7, mix(nb, na, w));
-  }
-  float laniso(vec3 q, vec3 dir) {                             // aniso_noise
-    float along = dot(q, dir);
-    vec3 qs = (q - dir * along) + dir * (along / lesStriStretch);
-    return lnoise(qs) * 0.6 + lnoise(qs * 2.3 + 0.17) * 0.4;
-  }
-  float lstri(vec3 p, vec3 vel) {                              // striations
-    float speed = length(vel);
-    vec3 dir = speed > 0.5 ? vel / speed : vec3(0.0, 1.0, 0.0);
-    float period = 2.0, ph = fract(lesTime / period), ph2 = fract(ph + 0.5), w = 1.0 - abs(2.0 * ph - 1.0);
-    float na = laniso((p - vel * (ph * period)) / lesStriScale, dir);
-    float nb = laniso((p - vel * (ph2 * period)) / lesStriScale + vec3(0.41, 0.23, 0.67), dir);
-    return mix(nb, na, w);
-  }
-  // the box (box units): its ground centre lesC, lesSize m (east, up, north)
-  void lesBox(out vec3 lo, out vec3 hi) {
-    vec3 hs = vec3(0.5 * lesSize.x, 0.5 * lesSize.z, lesSize.y) / (toKm * 1000.0);
-    lo = vec3(lesC.xy - hs.xy, lesC.z); hi = vec3(lesC.xy + hs.xy, lesC.z + hs.z);
-  }
-  // extinction per km (cloud, dust) of the model's tornado at box point p (mode 0: plain, for shadow rays)
-  vec2 lesTornado(vec3 p, int mode) {
-    if (lesOn == 0) return vec2(0.0);
-    vec3 m = vec3((p.xy - lesC.xy) * toKm.xy, (p.z - lesC.z) * toKm.z) * 1000.0;
-    vec3 q = vec3(m.x, m.z, m.y);                              // the model's axes: east, up, north
-    vec3 tu = vec3(q.x / lesSize.x + 0.5, q.y / lesSize.y, q.z / lesSize.z + 0.5);
-    if (any(lessThanEqual(tu, vec3(0.0))) || any(greaterThanEqual(tu, vec3(1.0)))) return vec2(0.0);
-    vec4 raw = textureLod(lesM, tu, 0.0);
-    float span = lesCode.y - lesCode.x;
-    float cond = lesCode.x + raw.r * span, dust = raw.g * lesCode.z, tube = lesCode.x + raw.b * span;
-    bool detail = mode > 0;
-    vec3 vel = vec3(0.0);
-    if (detail && (cond > lesThr - 1.0 || dust > 0.0 || (lesShroud > 0.0 && cond > -lesShroudW)))
-      vel = (textureLod(lesV, tu, 0.0).rgb * 2.0 - 1.0) * lesCode.w;
-    // shape_condensate: streaks displace the iso-surface, the edge is sharpened, thin parts erode
-    float rc = cond - lesThr, streak = 0.5;
-    if (detail && lesStri > 0.0 && rc > -1.0) { streak = lstri(q, vel); rc += lesStri * (streak - 0.5); }
-    float c = clamp(rc * lesSharp, 0.0, 1.0);
-    if (detail) {
-      if (lesEro > 0.0 && c > 0.0 && c < 1.0) {
-        float thr = lesEro * lflow(q, vel, lesEroScale) * (1.0 - c);
-        c = clamp((c - thr) / max(1.0 - thr, 0.05), 0.0, 1.0);
-      }
-      c *= mix(1.0, 0.3 + 1.4 * streak, clamp(0.55 * lesStri, 0.0, 1.0));
-    }
-    // shape_dust: wind-carried billows, clumps, grain and streaks
-    float d = clamp(dust, 0.0, 1.0);
-    if (detail && d > 0.0) {
-      if (lesDustEro > 0.0 && d < 1.0) {
-        float thr = lesDustEro * lflow(q + vec3(31.0, 0.0, 17.0), vel, lesDustScale) * (1.0 - d);
-        d = clamp((d - thr) / max(1.0 - thr, 0.05), 0.0, 1.0);
-      }
-      if (lesDustClumps > 0.0 && d > 0.0) {
-        float cl = lflow(q * vec3(1.0, 1.6, 1.0) + vec3(-53.0, 0.0, 29.0), vel, 2.2 * lesDustScale);
-        d *= mix(1.0, clamp(1.9 * cl * cl, 0.0, 1.0), lesDustClumps);
-      }
-      if (lesDustGrain > 0.0 && d > 0.0) {
-        float g = lnoise(q / 9.0 + vec3(0.0, 0.03 * lesTime, 0.0)) * 0.6 + lnoise(q / 4.3 + 0.71) * 0.4;
-        d *= mix(1.0, clamp(2.2 * g * g, 0.0, 1.0), lesDustGrain);
-      }
-      if (lesDustStreaks > 0.0 && d > 0.0) {
-        float sp = length(vel);
-        float st = laniso((q - lesWind * lesTime) / (2.5 * lesStriScale), sp > 0.5 ? vel / sp : vec3(0.0, 1.0, 0.0));
-        d *= mix(1.0, clamp(0.1 + 1.8 * st * st, 0.0, 1.0), lesDustStreaks);
-      }
-    }
-    // the shroud: ragged mist in the nearly saturated air round the funnel
-    if (lesShroud > 0.0 && cond > -lesShroudW) {
-      float mist = clamp(1.0 + cond / lesShroudW, 0.0, 1.0);
-      if (detail) mist *= clamp(1.6 * lflow(q + vec3(7.0, 0.0, -11.0), vel, 2.0 * lesEroScale), 0.0, 1.0);
-      c = max(c, lesShroud * mist * mist);
-    }
-    vec2 e = min(tu.xz, 1.0 - tu.xz) / 0.04;                   // the box's sides fade (edgeFade)
-    float ef = clamp(min(e.x, e.y), 0.0, 1.0);
-    vec2 s = vec2(c * lesCloud, d * lesDust) * 1000.0 * ef;   // 1/m -> per km
-    if (lesTubes > 0.0) s.x += clamp(tube, 0.0, 1.0) * 60.0 * ef;   // the vortex-tube view (Tubes: 0.06 per m)
-    return s * density;
-  }
-  // the next step along the ray: a third of a model cell inside the tornado's box (k x that), and never past its edge
-  float lesDt(vec3 p, vec3 rd, float dt, float k) {
-    if (lesOn == 0) return dt;
-    vec3 lo, hi; lesBox(lo, hi);
-    float fine = k * lesStepM / 1000.0 / length(rd * toKm);
-    if (all(greaterThanEqual(p, lo)) && all(lessThanEqual(p, hi))) return min(dt, fine);
-    vec3 t0 = (lo - p) / rd, t1 = (hi - p) / rd, tmn = min(t0, t1), tmx = max(t0, t1);
-    float te = max(max(tmn.x, tmn.y), tmn.z), tl = min(min(tmx.x, tmx.y), tmx.z);
-    if (te > 0.0 && te <= tl && te < dt) return te + 0.5 * fine;
-    return dt;
-  }
-  // optical depth (sun) through the tornado's own media from p: the model's shadow march
-  float lesSunTau(vec3 p, vec3 wd, float kmPerW) {
-    if (lesOn == 0) return 0.0;
-    vec3 lo, hi; lesBox(lo, hi);
-    if (any(lessThan(p, lo)) || any(greaterThan(p, hi))) return 0.0;
-    float tau = 0.0, sk = 4.0 * lesStepM / 1000.0;
-    vec3 pp = p;
-    for (int j = 0; j < 10; j++) {
-      pp += wd * (sk / kmPerW);
-      vec2 s = lesTornado(pp, 0);
-      tau += (s.x + s.y) * sk;
-      sk *= 1.35;
-    }
-    return tau;
   }`;
 
   // The far cloud (setFar; game.js loadFar): two coarse volumes round the box out to the visibility, 0 the nearer and
@@ -653,14 +476,12 @@ const Render = (() => {
     if (!src.includes(head) || !src.includes(tail)) return src;
     // geoWins: with the detailed map the geometry (the map, the cars on it) is never hidden by the model's coarser ground
     src = src.replace(head, head + '\n  uniform float cloudContrast; uniform int geoWins;' + RAIN_GLSL);
-    // the cloud's detail carried with the air and turned round the vortices (VORTEX_GLSL): media() as volume.js's,
-    // its detail from flowK's coordinates
+    // the cloud's detail carried with the storm (FLOW_GLSL): media() as volume.js's, its detail from flowK's coordinates
     const media = 'vec2 media(vec3 p, int mode) {', ret = '    return s;\n  }\n  float sig(vec2 s)';
     const m0 = src.indexOf(media), m1 = src.indexOf('\n  float sig(vec2 s)');
     if (m0 >= 0 && m1 > m0 && src.slice(m0, m1).includes('vec3 k = p * toKm + kmOrigin;')) {
       src = src.slice(0, m0) + MEDIA_GLSL.trim() + src.slice(m1);
     } else console.warn('chase: the cloud\'s media() not as expected; its detail stays put');
-    if (!src.includes('float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));')) console.warn('chase: debris colour hook not found');
     // the detailed map's pixels (distance stored negative): already lit as under a clear sky, taken wherever they
     // are (the model's coarser ground would otherwise cut through them), then darkened by the cloud's shadow and
     // the sky the cloud hides
@@ -682,30 +503,20 @@ const Render = (() => {
     if (src.includes(sHook) && src.includes(media) && src.includes(ret)) {
       src = src.replace(sHook, 'vec3 S = albedo * (bounceAt(p) + SUN * max(sunDir.z, 0.0) * 1.1 * fdiff(ts) + amb * 0.9 * fdiff(lt.y) + SUN * L * 4.5 + ');
     } else console.warn('chase: ground bounce hook not found');
-    // the tornado model's volume: its hooks into the march (fine steps in its box, its own shadow)
+    // the march through the nests at their own resolution (nestDt): the same step for the extinction and the advance;
+    // fine only in cloud (the funnel, the wall cloud), not through rain alone, which is smooth and would cost the most
+    // (every step lit)
     const marchHooks = [
       ['for (int i = 0; i < 900; i++) {', 'for (int i = 0; i < 2400; i++) {'],
-      ['if (sg <= 1e-3) { t += dt * 1.8; continue; }', 'if (sg <= 1e-3) { t += lesDt(p, rd, dt * 1.8, 2.5); continue; }'],
-      ['float ds = dt * kmPer;', 'float ds = lesDt(p, rd, dt, 1.0) * kmPer;'],
-      ['float ts = lt.x;', 'float ts = lt.x + lesSunTau(p, wd, kmPerW);'],
-      ['        t += dt;\n', '        t += lesDt(p, rd, dt, 1.0);\n'],
+      ['if (sg <= 1e-3) { t += dt * 1.8; continue; }', 'if (sg <= 1e-3) { t += nestDt(p, dt * 1.8, 3.0); continue; }'],
+      ['float ds = dt * kmPer;', 'float ds = nestDt(p, dt, s.x > 0.2 * sg ? 0.6 : 4.0) * kmPer;'],
+      ['        t += dt;\n', '        t += nestDt(p, dt, s.x > 0.2 * sg ? 0.6 : 4.0);\n'],
     ];
-    const lesOk = src.includes(media) && src.includes(ret) && marchHooks.every(([a]) => src.includes(a));
-    if (!lesOk) console.warn('chase: tornado model hooks not found; its volume is off');
     if (src.includes(media) && src.includes(ret)) {
-      src = src.replace(media, VORTEX_GLSL + (lesOk ? LES_GLSL : '') + '\n  ' + media);
-      src = src.replace(ret, '    gDebris = 0.0;\n' +
-        (lesOk ? '    if (lesOn > 0) { vec2 lt = lesTornado(p, mode); s += lt; gDebris += lt.y; }\n' : '') + ret);
-      if (lesOk) {
-        for (const [a, b] of marchHooks) src = src.replace(a, b);
-        // and the nests' resolution in the march (nestDt): the same step for the extinction and the advance; fine
-        // only in cloud (the funnel, the wall cloud), not through rain alone, which is smooth and would cost the
-        // most (every step lit)
-        src = src.split('lesDt(p, rd, dt * 1.8, 2.5)').join('lesDt(p, rd, nestDt(p, dt * 1.8, 3.0), 2.5)')
-                 .split('lesDt(p, rd, dt, 1.0)').join('lesDt(p, rd, nestDt(p, dt, s.x > 0.2 * sg ? 0.6 : 4.0), 1.0)');
-      }
+      src = src.replace(media, FLOW_GLSL + '\n  ' + media);
+      if (marchHooks.every(([a]) => src.includes(a))) for (const [a, b] of marchHooks) src = src.replace(a, b);
+      else console.warn('chase: march hooks not found; the nests are marched at the box\'s step');
     }
-    lesShader = lesOk;
     // relief (four more reads of the cloud a step, a box cell apart) only on the coarser grids and where the step
     // is mostly cloud: inside a fine nest its box-sized offsets mean nothing and it costs the most.  Faded in and
     // out (rlf), not switched: a switch showed as a hard line at the nest's edge
@@ -714,8 +525,6 @@ const Render = (() => {
       src = src.replace(rHead, 'float rlf = relief * smoothstep(0.1, 0.2, gDkm) * smoothstep(0.15, 0.4, s.x / (sg + 1e-6));\n' +
                         '          if (rlf > 0.0) {').replace(rMix, '0.6 * rlf);');
     } else console.warn('chase: relief hook not found');
-    src = src.replace('float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));',
-                      'float albedo = mix(mix(0.98, 0.78, s.y / (sg + 1e-6)), 0.3, clamp(gDebris * density / (sg + 1e-6), 0.0, 1.0));');
     // the far cloud (FAR_GLSL) behind the box's, in front of the ground and the sky
     const mainHead = '  void main() {';
     if (src.split(mainHead).length === 2) {
@@ -760,10 +569,8 @@ const Render = (() => {
   // ---------------------------------------------------------------- blending volumes
   // With the model's wind (warp 1) the blend carries the picture along it instead of fading: the start (a, model
   // time sa s ago) read from where the air here was then, the newest (b, sb s from now) from where it will be, each
-  // by its own wind (wa, wb: 3 bytes a point, 0.5 m/s steps about 128).  Round a vortex (vor: centre now x, y m, peak
-  // wind m/s + counter-clockwise, its radius m; vorM: its motion m/s) the air is turned about the centre instead,
-  // at the vortex's own rate (Rankine), and the centre carried along its track: a straight step would smear a
-  // fast-turning funnel into a ring.  org, span: the grid's box (its corner and size, m east, north, up).
+  // by its own wind (wa, wb: 3 bytes a point, 0.5 m/s steps about 128).  org, span: the grid's box (its corner and
+  // size, m east, north, up).
   // A grid that moved between the two (a nest following its tornado: moved 1) has its start (a) in its old box (orgA,
   // spanA): read there by world position, the newest alone where the old box did not reach.  sa, sb come from the
   // blend's own fraction, which runs past 1 while the next volume is late (the newest carried on along its wind);
@@ -772,9 +579,8 @@ const Render = (() => {
   precision highp float; precision highp sampler3D;
   out vec4 frag;
   uniform sampler3D a, b, wa, wb; uniform float f, sa, sb; uniform int layer, warp, moved;
-  uniform vec3 org, span, orgA, spanA; uniform int vorN; uniform vec4 vor[4], vorM[4];
+  uniform vec3 org, span, orgA, spanA;
   vec3 wind(sampler3D t, vec3 uvw) { return (texture(t, uvw).rgb * 255.0 - 128.0) * 0.5; }
-  mat2 rot(float x) { float c = cos(x), s = sin(x); return mat2(c, s, -s, c); }
   // how much the start (a) has to say at its point ua: all of it well inside its box, fading to nothing over its
   // outer part (its sides and top; the ground is its floor): 15 % for a nest that moved, 2 % for the box -- a cut
   // there showed as a hard straight line across the cloud wherever the storm had changed between the two volumes
@@ -795,17 +601,6 @@ const Render = (() => {
       return;
     }
     pa = pm - wind(wa, (pm - orgA) / spanA) * sa; pb = pm + wind(wb, uvw) * sb;
-    for (int i = 0; i < 4; i++) {
-      if (i >= vorN) break;
-      vec2 d = pm.xy - vor[i].xy;
-      float r = length(d), V = vor[i].z, R = vor[i].w;
-      float k = (1.0 - smoothstep(3.0 * R, 6.0 * R, r)) * (1.0 - smoothstep(3000.0, 5000.0, pm.z));
-      if (k <= 0.0) continue;
-      float om = r < R ? V / R : V * R / max(r * r, 1.0);
-      vec2 qa = vor[i].xy - vorM[i].xy * sa + rot(-om * sa) * d;
-      vec2 qb = vor[i].xy + vorM[i].xy * sb + rot(om * sb) * d;
-      pa.xy = mix(pa.xy, qa, k); pb.xy = mix(pb.xy, qb, k);
-    }
     vec3 ua = (pa - orgA) / spanA;
     frag = mix(texture(a, ua), texture(b, (pb - org) / span), mix(1.0, f, inA(ua)));
   }`;
@@ -865,7 +660,7 @@ const Render = (() => {
   }
   // dst = mix(a, b, f), layer by layer (all three the same size); w: { org, span (this grid's box, m), orgA, spanA
   // (the start's, when the grid moved), warp: carried along the wind (wa, wb), fw: the blend's own fraction (past 1
-  // while the next volume is late) } -- the times and the vortices from mixSt
+  // while the next volume is late) } -- the times from mixSt
   function mixInto(dst, a, b, f, nx, ny, nz, w) {
     gl.disable(gl.BLEND);
     gl.useProgram(mixProg); gl.bindVertexArray(vao);
@@ -884,12 +679,6 @@ const Render = (() => {
       gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_3D, w.wb); gl.uniform1i(u.wb, 3);
       const dtm = mixSt.tB - mixSt.tA, fw = w.fw === undefined ? f : w.fw;
       gl.uniform1f(u.sa, fw * dtm); gl.uniform1f(u.sb, (1 - fw) * dtm);
-      const vs = (mixSt.vor || []).slice(0, 4), V = new Float32Array(16), M = new Float32Array(16);
-      vs.forEach((v, i) => {
-        const back = (1 - fw) * dtm;                   // the centre now: back from where it is at the newest volume
-        V.set([v.x - v.vx * back, v.y - v.vy * back, v.v, v.r], 4 * i); M.set([v.vx, v.vy, 0, 0], 4 * i);
-      });
-      gl.uniform1i(u.vorN, vs.length); gl.uniform4fv(u.vor, V); gl.uniform4fv(u.vorM, M);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, mixFbo);
     gl.viewport(0, 0, nx, ny);
@@ -975,7 +764,7 @@ const Render = (() => {
     const dtm = tNew !== null && tNow !== null ? tNew - tNow : 0;
     const warp = blend && hasWind && hadWind && dtm > 0 && dtm < WARP_MAX;
     Object.assign(mixSt, { t0: performance.now(), dur: blend ? blendMs : 0, f: blend ? 0 : 1, dirty: true, lightB: -1,
-                           tA: blend && tNow !== null ? tNow : tNew, tB: tNew, warp, vor: header.vortices || [] });
+                           tA: blend && tNow !== null ? tNow : tNew, tB: tNew, warp });
     gMap = null;
     if (header.ground) {
       const n = header.nx * header.ny, off = data.byteOffset + n * header.nz * header.channels;
@@ -1070,47 +859,11 @@ const Render = (() => {
     if (!(mixSt.dur > 0)) return 1;
     return Math.min(mixSt.warp ? OVERRUN : 1, (now - mixSt.t0) / mixSt.dur);
   }
-  // the newest volume's vortices where they are now (back along their tracks from the newest volume's time)
-  function vortexNow() {
-    const t = shownT(), vs = (mixSt.vor || []).slice(0, 4);
-    if (t === null || mixSt.tB === null) return vs;
-    const back = mixSt.tB - t;
-    return vs.map(v => ({ ...v, x: v.x - v.vx * back, y: v.y - v.vy * back }));
-  }
   // what the blend of one grid needs to carry it along the wind (MIX_FS): its wind at both ends and its box (m)
   function warpOf(wa, wb, bx, ztop, from, warp, fw) {
     const w = { wa, wb, warp, fw, org: [bx[0], bx[1], 0], span: [bx[2] - bx[0], bx[3] - bx[1], ztop] };
     if (from) { w.moved = true; w.orgA = [from.box[0], from.box[1], 0]; w.spanA = [from.box[2] - from.box[0], from.box[3] - from.box[1], from.ztop]; }
     return w;
-  }
-
-  // the tornado model's frame (lestornado.py / AtmosBridge.cs): header, media and wind bytes (RGBA8 each); blendMs > 0
-  // blends from what is shown into it over that long (same grids only).  h null: no tornado.
-  function setLes(h, media, vel, blendMs = 0) {
-    if (!gl || !lesShader) return;
-    if (!h) { lesHead = null; return; }
-    if (!lesM) {
-      lesM = gl.createTexture(); lesMA = gl.createTexture(); lesMB = gl.createTexture();
-      lesVt = gl.createTexture(); lesVA = gl.createTexture(); lesVB = gl.createTexture();
-    }
-    const [w, hh, d] = h.tex, [vw, vh, vd] = h.vtex;
-    const blend = blendMs > 0 && !!lesHead && lesHead.tex.join() === h.tex.join() && lesHead.vtex.join() === h.vtex.join();
-    if (blend) { [lesMA, lesM] = [lesM, lesMA]; [lesVA, lesVt] = [lesVt, lesVA]; }
-    alloc3D(lesMB, gl.RGBA8, w, hh, d, gl.RGBA, gl.UNSIGNED_BYTE, media);
-    alloc3D(lesVB, gl.RGBA8, vw, vh, vd, gl.RGBA, gl.UNSIGNED_BYTE, vel);
-    for (const t of [lesMA, lesM]) alloc3D(t, gl.RGBA8, w, hh, d, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    for (const t of [lesVA, lesVt]) alloc3D(t, gl.RGBA8, vw, vh, vd, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    Object.assign(lesSt, { t0: performance.now(), dur: blend ? blendMs : 0, f: blend ? 0 : 1, dirty: true });
-    lesHead = h;
-  }
-  function advanceLes() {
-    if (!lesHead) return;
-    const now = performance.now(), f = lesSt.dur > 0 ? Math.min(1, (now - lesSt.t0) / lesSt.dur) : 1;
-    if (!lesSt.dirty && (f === lesSt.f || (f < 1 && now - lesSt.at < MIX_EVERY))) return;
-    const [w, hh, d] = lesHead.tex, [vw, vh, vd] = lesHead.vtex;
-    mixInto(lesM, lesMA, lesMB, f, w, hh, d);
-    mixInto(lesVt, lesVA, lesVB, f, vw, vh, vd);
-    Object.assign(lesSt, { f, at: now, dirty: false });
   }
 
   // the blend now: the volume (and its nests) and their light mixed for this moment, at most every MIX_EVERY ms
@@ -1370,10 +1123,7 @@ const Render = (() => {
       gl.uniformMatrix4fv(t.VP, false, VP);
       gl.uniform3f(t.org, ...toBox(G, [trees.origin[0], trees.origin[1], 0]));
       gl.uniform1f(t.s, s); gl.uniform3f(t.eye, ...eye); gl.uniform3f(t.sunDir, ...sun);
-      const vo = (tw && tw.vort) || [], VO = new Float32Array(8);
-      vo.slice(0, 2).forEach((v, i) => VO.set([v.x - trees.origin[0], v.y - trees.origin[1], v.R, v.V], 4 * i));
       gl.uniform3f(t.uWind, tw ? tw.u : 0, tw ? tw.v : 0, tw ? tw.gust : 1);
-      gl.uniform4fv(t.uVor, VO); gl.uniform1i(t.uVorN, Math.min(2, vo.length));
       gl.uniform1f(t.uTime, performance.now() / 1000 % 3600);
       gl.bindVertexArray(trees.vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, trees.inst);
@@ -1472,8 +1222,6 @@ const Render = (() => {
     drawGeometry(G, VPr, eye, view.sun, cars, view.wet, view.trees !== false, wimg, view.fov, view.treeWind);
     advance(G, view.sun, view.density, view.rain);
     if (view.far) advanceFar(view.sun, view.density, view.rain);
-    const les = lesHead && view.les ? view.les : null;
-    if (les) advanceLes();
     gl.viewport(0, 0, W, H);
     if (view.blend > 0) {
       gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, 1 - view.blend);
@@ -1504,13 +1252,9 @@ const Render = (() => {
     gl.uniform1f(u.relief, view.relief);
     gl.uniform1f(u.cloudContrast, view.contrast || 1);
     gl.uniform1i(u.geoWins, wimg ? 1 : 0);
-    // the model's vortices where they are now, the storm's drift over the model's time, the spin in real time
-    const vs = vortexNow(), VA = new Float32Array(16);
-    vs.forEach((v, i) => { const b = toBox(G, [v.x, v.y, 0]); VA.set([b[0], b[1], v.v, v.r], 4 * i); });
-    gl.uniform1i(u.vorN, vs.length); gl.uniform4fv(u.vorA, VA);
+    // the storm's drift over the model's time (the detail carried with it)
     const ft = shownT();
     gl.uniform1f(u.flowT, ft === null ? 0 : ft - flowEpoch);
-    gl.uniform1f(u.spinT, performance.now() / 1000 % 3600);
     const dr = (head && head.drift) || [0, 0];
     gl.uniform2f(u.drift, dr[0], dr[1]);
     gl.uniform1f(u.bounce, view.bounce === undefined ? 1 : view.bounce);
@@ -1552,28 +1296,6 @@ const Render = (() => {
     gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, gb.col); gl.uniform1i(u.geoA, 6);
     gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, gb.dist); gl.uniform1i(u.geoT, 7);
     gl.uniform1i(u.hasGeo, 1);
-    // the tornado model's volume, standing on the ground at the vortex
-    gl.uniform1i(u.lesOn, les ? 1 : 0);
-    if (les) {
-      const h = lesHead, k = h.look || {};
-      gl.activeTexture(gl.TEXTURE13); gl.bindTexture(gl.TEXTURE_3D, lesM); gl.uniform1i(u.lesM, 13);
-      gl.activeTexture(gl.TEXTURE14); gl.bindTexture(gl.TEXTURE_3D, lesVt); gl.uniform1i(u.lesV, 14);
-      gl.uniform3f(u.lesC, ...toBox(G, [les.x, les.y, les.ground]));
-      gl.uniform3f(u.lesSize, h.size[0], h.size[1], h.size[2]);
-      gl.uniform1f(u.lesStepM, Math.max(0.5, Math.min(h.size[0] / h.tex[0], h.size[1] / h.tex[1], h.size[2] / h.tex[2]) / 3));
-      gl.uniform1f(u.lesTime, performance.now() / 1000 % 3600);
-      gl.uniform1f(u.lesTubes, view.lesTubes ? 1 : 0);
-      gl.uniform4f(u.lesCode, h.condMin, h.condMax, h.dustMax, h.velMax);
-      const W3 = k.detailWind || [0, 0, 0];
-      gl.uniform3f(u.lesWind, W3[0], W3[1], W3[2]);
-      const set = (n, v, d) => gl.uniform1f(u[n], v === undefined ? d : v);
-      set('lesCloud', k.cloudDensity, 0.08); set('lesDust', k.dustDensity, 0.045); set('lesSharp', k.edgeSharpness, 2);
-      set('lesThr', k.condensationThreshold, 0); set('lesStri', k.striation, 1); set('lesStriScale', k.striationScale, 14);
-      set('lesStriStretch', k.striationStretch, 6); set('lesEro', k.erosion, 0.3); set('lesEroScale', k.erosionScale, 32);
-      set('lesDustEro', k.dustErosion, 0.6); set('lesDustScale', k.dustScale, 28); set('lesDustClumps', k.dustClumps, 0.8);
-      set('lesDustGrain', k.dustGrain, 0.15); set('lesDustStreaks', k.dustStreaks, 0.05); set('lesShroud', k.shroud, 0);
-      set('lesShroudW', k.shroudWidth, 0.7);
-    }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     drawPrecip(view, G, VPr, eye, W, H);
     gl.disable(gl.BLEND);
@@ -1607,9 +1329,9 @@ const Render = (() => {
     return [(o[0] / o[3] * 0.5 + 0.5) * cv.clientWidth, (1 - (o[1] / o[3] * 0.5 + 0.5)) * cv.clientHeight];
   }
 
-  // how the picture is moving now (the HUD, testing): carried along the wind or fading, the model times, the vortices
+  // how the picture is moving now (the HUD, testing): carried along the wind or fading, the model times
   const motion = () => ({ warp: mixSt.warp, wind: hasWind, f: mixSt.f, tA: mixSt.tA, tB: mixSt.tB, shown: shownT(),
-                          vortices: vortexNow(), insWarp: mixSt.insWarp.slice() });
+                          insWarp: mixSt.insWarp.slice() });
   // (testing) one level of the shown volume ('vol') or nest i ('ins'), its first channel, after the blend's next step
   function _peek(which, i, k) {
     const t = which === 'vol' ? volTex : insTex[i], h = which === 'vol' ? head : head.insets[i];
@@ -1622,7 +1344,7 @@ const Render = (() => {
     for (let j = 0; j < out.length; j++) out[j] = px[4 * j];
     return { nx: h.nx, ny: h.ny, data: out };
   }
-  return { init, setVolume, setFar, farInfo: () => farV.map(s => s.head && { box: s.head.box, nx: s.head.nx, ny: s.head.ny, nz: s.head.nz }), setLes,lesReady: () => lesShader, blending: () => mixSt.f < 1, motion, _gb: () => gb, _peek,
+  return { init, setVolume, setFar, farInfo: () => farV.map(s => s.head && { box: s.head.box, nx: s.head.nx, ny: s.head.ny, nz: s.head.nz }), blending: () => mixSt.f < 1, motion, _gb: () => gb, _peek,
            _step: () => { mixSt.dirty = true; advance(geometry(), [0.5, 0.3, 0.81], 1, 1); }, setRoads, setTrees, setBuildings, frame, cloudBase, terrain, project, sample, head: () => head, box: () => box, gl: () => gl };
 })();
 window.Render = Render;

@@ -318,8 +318,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._poll(path[len("/poll"):])
             if path == "/api/state":
                 return self._state()
-            if path == "/api/tornado3d":
-                return self._tornado3d_get(q)
             if path == "/api/c/air":
                 return self._chase_air(q)
             if path == "/api/defaults":
@@ -874,16 +872,9 @@ class Handler(BaseHTTPRequestHandler):
             if far:
                 blob = volume.extract(fields, box, "cloud", patches, max_side=side, nz=nz, insets=False)
             elif q.get("wind") == "1":
-                # chase mode's moving clouds: the wind too, and the tornadoes now (from the last radar refresh on at
-                # their motion) to turn the cloud round
-                from . import radar as rd
-                tk = sim.tornadoes
-                age = max(0.0, t_now - tk.t) if tk.t is not None else 0.0
-                tors = [(c.id, c.x + c.vx * age, c.y + c.vy * age, c.vx, c.vy) for c in tk.items
-                        if c.found and c.seen >= rd.TORNADO_CONFIRM]
+                # chase mode's moving clouds: the model's own wind too, to carry the cloud along it between volumes
                 drift = getattr(sim.env, "storm_motion", None) if sim.env is not None else None
-                blob = volume.extract(fields, box, q.get("field", "dbz"), patches, wind=True, tors=tors, t=t_now,
-                                      drift=drift)
+                blob = volume.extract(fields, box, q.get("field", "dbz"), patches, wind=True, t=t_now, drift=drift)
             else:
                 blob = volume.extract(fields, box, q.get("field", "dbz"), patches)
         if blob is None:
@@ -891,20 +882,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, zlib.compress(blob, 1), "application/octet-stream", encoding="deflate",
                    headers={"X-Model-Time": f"{t_now:.3f}"})
 
-    def _tornado3d_put(self):
-        """A frame from the tornado model's bridge (lestornado.py): this PC only, binary, the newest kept."""
-        n = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(n) if n > 0 else b""
-        if not self._is_local():
-            return self._error(403, "the tornado stream is only taken from this PC")
-        from . import lestornado
-        try:
-            return self._json(lestornado.put(raw))
-        except (ValueError, KeyError, TypeError) as e:
-            return self._error(400, str(e))
-
     def _chase_air(self, q):
-        """The model's wind, gust, temperature and dew point at chase mode's cars: p=x,y;x,y (world m)."""
+        """The model's wind, gust, temperature and dew point at chase mode's cars: p=x,y;x,y (world m); grid=1: and
+        round the first, the model's 10 m wind on its finest grid (chase.air)."""
         from . import chase
         sim = APP.sim
         if sim is None or sim.engine is None:
@@ -916,19 +896,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._error(400, "p=x,y;x,y (world m)")
         with sim.lock:
-            out = chase.air(sim, pts)
+            out = chase.air(sim, pts, grid=q.get("grid") == "1")
         self._json({"t": float(sim.engine.t), "air": out})
-
-    def _tornado3d_get(self, q):
-        """The newest tornado frame for chase mode, or 204 (X-Tornado-State: same / off). No run lock needed."""
-        from . import lestornado
-        since = int(q["since"]) if str(q.get("since", "")).isdigit() else None
-        state, seq, blob = lestornado.get(since)
-        if blob is None:
-            return self._send(204, b"", "application/octet-stream",
-                              headers={"X-Tornado-State": state, "X-Tornado-Seq": str(seq)})
-        self._send(200, blob, "application/octet-stream", encoding="deflate",
-                   headers={"X-Tornado-State": state, "X-Tornado-Seq": str(seq)})
 
     def _pmw(self, path, q):
         """The PMWeather addon's live feed (pmw.py): targets as JSON, or a frame around x, y (m; none: the tornado
@@ -1149,8 +1118,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
         path = url.path
-        if path == "/api/tornado3d":
-            return self._tornado3d_put()
         body = self._body()
         if self._remote_refused(path):
             return None

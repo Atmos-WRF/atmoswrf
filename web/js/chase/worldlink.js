@@ -116,11 +116,10 @@ const WorldLink = (() => {
     };
   }
 
-  // the wind in the map's trees and grass: chase's { u, v (east, north m/s), gust, vort [{ x, y m, R, V }] }
+  // the wind in the map's trees and grass: chase's { u, v (east, north m/s: the model's at the camera), gust }
   function wind(tw) {
     if (!st.W || !st.W.wind) return;
-    const vort = (tw.vort || []).map(v => { const [x, z] = toW(v.x, v.y), s = scaleAt(v.x, v.y); return { x, z, R: v.R / s, V: v.V }; });
-    st.W.wind({ u: tw.u, z: -tw.v, gust: tw.gust, vort });
+    st.W.wind({ u: tw.u, z: -tw.v, gust: tw.gust });
   }
 
   return { st, start, update, moved, ground, collide, pushOut, drawer, wind, toW, fromW, ready: () => !!(st.W && st.ready && st.zOff !== null) };

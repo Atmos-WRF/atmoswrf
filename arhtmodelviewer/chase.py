@@ -240,10 +240,19 @@ def buildings(proj, box_km) -> dict:
 AIR_MAX = 16                     # points per request
 
 
-def air(sim, pts) -> list:
+# the model's 10 m wind round the first point (air(grid=True)): GRID_HALF cells each way of the finest grid holding
+# it, at most GRID_SPAN m across -- chase mode's car reads its wind from it every physics step (a tornado's winds
+# change over tens of metres: one point twice a second is too coarse and too late near one)
+GRID_HALF = 20
+GRID_SPAN = 2400.0
+
+
+def air(sim, pts, grid: bool = False) -> list:
     """The model's air at ground points pts [(x, y) world m]: per point {"u", "v" (m/s at 10 m, ground-relative),
     "gust" (m/s), "t" (deg C), "td" (dew point, deg C), "inside" (a storm patch holds it)}, the finest grid holding
-    the point (the tornado zoom where it is), the environment's lowest level elsewhere.  Caller holds sim.lock."""
+    the point (the tornado zoom where it is), the environment's lowest level elsewhere.  ``grid``: the first point's
+    also carries "grid" {x0, y0 (its first cell's centre, world m), dx, nx, ny, u, v (row by row from the south,
+    m/s at 10 m)}: that grid's lowest level round it, taken down to 10 m as the point is.  Caller holds sim.lock."""
     from .metars import GUST_MIN, GUST_SIGMA, _Station
     net, env = sim.metars, sim.env
     z0 = float(env.physics.z0)
@@ -275,6 +284,16 @@ def air(sim, pts) -> list:
         z1, zt = float(p.env.z_h[0]), float(p.env.z_w[-1])
         for k, (s, _, _) in enumerate(lst):
             vals[s.icao] = tuple(a[:6, k]) + (z1 * (1.0 - s.hg / zt), True)
+    near = None
+    if grid and sts and sts[0].icao in where:
+        p, j, i = where[sts[0].icao]
+        dx = float(p.env.grid.dx)
+        h = max(2, min(GRID_HALF, int(GRID_SPAN / (2.0 * dx))))
+        i0, i1 = max(0, i - h), min(p.rect.nx - 1, i + h)
+        j0, j1 = max(0, j - h), min(p.rect.ny - 1, j + h)
+        JJ, II = np.meshgrid(np.arange(j0, j1 + 1), np.arange(i0, i1 + 1), indexing="ij")
+        g = net._gather(p, JJ.ravel(), II.ravel(), net._fields)
+        near = (p, dx, i0, j0, i1 - i0 + 1, j1 - j0 + 1, g[0], g[1])
     rest = [s for s in sts if s.icao not in vals]
     if rest:
         u, v, th, qv, pp, tke = net._environment(rest)
@@ -293,8 +312,14 @@ def air(sim, pts) -> list:
         e = max(qv, 1e-7) * pp / (0.622 + max(qv, 1e-7)) / 100.0        # vapour pressure, hPa
         td = 243.5 * math.log(e / 6.112) / (17.67 - math.log(e / 6.112))
         ok = all(math.isfinite(c) for c in (u10, v10, gust, tk, td))
-        out.append({"u": round(u10, 2), "v": round(v10, 2), "gust": round(gust, 2), "t": round(tk - 273.15, 2),
-                    "td": round(min(td, tk - 273.15), 2), "inside": bool(inside)} if ok else None)
+        d = {"u": round(u10, 2), "v": round(v10, 2), "gust": round(gust, 2), "t": round(tk - 273.15, 2),
+             "td": round(min(td, tk - 273.15), 2), "inside": bool(inside)} if ok else None
+        if d is not None and near is not None and s is sts[0]:
+            p, dx, i0, j0, nx, ny, gu, gv = near
+            gu, gv = np.nan_to_num(gu * fac), np.nan_to_num(gv * fac)          # down to 10 m as the point is
+            d["grid"] = {"x0": p.world_x0() + (i0 + 0.5) * dx, "y0": p.world_y0() + (j0 + 0.5) * dx, "dx": dx,
+                         "nx": int(nx), "ny": int(ny), "u": np.round(gu, 2).tolist(), "v": np.round(gv, 2).tolist()}
+        out.append(d)
     return out
 
 
@@ -307,8 +332,7 @@ _NEXT = [1]
 STALE = 6.0                                     # s without a sync: gone from the others' lists
 # what a joined page on another computer may read (GET) with its token while hosting is on
 READ = ("/api/state", "/api/pmw/targets", "/api/c/air", "/api/volume", "/api/volume/times", "/api/volume/roads",
-        "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/frames", "/api/frame", "/api/ppi",
-        "/api/tornado3d")
+        "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/frames", "/api/frame", "/api/ppi")
 # (and the detailed map's module, tile worker and landmarks, and the cars' models)
 STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|colors)\.js|static/js/chase/[a-z0-9_]+\.js"
                     r"|static/js/chase/world/(world|tileworker)\.js|static/js/chase/world/landmarks\.json"

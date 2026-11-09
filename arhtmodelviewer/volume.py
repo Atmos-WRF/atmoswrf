@@ -32,13 +32,6 @@ INSET_SIDE = 160
 # and "no data"), so the page can carry the cloud along the wind between two volumes instead of fading one into the next
 WIND_STRIDE = 2
 WIND_SCALE = 2.0                 # 0.5 m/s steps, +-63.5 m/s
-# and the tornadoes in the box, each as a vortex the page turns the cloud round: its centre now, its motion and the
-# model's own azimuthal-mean tangential wind about it (VORTEX_RADII radii out to VORTEX_REACH m, averaged from
-# VORTEX_LOW to VORTEX_TOP m above the ground), from which its peak and the radius of that peak
-VORTEX_REACH = 2000.0
-VORTEX_RADII = 80
-VORTEX_LOW, VORTEX_TOP = 100.0, 1500.0
-VORTEX_MIN = 12.0                # m/s: weaker than this, no vortex
 
 
 def levels_for(dx: float) -> tuple:
@@ -95,10 +88,6 @@ def _sample(f, name: str, X, Y, zv, patch=None):
         a = f.wc
     elif name in ("cloud", "precip"):
         a = _species(patch, CLOUD_SPECIES if name == "cloud" else PRECIP_SPECIES) if patch is not None else None
-        if name == "cloud" and patch is not None and patch.env.grid.dx <= 200.0:
-            # a fine nest: the nearly saturated air of a vortex's pressure drop shows as cloud (the funnel)
-            ny_, nx_ = patch.state.p.shape[1:]
-            a = _near_saturation(patch, (0, ny_, 0, nx_), a)
         if a is None:
             return None
     elif name in ("wu", "wv", "ww"):
@@ -164,79 +153,6 @@ def _wind_codes(fields, patches, box, nx, ny, ztop, nz):
     return cp.asnumpy(cp.stack(codes, axis=-1)).tobytes(), [wx, wy, wz]
 
 
-def vortices(fields: dict, patches: dict | None, tors) -> list:
-    """The tornadoes ``tors`` [(id, x m, y m, vx, vy m/s)] as vortices: each one's peak azimuthal-mean tangential wind
-    (m/s, + counter-clockwise) and its radius (m), from the finest grid holding it; the weak ones left out."""
-    import cupy as cp
-    out = []
-    na = 16
-    th = np.arange(na) * (2.0 * math.pi / na)
-    for tid, x, y, vx, vy in tors:
-        hold = [f for f in fields.values() if f.x0 < x < f.x0 + f.nx * f.dx and f.y0 < y < f.y0 + f.ny * f.dx]
-        if not hold:
-            continue
-        f = min(hold, key=lambda f: f.dx)
-        p = _live_patch(patches, f.patch_id)
-        rr = np.linspace(0.5 * f.dx, VORTEX_REACH, VORTEX_RADII)
-        X, Y = x + rr[:, None] * np.cos(th), y + rr[:, None] * np.sin(th)          # (radii, azimuths)
-        g = ground(f, np.array([[x]]), np.array([[y]])) if getattr(f, "hgt", None) is not None else None
-        g0 = 0.0 if g is None or bool(cp.isnan(g).any()) else float(g[0, 0])
-        zv = g0 + np.linspace(VORTEX_LOW, VORTEX_TOP, 8)
-        u, v = _sample(f, "wu", X, Y, zv, p), _sample(f, "wv", X, Y, zv, p)
-        if u is None or v is None:
-            continue
-        s, c = cp.asarray(np.sin(th), cp.float32), cp.asarray(np.cos(th), cp.float32)
-        vt = cp.asnumpy(cp.nanmean(v * c - u * s, axis=(0, 2)))                   # (radii,)
-        if not np.isfinite(vt).any():
-            continue
-        i = int(np.nanargmax(np.abs(vt)))
-        if abs(vt[i]) < VORTEX_MIN:
-            continue
-        out.append({"id": tid, "x": round(float(x), 1), "y": round(float(y), 1), "vx": round(float(vx), 2),
-                    "vy": round(float(vy), 2), "v": round(float(vt[i]), 1), "r": round(max(float(rr[i]), 1.5 * f.dx), 1),
-                    "dx": f.dx})
-    return out
-
-
-HAZE_RH = 0.95                   # the tornado view: relative humidity where air starts to look like cloud
-HAZE_GKG = 0.25                  # g/kg of "cloud" it shows as at saturation
-# A 30-50 m nest still under-resolves a tornado's core: its peak winds, and so its pressure drop (~V^2), come out
-# lower than the real vortex's, and the air drawn into it is not expanded and cooled enough to condense.  The
-# vortex's own drop -- the pressure below the mean of its surroundings VORTEX_M across, so the mesocyclone, the
-# cloud base and the rest of the storm are left as they are -- counts (1 + VORTEX_GAIN) x for the condensation.
-VORTEX_GAIN = 0.5
-VORTEX_M = 600.0                 # m: the surroundings a tornado's drop is measured against
-
-
-def _near_saturation(patch, win, cloud):
-    """The tornado view's cloud plus the air that is nearly saturated: a vortex's pressure drop cools the air
-    it draws in toward saturation, which is how a real funnel and wall cloud condense below the storm's base.
-    The model only condenses at 100 %, and a ~100 m grid's vortex rarely gets there, so the air from HAZE_RH
-    up is drawn as thin cloud (HAZE_GKG at saturation): the lowering and the funnel where the vortex is.
-    On fine grids a tornado's own drop counts a little more (VORTEX_GAIN): the air in it is taken on, dry
-    adiabatically, to that lower pressure before its saturation is reckoned."""
-    import cupy as cp
-    st = patch.state
-    j0, j1, i0, i1 = win
-    thb = st.thb if st.thb.ndim == 3 else st.thb[:, None, None]
-    if thb.ndim == 3 and thb.shape[-1] > 1:
-        thb = thb[:, j0:j1, i0:i1]
-    p = st.p[:, j0:j1, i0:i1].astype(cp.float32)
-    T = (thb + st.thp[:, j0:j1, i0:i1]).astype(cp.float32) * (p / 1.0e5) ** 0.2857
-    n = int(round(VORTEX_M / patch.env.grid.dx)) | 1
-    if VORTEX_GAIN > 0.0 and n >= 5 and min(p.shape[1:]) >= n:
-        from cupyx.scipy.ndimage import uniform_filter
-        drop = cp.minimum(p - uniform_filter(p, size=(1, n, n), mode="nearest"), 0.0)     # Pa, <= 0
-        pe = cp.maximum(p + VORTEX_GAIN * drop, 0.5 * p)
-        T = T * (pe / p) ** 0.2857
-        p = pe
-    es = 611.2 * cp.exp(17.67 * (T - 273.15) / (T - 29.65))              # Bolton, over water
-    qs = 0.622 * es / cp.maximum(p - es, 1.0)
-    rh = st.qv[:, j0:j1, i0:i1].astype(cp.float32) / qs
-    haze = HAZE_GKG * cp.clip((rh - HAZE_RH) / (1.0 - HAZE_RH), 0.0, 1.0) ** 2
-    return haze if cloud is None else cloud + haze
-
-
 def _live_field(patch, name: str, win):
     """``name`` on the patch's mass points in its local cells ``win`` (j0, j1, i0, i1), from its state now."""
     import cupy as cp
@@ -244,10 +160,7 @@ def _live_field(patch, name: str, win):
     j0, j1, i0, i1 = win
     if name in ("cloud", "precip"):
         a = _species(patch, CLOUD_SPECIES if name == "cloud" else PRECIP_SPECIES)
-        a = None if a is None else a[:, j0:j1, i0:i1]
-        if name == "cloud":
-            a = _near_saturation(patch, (j0, j1, i0, i1), a)
-        return a
+        return None if a is None else a[:, j0:j1, i0:i1]
     if name == "w":
         return 0.5 * (st.w[:-1, j0:j1, i0:i1] + st.w[1:, j0:j1, i0:i1])
     if name == "pp":                  # from each level's mean over the window: the vortex's own drop, in hPa
@@ -397,13 +310,13 @@ def _insets_live(fields, box, name, res, patches, winds=None):
 
 
 def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None, wind: bool = False,
-            tors=None, t: float | None = None, drift=None, max_side: int = MAX_SIDE, nz: int = NZ,
+            t: float | None = None, drift=None, max_side: int = MAX_SIDE, nz: int = NZ,
             insets: bool = True) -> bytes | None:
     """The volume of ``name`` in box (x0, y0, x1, y1, ground m) from the run's radar fields (and, for "cloud",
     ``patches``: the patches by id): a JSON header (dims, box, heights, scale, channels) then nz * ny * nx points
     (x fastest) of ``channels`` bytes.  None if no patch overlaps the box.  ``wind``: the wind too (_wind_codes;
-    the header's "wind": its size, scale), with the vortices of the tornadoes ``tors`` [(id, x, y, vx, vy)] in the
-    box (vortices()), the model time t s and the storm's motion ``drift`` (m/s) in the header.  ``max_side``, ``nz``:
+    the header's "wind": its size, scale), with the model time t s and the storm's motion ``drift`` (m/s) in the
+    header.  ``max_side``, ``nz``:
     the grid's points along the longer side and its levels; ``insets`` False: no nests (chase mode's far cloud,
     extract_far), and no grid finer than the box's own spacing read (its parent has the cloud at that scale)."""
     import cupy as cp
@@ -465,9 +378,8 @@ def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None, w
     wb, wd = _wind_codes(list(fields.values()), patches, (x0, y0, x1, y1), nx, ny, ZTOP, NZ)
     iw: list = []
     insets = _insets_live(fields, (x0, y0, x1, y1), name, res, patches, iw)
-    inside = [tr for tr in (tors or []) if x0 <= tr[1] <= x1 and y0 <= tr[2] <= y1]
     head.update({"wind": {"dims": wd, "scale": WIND_SCALE, "offset": 128.0}, "t": t,
-                 "vortices": vortices(fields, patches, inside), "drift": list(drift or (0.0, 0.0))})
+                 "drift": list(drift or (0.0, 0.0))})
     return _pack(name, head, main, insets, wb + b"".join(b for _, b in iw))
 
 

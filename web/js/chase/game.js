@@ -239,7 +239,7 @@ const Chase = (() => {
         const gap = les.head ? Math.max(50, Math.min(1000, now - les.at)) : 0;
         Render.setLes(f.header, f.media, f.vel, gap);
         if (!les.head) say('The tornado model is live here', 2500);
-        les.head = f.header; les.at = now;
+        les.head = f.header; les.at = now; les.vel = f.vel;
         les.seq = +(r.headers.get('X-Tornado-Seq') || 0);
       } else if (r.status === 204 && r.headers.get('X-Tornado-State') === 'off' && les.head) {
         les.head = null; Render.setLes(null);
@@ -304,6 +304,90 @@ const Chase = (() => {
     wx.eye = view.eye.slice();
     return wx;
   }
+  // ---------------------------------------------------------------- the wind on the car (and in the trees)
+  // The tornadoes near the car as vortices: { x, y (now, world m), vx, vy (motion m/s), V (peak tangential wind m/s,
+  // + counter-clockwise), R (its radius m), les (the LES tornado stands on it) }.  Centre, motion, spin and radius
+  // from the model's own vortices (render.js, the volume's vortices()) where it has one; the peak wind the stronger of
+  // that and the tornado's rated wind (its track's estimate, or its EF): the model's grid under-resolves the core.
+  function vortexList() {
+    const mv = (Render.motion && Render.motion().vortices) || [], out = [], used = new Set();
+    for (const t of tornadoes()) {
+      const h = mv.find(v => !used.has(v) && Math.hypot(v.x - t.x, v.y - t.y) < 3000);
+      if (h) used.add(h);
+      const Vr = t.wind || [32, 43, 55, 67, 80, 95][Math.max(0, t.ef || 0)];
+      const V = Math.min(110, Math.max(Math.abs(h ? h.v : 0), Vr));
+      out.push({ x: h ? h.x : t.x, y: h ? h.y : t.y, vx: h ? h.vx || 0 : 0, vy: h ? h.vy || 0 : 0, V: (h && h.v < 0 ? -1 : 1) * V,
+                 R: Math.max(40, Math.min(450, h && h.r ? h.r : 25 + 1.8 * V)) });
+    }
+    for (const h of mv) if (!used.has(h) && Math.abs(h.v) >= 30) out.push({ x: h.x, y: h.y, vx: h.vx || 0, vy: h.vy || 0, V: h.v, R: Math.max(40, h.r || 100) });
+    // the LES tornado: its own wind replaces the profile of the vortex it stands on
+    const L = lesView();
+    if (L && les.vel) {
+      let b = null, bd = 3000;
+      for (const v of out) { const d = Math.hypot(v.x - L.x, v.y - L.y); if (d < bd) { bd = d; b = v; } }
+      if (!b) out.push(b = { x: L.x, y: L.y, vx: les.head.vx || 0, vy: les.head.vy || 0, V: 40, R: 120 });
+      b.les = L;
+    }
+    if (st.fakeVortex) out.push(...st.fakeVortex());          // testing: Chase.st.fakeVortex = () => [{ x, y, vx, vy, V, R }]
+    return out;
+  }
+  // the LES tornado's own wind at a point (east, north, up m/s), from its frame's wind volume, or null outside it
+  function lesWind(L, x, y, z) {
+    const h = les.head, vel = les.vel;
+    if (!h || !vel || !h.vtex || !h.size) return null;
+    const [sx, sy, sz] = h.size, [vw, vh, vd] = h.vtex;
+    const tx = (x - L.x) / sx + 0.5, ty = (z - L.ground) / sy, tz = (y - L.y) / sz + 0.5;
+    if (!(tx > 0 && tx < 1 && ty >= 0 && ty < 1 && tz > 0 && tz < 1)) return null;
+    const fx = Math.max(0, tx * vw - 0.5), fy = Math.max(0, ty * vh - 0.5), fz = Math.max(0, tz * vd - 0.5);
+    const i0 = Math.min(vw - 1, Math.floor(fx)), j0 = Math.min(vh - 1, Math.floor(fy)), k0 = Math.min(vd - 1, Math.floor(fz));
+    const i1 = Math.min(vw - 1, i0 + 1), j1 = Math.min(vh - 1, j0 + 1), k1 = Math.min(vd - 1, k0 + 1);
+    const a = fx - i0, b = fy - j0, c = fz - k0, out = [0, 0, 0];
+    for (const [k, wk] of [[k0, 1 - c], [k1, c]]) for (const [j, wj] of [[j0, 1 - b], [j1, b]]) for (const [i, wi] of [[i0, 1 - a], [i1, a]]) {
+      const o = ((k * vh + j) * vw + i) * 4, w = wi * wj * wk;
+      out[0] += w * vel[o]; out[1] += w * vel[o + 1]; out[2] += w * vel[o + 2];
+    }
+    const dec = q => (q / 255 * 2 - 1) * h.velMax;
+    return [dec(out[0]), dec(out[2]), dec(out[1])];            // the model's axes are east, up, north
+  }
+  const smooth = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  // The wind at a point (world m): the model's 10 m wind, gusting between its mean and its gusts, and round each
+  // tornado near it its vortex -- Rankine in the core (solid-body turning out to R), falling off as r^-0.6 outside
+  // (a real tornado's winds reach out further than 1/r), turning through suction-vortex gusts near the core, air
+  // spiralling in along the ground, an updraft ring at the core's edge, carried along at the storm's motion -- or the
+  // LES tornado's own wind where it streams.  The model's air is damped near the vortex (its grid already holds a
+  // smeared share of it).  Every physics step for the car (carphys windAt).
+  function windAt(x, y, z) {
+    const now = performance.now(), t = now / 1000, g = footWind(now);
+    let env = 1, vu = 0, vv = 0, w = 0;
+    const zg = z - Render.terrain(x, y);
+    for (const o of st.vort || []) {
+      // the rating is the peak wind over the ground: the spin is that less the storm's motion and the inflow
+      const dx = x - o.x, dy = y - o.y, d = Math.hypot(dx, dy), R = o.R, V0 = Math.abs(o.V);
+      const A = Math.max(0.4 * V0, V0 - Math.hypot(o.vx, o.vy)) / 1.08;
+      if (d > 20 * R && !o.les) continue;
+      env = Math.min(env, 0.35 + 0.65 * smooth(R, 6 * R, d));
+      if (o.les) {
+        const lw = lesWind(o.les, x, y, z);
+        if (lw) { vu += lw[0] + o.vx; vv += lw[1] + o.vy; w += lw[2]; continue; }
+      }
+      const r = Math.max(d, 1), cx = dx / r, cy = dy / r;
+      const vt = (r < R ? A * r / R : A * Math.pow(R / r, 0.6)) * (1 - smooth(12 * R, 20 * R, d));
+      const th = Math.atan2(dy, dx);
+      const gust = r < 3 * R ? 1 + 0.2 * (0.6 * Math.sin(3 * th - 2.4 * t + o.x * 1e-3) + 0.4 * Math.sin(5.3 * t + r * 0.02)) : 1;
+      const tang = vt * gust * (o.V < 0 ? -1 : 1), ur = -0.4 * vt * Math.exp(-Math.max(0, zg) / 150);
+      const carry = smooth(8 * R, 3 * R, d);
+      vu += -cy * tang + cx * ur + o.vx * carry;
+      vv += cx * tang + cy * ur + o.vy * carry;
+      w += 0.5 * A * Math.exp(-((((r / R) - 0.9) / 0.7) ** 2)) * (1 - Math.exp(-(Math.max(0, zg) + 2) / 15));
+    }
+    return [g[0] * env + vu, g[1] * env + vv, w];
+  }
+  // the trees' wind (render.js, world.js): the air at the camera, the nearest two vortices
+  function treeWind() {
+    const W = Math.hypot(wx.u, wx.v) || 1;
+    return { u: wx.u, v: wx.v, gust: Math.max(1, wx.gust / W), vort: (st.vort || []).slice(0, 2).map(o => ({ x: o.x, y: o.y, R: o.R, V: o.V })) };
+  }
+
   // the rain and snow for Render.frame, and the sound
   function precipView(view) {
     const I = wx.rainI;
@@ -493,6 +577,7 @@ const Chase = (() => {
     }
     st.car = new CarPhys.Car(st.kind, ground);
     st.car.solid = Scenery.solid;
+    st.car.windAt = windAt;
     st.extraCars = remoteCars; st.extraMap = remoteMap;
     st.car.reset(sx, sy, 0);
     st.spawnHint = { x: sx, y: sy, yaw: Math.atan2(s.y - sy, s.x - sx), what: s.what };
@@ -701,7 +786,13 @@ const Chase = (() => {
     const pr = Render.sample ? Render.sample(c.p[0], c.p[1]) : 0;
     st.rain += (pr - st.rain) * Math.min(1, dt * 0.5);
     st.wet = Math.max(st.wet - dt / 600, Math.min(1, st.rain / 0.6));
+    st.vort = vortexList();
     if (st.spawned) c.update(dt);
+    // rolled over (on its side or roof, stopped): R puts it back on its wheels on the road
+    if (st.spawned && !st.foot && c.upright < 0.35 && c.speed < 3) {
+      st.rolledT = (st.rolledT || 0) + dt;
+      if (st.rolledT > 2 && !st.rolledSaid) { st.rolledSaid = true; say('Rolled over by the wind! Press R to get back on your wheels', 6000); }
+    } else if (c.upright > 0.8) { st.rolledT = 0; st.rolledSaid = false; }
     if (!isFinite(c.p[0]) || c.p[2] < -50) resetCar();
     // on foot: you, on the same ground, in the model's wind, against walls, trunks and the car
     if (st.foot) {
@@ -729,8 +820,10 @@ const Chase = (() => {
     if (st.foot && !(st.cam.mode !== 'chase')) cars.push({ parts: st.foot.figure(st.color) });   // (first person: not yourself)
     if (st.extraCars) cars.push(...st.extraCars());
     const sun = sunDir();
+    const tw = treeWind();
+    if (detailed() && WorldLink.ready() && WorldLink.wind) WorldLink.wind(tw);
     const world = detailed() && WorldLink.ready() ? WorldLink.drawer(view, sun) : null;
-    const fr = Render.frame({ ...view, sun, world, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, les: lesView(), lesTubes: st.lesTubes, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view) }, cars);
+    const fr = Render.frame({ ...view, sun, world, treeWind: tw, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, les: lesView(), lesTubes: st.lesTubes, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view) }, cars);
     hud(fr, view);
     requestAnimationFrame(tick);
   }

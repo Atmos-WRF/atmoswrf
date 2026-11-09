@@ -4092,6 +4092,63 @@ function target(w, h) {
   rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, depthTexture: depth, depthBuffer: true });
   return rt;
 }
+// ---- the wind in the trees, grass and crops (chase mode's, through ChaseWorld.wind): each one leans downwind from
+// its foot (bend ~ W^2: 1 % of its height at 10 m/s, 10 % at 30, 40 % at 60), sways and shivers about it, more in the
+// gusts; round a tornado (up to two: centre, radius, peak wind) in its turning wind, violently.  A few instructions
+// a vertex on the GPU, added to the materials' own hooks (their gentle idle sway stays).
+const windU = { value: new THREE.Vector3(0, 0, 1) };              // x, z m/s (this map's axes), gust factor
+const vorU = { value: [new THREE.Vector4(0, 0, 100, 0), new THREE.Vector4(0, 0, 100, 0)] };   // x, z, R m, V (+ ccw)
+const vorNU = { value: 0 }, windTU = { value: 0 };
+const SWAY_GLSL = `
+uniform vec3 uWind; uniform vec4 uVor[2]; uniform int uVorN; uniform float uWT;
+vec2 windAtW(vec2 xz) {
+  vec2 w = uWind.xy;
+  for (int i = 0; i < 2; i++) {
+    if (i >= uVorN) break;
+    vec2 d = xz - uVor[i].xy; float r = max(length(d), 1.0), R = uVor[i].z, A = abs(uVor[i].w);
+    if (r > 20.0 * R) continue;
+    float vt = (r < R ? A * r / R : A * pow(R / r, 0.6)) * (1.0 - smoothstep(12.0 * R, 20.0 * R, r));
+    vec2 c = d / r;                                             // (x east, z south: counter-clockwise from above is (c.y, -c.x))
+    w = w * (0.35 + 0.65 * smoothstep(R, 6.0 * R, r)) + vec2(c.y, -c.x) * vt * sign(uVor[i].w + 1e-6) - c * 0.4 * vt;
+  }
+  return w;
+}
+vec2 swayW(vec2 xz, float h, float f, float sd) {
+  vec2 w = windAtW(xz); float W = length(w);
+  if (W < 0.3) return vec2(0.0);
+  vec2 dir = w / W;
+  float lean = min(0.00011 * W * W, 0.42), fr = 0.35 + 0.012 * W;
+  float osc = sin(uWT * 6.2832 * fr + sd * 40.0) * (0.25 + 0.35 * clamp((W - 15.0) / 40.0, 0.0, 1.0));
+  float gust = (uWind.z - 1.0) * max(0.0, sin(uWT * 0.9 + xz.x * 0.01) * sin(uWT * 2.3 + xz.y * 0.013 + 1.0));
+  vec2 perp = vec2(-dir.y, dir.x) * sin(uWT * 6.2832 * 2.7 * fr + sd * 17.0) * 0.12 * lean;
+  return (dir * lean * (1.0 + 0.6 * gust) * (1.0 + osc) + perp) * h * f * f;
+}
+`;
+// three's project_vertex with the sway added after the instance's own transform (f: the vertex's height share)
+const projectSway = f => `
+vec4 mvPosition = vec4( transformed, 1.0 );
+#ifdef USE_INSTANCING
+  mvPosition = instanceMatrix * mvPosition;
+  {
+    float hh = length(instanceMatrix[1].xyz); vec3 ip0 = instanceMatrix[3].xyz;
+    vec2 dsw = swayW(ip0.xz, hh, clamp(${f}, 0.0, 1.2), fract(ip0.x * 0.137 + ip0.z * 0.071));
+    mvPosition.xz += dsw; mvPosition.y -= 0.5 * dot(dsw, dsw) / max(hh, 0.5);
+  }
+#endif
+mvPosition = modelViewMatrix * mvPosition;
+gl_Position = projectionMatrix * mvPosition;
+`;
+for (const mat of [treeMat, farMat, plantMat]) {
+  const own = mat.onBeforeCompile, key = mat.customProgramCacheKey ? mat.customProgramCacheKey() : 'plant';
+  mat.onBeforeCompile = (sh, r) => {
+    if (own) own.call(mat, sh, r);
+    Object.assign(sh.uniforms, { uWind: windU, uVor: vorU, uVorN: vorNU, uWT: windTU });
+    sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\n' + SWAY_GLSL)
+      .replace('#include <project_vertex>', projectSway('position.y'));
+  };
+  mat.customProgramCacheKey = () => key + '-wind1';
+  mat.needsUpdate = true;
+}
 const ChaseWorld = {
   START_LAT, START_LON, TILE_SIZE, SURF, SURF_NAMES, LAND, LAND_SURFACE, CLASS_LIST, SEG,
   toLatLon, fromLatLon, scene, camera, renderer, V, tiles,
@@ -4185,6 +4242,14 @@ const ChaseWorld = {
     return hit ? [mx, mz] : null;
   },
   nearestRoad,
+  // the wind for the trees, grass and crops: { u, z m/s (this map's axes), gust (factor), vort: [{ x, z, R, V }] }
+  wind(o) {
+    windU.value.set(o.u || 0, o.z || 0, o.gust || 1);
+    const vs = (o.vort || []).slice(0, 2);
+    vs.forEach((v, i) => vorU.value[i].set(v.x, v.z, v.R, v.V));
+    vorNU.value = vs.length;
+    windTU.value = performance.now() / 1000 % 3600;
+  },
   // the landmark close by (within 400 m), its name
   landmarkNear: () => (lmNear ? lmNear.name : null),
 };

@@ -182,7 +182,33 @@ const Render = (() => {
   layout(location = 0) in vec3 p; layout(location = 1) in vec3 n; layout(location = 2) in float part;
   layout(location = 3) in vec4 a; layout(location = 4) in vec2 b;
   uniform mat4 VP; uniform vec3 org; uniform float s;
+  // the wind in the trees: uWind (u, v m/s, gust factor), up to two vortices uVor (x, y m from the trees' origin,
+  // radius m, peak wind m/s + counter-clockwise), uTime s.  A tree leans downwind (bend ~ W^2: 1 % of its height at
+  // 10 m/s, 10 % at 30, 40 % at 60), sways and shivers about it, more in the gusts; near a tornado, violently.
+  uniform vec3 uWind; uniform vec4 uVor[2]; uniform int uVorN; uniform float uTime;
   out vec3 wpos; out vec3 nw; out vec3 col;
+  vec2 windHere(vec2 xy) {
+    vec2 w = uWind.xy;
+    for (int i = 0; i < 2; i++) {
+      if (i >= uVorN) break;
+      vec2 d = xy - uVor[i].xy; float r = max(length(d), 1.0), R = uVor[i].z, A = abs(uVor[i].w);
+      if (r > 20.0 * R) continue;
+      float vt = (r < R ? A * r / R : A * pow(R / r, 0.6)) * (1.0 - smoothstep(12.0 * R, 20.0 * R, r));
+      vec2 c = d / r;
+      w = w * (0.35 + 0.65 * smoothstep(R, 6.0 * R, r)) + vec2(-c.y, c.x) * vt * sign(uVor[i].w + 1e-6) - c * 0.4 * vt;
+    }
+    return w;
+  }
+  vec2 swayAt(vec2 xy, float h, float f, float sd) {
+    vec2 w = windHere(xy); float W = length(w);
+    if (W < 0.3) return vec2(0.0);
+    vec2 dir = w / W;
+    float lean = min(0.00011 * W * W, 0.42), fr = 0.35 + 0.012 * W;
+    float osc = sin(uTime * 6.2832 * fr + sd * 40.0) * (0.25 + 0.35 * clamp((W - 15.0) / 40.0, 0.0, 1.0));
+    float gust = (uWind.z - 1.0) * max(0.0, sin(uTime * 0.9 + xy.x * 0.01) * sin(uTime * 2.3 + xy.y * 0.013 + 1.0));
+    vec2 perp = vec2(-dir.y, dir.x) * sin(uTime * 6.2832 * 2.7 * fr + sd * 17.0) * 0.12 * lean;
+    return (dir * lean * (1.0 + 0.6 * gust) * (1.0 + osc) + perp) * h * f * f;
+  }
   void main() {
     float h = a.w, cr = b.x, sd = b.y;
     vec3 local, nn;
@@ -201,6 +227,8 @@ const Render = (() => {
     mat2 rot = mat2(c, si, -si, c);
     local.xy = rot * local.xy; nn.xy = rot * nn.xy;
     nw = nn;
+    vec2 sw = swayAt(a.xy, h, clamp(local.z / max(h, 0.5), 0.0, 1.2), sd);
+    local.xy += sw; local.z -= 0.5 * dot(sw, sw) / max(h, 0.5);
     wpos = org + (a.xyz + local) * s;
     gl_Position = VP * vec4(wpos, 1.0);
   }`;
@@ -1317,7 +1345,7 @@ const Render = (() => {
     gl.depthFunc(gl.LESS);
   }
 
-  function drawGeometry(G, VP, eye, sun, cars, wet, showTrees, wimg, fov) {
+  function drawGeometry(G, VP, eye, sun, cars, wet, showTrees, wimg, fov, tw) {
     gl.bindFramebuffer(gl.FRAMEBUFFER, gb.fbo);
     gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
     gl.viewport(0, 0, gb.w, gb.h);
@@ -1342,6 +1370,11 @@ const Render = (() => {
       gl.uniformMatrix4fv(t.VP, false, VP);
       gl.uniform3f(t.org, ...toBox(G, [trees.origin[0], trees.origin[1], 0]));
       gl.uniform1f(t.s, s); gl.uniform3f(t.eye, ...eye); gl.uniform3f(t.sunDir, ...sun);
+      const vo = (tw && tw.vort) || [], VO = new Float32Array(8);
+      vo.slice(0, 2).forEach((v, i) => VO.set([v.x - trees.origin[0], v.y - trees.origin[1], v.R, v.V], 4 * i));
+      gl.uniform3f(t.uWind, tw ? tw.u : 0, tw ? tw.v : 0, tw ? tw.gust : 1);
+      gl.uniform4fv(t.uVor, VO); gl.uniform1i(t.uVorN, Math.min(2, vo.length));
+      gl.uniform1f(t.uTime, performance.now() / 1000 % 3600);
       gl.bindVertexArray(trees.vao);
       gl.bindBuffer(gl.ARRAY_BUFFER, trees.inst);
       gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 24, 0); gl.vertexAttribPointer(4, 2, gl.FLOAT, false, 24, 16);
@@ -1436,7 +1469,7 @@ const Render = (() => {
       try { wimg = view.world(W, H); } catch (e) { console.warn('chase: detailed map', e); wimg = null; }
     }
     targets(W, H);
-    drawGeometry(G, VPr, eye, view.sun, cars, view.wet, view.trees !== false, wimg, view.fov);
+    drawGeometry(G, VPr, eye, view.sun, cars, view.wet, view.trees !== false, wimg, view.fov, view.treeWind);
     advance(G, view.sun, view.density, view.rain);
     if (view.far) advanceFar(view.sun, view.density, view.rain);
     const les = lesHead && view.les ? view.les : null;

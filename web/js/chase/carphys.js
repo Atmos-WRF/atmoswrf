@@ -20,21 +20,21 @@
       wheelR: 0.38, wheelI: 1.9, rest: 0.34, travel: 0.17, k: [56000, 52000], zeta: 0.32, arb: [30000, 13000],
       maxSteer: 0.58, steerRate: 2.6, idle: 750, redline: 5900, peakT: 560, peakRpm: 4000, engI: 0.22,
       gears: [4.03, 2.36, 1.53, 1.15, 0.85, 0.67], final: 3.42, rev: 3.6, split: 0.4, lsd: 60,
-      brake: 2900, brakeBias: 0.64, cdA: 1.2, cyA: 6.5, clA: 2.2, ground: 0.24, tire: 1.15,
+      brake: 2900, brakeBias: 0.64, cdA: 1.2, cyA: 6.5, clA: 2.2, cy: 0.8, cls: 0.33, ground: 0.24, tire: 1.15,
     },
     sedan: {
       name: 'Sedan', mass: 1480, dims: [4.75, 1.84, 1.45], cgH: 0.53, wheelbase: 2.78, cgFront: 1.10, track: 1.58,
       wheelR: 0.33, wheelI: 1.2, rest: 0.30, travel: 0.13, k: [40000, 34000], zeta: 0.34, arb: [22000, 9000],
       maxSteer: 0.62, steerRate: 2.9, idle: 700, redline: 6600, peakT: 340, peakRpm: 4600, engI: 0.15,
       gears: [3.54, 2.06, 1.40, 1.03, 0.84, 0.69], final: 3.62, rev: 3.3, split: 1.0, lsd: 0,
-      brake: 2100, brakeBias: 0.68, cdA: 0.68, cyA: 4.6, clA: 1.4, ground: 0.15, tire: 1.15,
+      brake: 2100, brakeBias: 0.68, cdA: 0.68, cyA: 4.6, clA: 1.4, cy: 0.66, cls: 0.26, ground: 0.15, tire: 1.15,
     },
     truck: {
       name: 'Heavy pickup', mass: 5200, dims: [5.9, 2.25, 2.55], cgH: 0.95, wheelbase: 3.6, cgFront: 1.7, track: 1.9,
       wheelR: 0.46, wheelI: 4.5, rest: 0.40, travel: 0.22, k: [130000, 150000], zeta: 0.38, arb: [80000, 60000],
       maxSteer: 0.55, steerRate: 2.0, idle: 650, redline: 4200, peakT: 1350, peakRpm: 2400, engI: 0.6,
       gears: [4.7, 2.21, 1.53, 1.0, 0.76, 0.67], final: 4.1, rev: 4.3, split: 0.35, lsd: 250,
-      brake: 7500, brakeBias: 0.6, cdA: 2.9, cyA: 13, clA: 1.5, ground: 0.34, tire: 1.1,
+      brake: 7500, brakeBias: 0.6, cdA: 2.9, cyA: 13, clA: 1.5, cy: 0.7, cls: 0.22, ground: 0.34, tire: 1.1,
     },
   };
 
@@ -72,6 +72,7 @@
       this.kind = SPECS[kind] ? kind : 'suv';
       this.ground = ground;                     // (x, y) -> { h, n: [nx, ny, nz], mu, crr, rough, C, kpk, apk, name }
       this.wind = [0, 0, 0];                    // the air's motion here (m/s, world)
+      this.windAt = null;                       // (x, y, z) -> [u, v, w] m/s: the wind at the car, every step (game.js)
       const L = S.wheelbase, a = S.cgFront, b = L - a, m = S.mass;
       const [dl, dw, dh] = S.dims;
       this.I = [m * (dw * dw + dh * dh) / 14, m * (dl * dl + dh * dh) / 13, m * (dl * dl + dw * dw) / 13];
@@ -281,12 +282,28 @@
         if (fx || fy) apply(add(scl(fwd, fx), scl(side, fy)), c);
       }
 
-      // ---- the air: drag, side force (high and behind the middle) and lift, from the air's motion past the car
+      // ---- the air, from its motion past the car (the wind from windAt every step: the model's, a tornado's):
+      //  drag on the front; a side force on the whole side (a box broadside: Cy ~1), acting at the side's middle --
+      //  above the centre of gravity, so a crosswind leans the car onto its downwind wheels; lift, from the speed
+      //  along it and the crosswind over the roof (Cl ~0.6), centred toward the windward side; an updraft lifting
+      //  the floor.  A broadside SUV starts to slide at ~50 m/s on grass and tips onto its downwind wheels at
+      //  ~52-55 (a sedan, lower and flatter, slides first and tips later); gusts and a tornado's turning, changing
+      //  wind roll it over.
+      if (this.windAt) this.wind = this.windAt(this.p[0], this.p[1], this.p[2]);
       const va = toBody(M, sub(this.v, this.wind));
+      const [dl0, dw0, dh0] = S.dims, aSide = dl0 * (dh0 - S.ground) * 0.9, aTop = dl0 * dw0 * 0.9;
       const ax = -0.5 * RHO * S.cdA * va[0] * Math.abs(va[0]);
-      const ay = -0.5 * RHO * S.cyA * va[1] * Math.abs(va[1]);
-      const az = 0.5 * RHO * S.clA * (va[0] * va[0] + va[1] * va[1]) - 0.5 * RHO * S.dims[0] * S.dims[1] * 0.9 * va[2] * Math.abs(va[2]);
-      apply(toWorld(M, [ax, ay, az]), add(this.p, toWorld(M, [-0.25 * S.dims[0] * 0.25, 0, 0.45 * S.dims[2] - S.cgH * 0.5])));
+      const ay = -0.5 * RHO * (S.cy || 0.85) * aSide * va[1] * Math.abs(va[1]);
+      const lift = 0.5 * RHO * (S.clA * va[0] * va[0] + (S.cls || 0.35) * aTop * va[1] * va[1]);
+      const az = lift - 0.5 * RHO * aTop * 0.9 * va[2] * Math.abs(va[2]);
+      const zSide = (S.ground + dh0) / 2 - S.cgH;
+      apply(toWorld(M, [ax, ay, 0]), add(this.p, toWorld(M, [-0.08 * dl0, 0, zSide])));
+      // the lift toward the windward side (where the air comes from: against the side force)
+      apply(toWorld(M, [0, 0, az]), add(this.p, toWorld(M, [0, ay ? -Math.sign(ay) * 0.22 * dw0 : 0, dh0 - S.cgH])));
+      // the air damps a car turning over in it (it does not spin for ever)
+      const wl = len(this.w);
+      if (wl > 0.5) Tq = add(Tq, scl(this.w, -RHO * dl0 * dl0 * dw0 * 0.6 * wl));
+      this.airW = Math.hypot(this.wind[0], this.wind[1]);
 
       // ---- the body against the ground (rolled over, nosed into a ditch, bottomed out)
       let hit = 0;

@@ -34,7 +34,8 @@ const Chase = (() => {
   const BOX_KM = 100, RECENTRE_KM = 18, VOL_MIN = 1000, VOL_MAX = 8000, VOL_LOAD = 2.5;
   const BLEND_MIN = 300, BLEND_MAX = 90000;          // ms: the blend into each new volume (the time they take to come)
   const TARGETS_EVERY = 1000;                         // ms: the tornadoes' positions (cheap)
-  const COLORS = { suv: [196, 30, 36], sedan: [235, 235, 232], truck: [70, 74, 66] };
+  const COLORS = { suv: [196, 30, 36], sedan: [235, 235, 232], truck: [70, 74, 66],
+                   p_suv: [241, 241, 236], p_pickup: [43, 48, 52], p_sedan: [28, 42, 68], p_van: [185, 190, 194] };   // (the probes' own paints)
   // what is under a wheel: grip (mu), rolling drag, the slip at the grip's peak (driving, cornering), the curve's
   // shape (lower: a flatter peak, looser), roughness m
   const SURF = {
@@ -187,6 +188,37 @@ const Chase = (() => {
     return out;
   }
   const norm3 = v => { const l = Math.hypot(...v) || 1; return v.map(x => x / l); };
+  // a probe car's moving parts and lights (render.js drawProbes): o its state -- id, p, M, v, wind (the air's motion
+  // there, world), steer (the front wheels'), brake, reverse, head (headlights), bar (the light bar and hazards);
+  // lod 0 for yours, 1 for the others'.  The vane turns into the wind over the car (a few tenths of a second
+  // behind it), the propeller spins with that wind; the light bar's halves swap at ~2 Hz, the hazards blink at 1.5.
+  const probeAnim = new Map();
+  function probeState(o, lod, now) {
+    let a = probeAnim.get(o.id);
+    if (!a) probeAnim.set(o.id, a = { yaw: 0, prop: 0, t: now });
+    const dt = Math.min(0.1, Math.max(0, (now - a.t) / 1000));
+    a.t = now;
+    const rel = [o.wind[0] - o.v[0], o.wind[1] - o.v[1], o.wind[2] - o.v[2]], rb = CarPhys.toBody(o.M, rel), sp = Math.hypot(rb[0], rb[1]);
+    if (sp > 0.3) {
+      const want = Math.atan2(-rb[1], -rb[0]), d = Math.atan2(Math.sin(want - a.yaw), Math.cos(want - a.yaw));
+      a.yaw += d * Math.min(1, dt * (2 + sp * 0.3));
+    }
+    a.prop = (a.prop + sp * 3.2 * dt) % (Math.PI * 2000);
+    const lit = new Float32Array(16), flash = Math.floor(now / 250) % 2, blink = Math.floor(now / 333) % 2;
+    lit[4] = o.head ? 1 : 0; lit[5] = 1; lit[6] = o.head ? 1 : 0; lit[7] = o.brake ? 1 : 0;
+    lit[8] = o.bar && blink ? 1 : 0; lit[9] = o.reverse ? 1 : 0;
+    lit[10] = o.bar && flash ? 1 : 0; lit[11] = o.bar && !flash ? 1 : 0; lit[12] = 1;
+    return { lod, steer: o.steer, vaneYaw: a.yaw, prop: a.prop, lit, glass: o.glass };
+  }
+  function myProbe(c, now) {
+    if (!Probes.isProbe(c.kind)) return null;
+    const night = st.night || { dayK: 1 }, auto = night.dayK < 0.6 || wx.rainI > 0.5;
+    const ws = c.wheels;
+    return probeState({ id: 'me', p: c.p, M: c.matrix, v: c.v, wind: c.wind || [0, 0, 0], steer: (ws[0].steer + ws[1].steer) / 2,
+                        brake: c.in.brk > 0.05 || c.in.hand, reverse: c.gear === -1, bar: st.lightBar,
+                        head: st.lights === 'on' || (st.lights !== 'off' && auto),
+                        glass: !(st.cam.mode !== 'chase' && !st.foot) }, 0, now);
+  }
   function sunDir() {
     let az = 240 * Math.PI / 180, el = 35 * Math.PI / 180;
     const r = st.run;
@@ -588,7 +620,9 @@ const Chase = (() => {
       const c = st.car, hg = c.p[2] - surfAt(c.p[0], c.p[1]).h, f = st.foot;
       const r2 = v => Math.round(v * 100) / 100;
       const fs = f ? [f.p[0], f.p[1], f.p[2] - surfAt(f.p[0], f.p[1]).h, f.yaw, f.phase % 1000, f.gait, f.down, f.lean, f.leanDir || 0, f.air ? 1 : 0, f.speed].map(r2) : null;
-      Net.tick(c, { name: st.name, kind: st.kind, color: st.color, hg, f: fs });
+      const nt = st.night || { dayK: 1 };
+      Net.tick(c, { name: st.name, kind: st.kind, color: st.color, hg, f: fs, lb: Probes.isProbe(c.kind) && st.lightBar,
+                    hl: st.lights === 'on' || (st.lights !== 'off' && (nt.dayK < 0.6 || wx.rainI > 0.5)) });
     }, 40);
   }
 
@@ -764,7 +798,9 @@ const Chase = (() => {
     }
     // hood and driver: fixed in the car, looking along it (turned by the mouse / right stick), rolling with it
     const a = S.cgFront, b = S.wheelbase - a, xF = a + (S.dims[0] - S.wheelbase) / 2;
-    const loc = cam.mode === 'hood' ? [xF - 0.35, 0, S.ground + (c.kind === 'sedan' ? 0.72 : c.kind === 'truck' ? 1.2 : 0.98) - S.cgH]
+    const eyeM = S.model && S.model.eye, mo = eyeM ? [S.cgFront - S.model.hubF, -S.cgH] : null;
+    const loc = eyeM ? (cam.mode === 'hood' ? [eyeM[0] + mo[0] + 1.3, 0, eyeM[2] + mo[1] - 0.05] : [eyeM[0] + mo[0], eyeM[1], eyeM[2] + mo[1]])
+      : cam.mode === 'hood' ? [xF - 0.35, 0, S.ground + (c.kind === 'sedan' ? 0.72 : c.kind === 'truck' ? 1.2 : 0.98) - S.cgH]
       : [xF - (c.kind === 'truck' ? 2.0 : c.kind === 'sedan' ? 2.25 : 2.05), S.dims[1] * 0.2, S.ground + (c.kind === 'sedan' ? 0.95 : c.kind === 'truck' ? 1.55 : 1.28) - S.cgH];
     const eye = CarPhys.toWorld(M, loc).map((v, i) => v + c.p[i]);
     const yaw = cam.look, pitch = cam.pitch - (cam.mode === 'driver' ? 0.05 : 0.02);
@@ -867,7 +903,7 @@ const Chase = (() => {
     weather(dt, view);
     if (st.fake && st.fake.rain !== undefined) st.wet = Math.max(st.wet, Math.min(1, st.fake.rain * 1.5));
     sound(dt);
-    const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
+    const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false, probe: myProbe(c, performance.now()) }];
     if (st.foot && !(st.cam.mode !== 'chase')) cars.push({ parts: st.foot.figure(st.color) });   // (first person: not yourself)
     if (st.extraCars) cars.push(...st.extraCars());
     {
@@ -1445,7 +1481,10 @@ const Chase = (() => {
         return { c: [p[0] + w[0] - up[0] * o.L[i], p[1] + w[1] - up[1] * o.L[i], p[2] + w[2] - up[2] * o.L[i]],
                  steer: i < 2 ? o.st[i] : 0, spin: o.sp[i], left: i % 2 === 0 };
       });
-      return { kind, color: o.color, p, M, wheels, hidden: false };
+      const probe = Probes.isProbe(kind) ? probeState({ id: o.id, p, M, v: o.v || [0, 0, 0], wind: windAt(p[0], p[1], p[2] + 1),
+                                                         steer: (o.st[0] + o.st[1]) / 2, brake: !!o.b, reverse: o.g === -1, bar: !!o.lb,
+                                                         head: !!o.hl || (st.night && st.night.dayK < 0.6) }, 1, performance.now()) : null;
+      return { kind, color: o.color, p, M, wheels, hidden: false, probe };
     }).concat(list.filter(o => o.f).map(o => {
       let w = walkers.get(o.id);
       if (!w) walkers.set(o.id, w = new Walker.Person(0, 0, 0, 0));
@@ -1522,7 +1561,7 @@ const Chase = (() => {
     const q = st.vis, keep = { scale: q.scale, blend: q.blend };
     Object.assign(q, { scale: 1, blend: 0 });
     const view = camera(0), c = st.car;
-    const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false }];
+    const cars = [{ kind: c.kind, color: st.color, p: c.p, M: c.matrix, wheels: c.wheelPoses(), hidden: false, probe: myProbe(c, performance.now()) }];
     if (st.extraCars) cars.push(...st.extraCars());
     Render.frame({ ...view, sun: sunDir(), scale: 1, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief,
                    haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, quality: 1, blend: 0, seed: 0 }, cars);
@@ -1584,6 +1623,7 @@ const Chase = (() => {
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
       if (e.repeat) return;
       st.keys.add(e.code);
+      if (e.code === 'KeyX' && !e.repeat && st.car && Probes.isProbe(st.car.kind)) { st.lightBar = !st.lightBar; say(`Light bar ${st.lightBar ? 'on' : 'off'}`, 1200); return; }
       if (e.code === 'KeyC') cycleCam();
       if (e.code === 'KeyR') resetCar();
       if (e.code === 'KeyH' || e.code === 'F1' || e.code === 'Escape') { e.preventDefault(); $('help').classList.toggle('hidden'); }

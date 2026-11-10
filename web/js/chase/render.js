@@ -6,7 +6,7 @@
 // World positions are metres on the run's map plane; the volume's box is world km; its units: the longer side 2.
 const Render = (() => {
   const L = () => Vol.lib;
-  let gl = null, cv = null, cloudProg = null, lightProg = null, roadProg = null, meshProg = null, vao = null;
+  let gl = null, cv = null, cloudProg = null, lightProg = null, roadProg = null, meshProg = null, carProg = null, vao = null;
   let volTex = null, gndTex = null, noiseTex = null, lightTex = null, lightFbo = null, lightKey = '', loadSeq = 0;
   const insTex = [];
   // Blending between volumes: volA / insA / lightA hold the picture shown when the newest volume came in (a blend
@@ -216,6 +216,41 @@ const Render = (() => {
     o0 = vec4(c, lam);
     o1 = vec4(length(wpos - eye), 0.0, 0.0, 1.0);
     o2 = em ? vec4(col - 10.0, 1.0) : vec4(0.0);
+  }`;
+
+  // the mesonet probe cars (probes.js): each vertex its colour and class -- the paint (1-3: the player's colours), the
+  // lights (4 head, 5 DRL, 6 tail, 7 brake, 8 turn, 9 reverse, 10 / 11 the light bar, 12 the radar screen: lit by
+  // lit[class], glowing their colour at night, brighter lenses by day), the glass (13 windscreen, 14 privacy:
+  // dithered to their opacity so the cabin shows, or left out from inside the car)
+  const CAR_VS = `#version 300 es
+  layout(location = 0) in vec3 p; layout(location = 1) in vec3 n; layout(location = 2) in vec4 c;
+  uniform mat4 VP; uniform mat3 R; uniform vec3 org; uniform float s; uniform vec3 paint[3];
+  out vec3 wpos; out vec3 nw; out vec3 col; flat out int cls;
+  void main() {
+    cls = int(c.a * 255.0 + 0.5);
+    col = cls >= 1 && cls <= 3 ? paint[cls - 1] : c.rgb;
+    wpos = org + R * p * s; nw = R * n; gl_Position = VP * vec4(wpos, 1.0);
+  }`;
+  const CAR_FS = `#version 300 es
+  precision highp float;
+  in vec3 wpos; in vec3 nw; in vec3 col; flat in int cls;
+  uniform vec3 eye, sunDir; uniform float lit[16]; uniform vec3 em[16]; uniform float glass;
+  layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1; layout(location = 2) out vec4 o2;
+  void main() {
+    if (cls == 13 || cls == 14) {
+      float a = cls == 13 ? 0.42 : 0.78;
+      vec2 q = floor(gl_FragCoord.xy);
+      float h = fract(sin(dot(q, vec2(12.9898, 78.233))) * 43758.5453);
+      if (glass < 0.5 || h > a) discard;
+    }
+    vec3 n = normalize(nw);
+    if (!gl_FrontFacing) n = -n;
+    float lam = max(dot(n, sunDir), 0.0);
+    bool on = cls >= 4 && cls <= 12 && lit[cls] > 0.5;
+    vec3 cc = on ? mix(col, em[cls], 0.75) * 1.4 : col;
+    o0 = vec4(min(cc, vec3(1.0)) * (0.72 + 0.28 * n.z), lam);
+    o1 = vec4(length(wpos - eye), 0.0, 0.0, 1.0);
+    o2 = on ? vec4(em[cls], 1.0) : vec4(0.0);
   }`;
 
   // The rain and snow falling round the camera (setPrecip's amounts): drops and flakes fixed in the world, falling
@@ -879,6 +914,7 @@ const Render = (() => {
     mergeProg = program(L().VS, MERGE_FS);
     roadProg = program(ROAD_VS, ROAD_FS);
     meshProg = program(MESH_VS, MESH_FS);
+    try { carProg = program(CAR_VS, CAR_FS); } catch (e) { console.warn('chase probe cars:', e.message); }
     treeProg = program(TREE_VS, MESH_FS);
     try { precipProg = program(PRECIP_VS, PRECIP_FS); } catch (e) { console.warn('chase rain and snow:', e.message); }
     trees.vao = gl.createVertexArray(); trees.mesh = gl.createBuffer(); trees.inst = gl.createBuffer();
@@ -1254,6 +1290,98 @@ const Render = (() => {
     gl.bindVertexArray(null);
     return { vao: v, buf: b, n: arr.length / 9 };
   }
+  // a probe car's parts on the GPU (probes.js data): each part's vertices (position, normal: floats; colour and
+  // class: bytes) and its triangles
+  const probeBufs = new WeakMap();
+  function probeBuffers(d) {
+    let B = probeBufs.get(d);
+    if (B) return B;
+    B = {};
+    for (const pt of d.parts) {
+      const nv = pt.P.length / 3, ab = new ArrayBuffer(nv * 28), f = new Float32Array(ab), u8 = new Uint8Array(ab);
+      for (let i = 0; i < nv; i++) {
+        f.set([pt.P[3 * i], pt.P[3 * i + 1], pt.P[3 * i + 2], pt.N[3 * i], pt.N[3 * i + 1], pt.N[3 * i + 2]], i * 7);
+        u8.set(pt.C.subarray(4 * i, 4 * i + 4), i * 28 + 24);
+      }
+      const v = gl.createVertexArray(), b = gl.createBuffer(), e = gl.createBuffer();
+      gl.bindVertexArray(v);
+      gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, ab, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+      gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 28, 12);
+      gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 4, gl.UNSIGNED_BYTE, true, 28, 24);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, e); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, pt.X, gl.STATIC_DRAW);
+      gl.bindVertexArray(null);
+      B[pt.key] = { vao: v, n: pt.X.length, part: pt };
+    }
+    const em = new Float32Array(48);
+    d.em.forEach((c, i) => { if (c) em.set(c, i * 3); });
+    B.em = em;
+    probeBufs.set(d, B);
+    return B;
+  }
+  // rotation (column-major mat3, world) of the body's axes M turned by r (a body-axes 3x3: columns its x, y, z)
+  const turned = (M, r) => {
+    const col = v => [M[0][0] * v[0] + M[1][0] * v[1] + M[2][0] * v[2], M[0][1] * v[0] + M[1][1] * v[1] + M[2][1] * v[2], M[0][2] * v[0] + M[1][2] * v[1] + M[2][2] * v[2]];
+    return new Float32Array([...col(r[0]), ...col(r[1]), ...col(r[2])]);
+  };
+  // a rotation about a unit axis (body axes) by a: its columns
+  function axisRot(ax, a) {
+    const [x, y, z] = ax, c = Math.cos(a), s = Math.sin(a), t = 1 - c;
+    return [[t * x * x + c, t * x * y + s * z, t * x * z - s * y], [t * x * y - s * z, t * y * y + c, t * y * z + s * x], [t * x * z + s * y, t * y * z - s * x, t * z * z + c]];
+  }
+  const rmul = (a, b) => [0, 1, 2].map(j => [0, 1, 2].map(i => a[0][i] * b[j][0] + a[1][i] * b[j][1] + a[2][i] * b[j][2]));
+  const atBody = (c, v) => [0, 1, 2].map(i => c.p[i] + c.M[0][i] * v[0] + c.M[1][i] * v[1] + c.M[2][i] * v[2]);
+  // the probe cars in the list: their parts placed by the car's state (c.probe: lod, steer, lights, the relative
+  // wind's yaw, the propeller's and the light bar's phase), the model's middle on the physics' centre of gravity
+  function drawProbes(G, VP, eye, sun, s, cars) {
+    let u = null;
+    for (const c of cars) {
+      if (c.hidden || !c.probe) continue;
+      const S = CarPhys.SPECS[c.kind], d = Probes.get(c.kind, c.probe.lod) || Probes.get(c.kind, 1 - c.probe.lod);
+      if (!d || !S) continue;
+      if (!u) {
+        gl.useProgram(carProg); u = carProg.u;
+        gl.uniformMatrix4fv(u.VP, false, VP); gl.uniform3f(u.eye, ...eye); gl.uniform3f(u.sunDir, ...sun); gl.uniform1f(u.s, s);
+        gl.disable(gl.CULL_FACE);
+      }
+      const B = probeBuffers(d), st = c.probe, off = [S.cgFront - S.model.hubF, 0, -S.cgH];
+      const pc = c.color.map(v => v / 255);
+      gl.uniform3fv(u.paint, new Float32Array([...pc, ...pc, ...(st.accent || [0.9, 0.6, 0.12])]));
+      gl.uniform1fv(u.lit, st.lit); gl.uniform3fv(u.em, B.em); gl.uniform1f(u.glass, st.glass === false ? 0 : 1);
+      const draw = (key, R, at) => {
+        const b = B[key];
+        if (!b) return;
+        gl.uniformMatrix3fv(u.R, false, R); gl.uniform3f(u.org, ...toBox(G, at));
+        gl.bindVertexArray(b.vao); gl.drawElements(gl.TRIANGLES, b.n, gl.UNSIGNED_INT, 0);
+      };
+      const R0 = mat3(c.M), piv = k => B[k] ? B[k].part.pivot : [0, 0, 0], body = v => atBody(c, [v[0] + off[0], v[1] + off[1], v[2] + off[2]]);
+      draw('body', R0, body([0, 0, 0]));
+      // the wheels on the physics' wheels (their suspension), steered and rolling
+      const names = ['FL', 'FR', 'RL', 'RR'];
+      c.wheels.forEach((w, i) => {
+        const nm = names[i], at = w.c;
+        draw('hub_' + nm, wheelMat(c.M, w.steer, 0), at);
+        const sp = B['spin_' + nm];
+        if (sp) {
+          const dd = [0, 1, 2].map(k => sp.part.pivot[k] - piv('hub_' + nm)[k]);
+          draw('spin_' + nm, wheelMat(c.M, w.steer, -w.spin), [at[0] + dd[0], at[1] + dd[1], at[2] + dd[2]]);
+        }
+      });
+      // the steering wheel, ~2.5x the road wheels' turn
+      if (B.steering) draw('steering', turned(c.M, axisRot(d.steerAxis, -2.5 * (st.steer || 0))), body(piv('steering')));
+      // the anemometer: the vane into the wind over the car, the propeller turning in it
+      if (B.vane) {
+        const yr = axisRot([0, 0, 1], (st.vaneYaw || 0) - d.vaneYaw0), vp = piv('vane');
+        draw('vane', turned(c.M, yr), body(vp));
+        if (B.prop) {
+          const pp = piv('prop'), rel = [pp[0] - vp[0], pp[1] - vp[1], pp[2] - vp[2]];
+          const rr = [0, 1, 2].map(i => yr[0][i] * rel[0] + yr[1][i] * rel[1] + yr[2][i] * rel[2]);
+          draw('prop', turned(c.M, rmul(yr, axisRot(d.propAxis, st.prop || 0))), body([vp[0] + rr[0], vp[1] + rr[1], vp[2] + rr[2]]));
+        }
+      }
+    }
+    if (u) { gl.useProgram(meshProg); gl.enable(gl.CULL_FACE); }
+  }
   function carMeshes(kind, color) {
     // (built again once the car's model has come in: carmesh.js)
     const key = `${kind}/${color.join(',')}/${CarMesh.ready && CarMesh.ready(kind) ? 'model' : 'code'}`;
@@ -1384,7 +1512,8 @@ const Render = (() => {
         }
         continue;
       }
-      const m = carMeshes(c.kind, c.color);
+      if (c.probe && carProg && (Probes.get(c.kind, c.probe.lod) || Probes.get(c.kind, 1 - c.probe.lod))) continue;
+      const m = carMeshes(c.probe ? ({ p_sedan: 'sedan', p_van: 'sedan' }[c.kind] || 'suv') : c.kind, c.color);
       gl.uniformMatrix3fv(u.R, false, mat3(c.M));
       gl.uniform3f(u.org, ...toBox(G, c.p));
       gl.bindVertexArray(m.body.vao); gl.drawArrays(gl.TRIANGLES, 0, m.body.n);
@@ -1395,6 +1524,7 @@ const Render = (() => {
         gl.drawArrays(gl.TRIANGLES, 0, m.wheel.n);
       }
     }
+    if (carProg && window.Probes) drawProbes(G, VP, eye, sun, s, cars);
     // the debris in the air and on the ground
     if (debris.n) {
       gl.useProgram(debrisProg);

@@ -1347,6 +1347,19 @@ TORNADO_COLD = -1.0           # K
 TORNADO_COLD_KM = 5.0
 TORNADO_MIN_AGE = 1500.0      # s
 TORNADO_CONFIRM = 120.0       # s
+# On a grid that resolves the tornado itself (VORTEX_DX or finer: the nests, the tornado zoom, a sub-200 m run) a
+# tornado is the vortex's own strength (find_vortex_tornadoes), not the storm-scale gates above: the updraft
+# tracker's age (TORNADO_MIN_AGE) and the outflow test kept turning real, resolved tornadoes away -- or split them
+# -- whenever the storm's tracking re-linked its updrafts (the user, 2026-11-10: "unreliable mesocyclone
+# tracking").  A vortex there is a tornado when, at the lowest level, its azimuthal-mean tangential wind reaches
+# VORTEX_VT (it turns: no straight-line RFD gust passes) at a radius of at most VORTEX_RMAX (tornado-scale, not the
+# mesocyclone), and its strongest ground-relative wind within VORTEX_REACH_X of that radius reaches EF0 (EF_WIND[0]).
+# Only storm-start and nudger pushes and hurricane eyewalls still rule one out (Simulation._tornado_ok(forced_only)).
+VORTEX_DX = 200.0             # m: grids this fine or finer
+VORTEX_ZETA = 0.03            # 1/s at the lowest level: a candidate's core
+VORTEX_VT = 18.0              # m/s of azimuthal-mean tangential wind
+VORTEX_RMAX = 1000.0          # m
+VORTEX_REACH_X = 2.0          # x the radius of the peak tangential wind
 
 
 # Estimated strength along a tornado's track (Simulation.tornado_tracks: the map's colours, the tornado list and the
@@ -1432,6 +1445,8 @@ def find_tornadoes(f: "PatchRadarFields", env) -> list:
     import cupy as cp
     from cupyx.scipy import ndimage
     dx = f.dx
+    if dx <= VORTEX_DX:                             # the grid resolves the tornado: the vortex's own strength
+        return find_vortex_tornadoes(f, env)
     found = []
     u0, v0 = f.uc[0], f.vc[0]                       # ground-relative, lowest level
     zeta = cp.gradient(v0, dx, axis=1) - cp.gradient(u0, dx, axis=0)
@@ -1470,6 +1485,61 @@ def find_tornadoes(f: "PatchRadarFields", env) -> list:
                 found.append({"x": x, "y": y, "s": (ve - DEBRIS_V0) / (DEBRIS_V1 - DEBRIS_V0), "ve": ve,
                               "vrot": float(vrot[j, i])})
     return [d for d in _merge_tornadoes(found) if _tornado_allowed(f, env, d)]
+
+
+def vortex_profile(u, v, x: float, y: float, f: "PatchRadarFields", reach: float = VORTEX_RMAX * 1.5, na: int = 24):
+    """(radii m, azimuthal-mean tangential wind m/s, + anticlockwise) about world point (x, y) from the cell-centred
+    lowest-level winds u, v of fields f (bilinear on rings): the translation's share averages out round a ring."""
+    import cupy as cp
+    from cupyx.scipy import ndimage
+    dx = f.dx
+    rr = np.arange(1, max(3, int(reach / dx)) + 1) * dx
+    th = np.arange(na) * (2.0 * math.pi / na)
+    X = x + rr[:, None] * np.cos(th)[None]
+    Y = y + rr[:, None] * np.sin(th)[None]
+    gi, gj = (X - f.x0) / dx - 0.5, (Y - f.y0) / dx - 0.5
+    co = cp.asarray(np.stack([gj.ravel(), gi.ravel()]), dtype=cp.float32)
+    uu = ndimage.map_coordinates(u.astype(cp.float32), co, order=1, mode="nearest").reshape(X.shape)
+    vv = ndimage.map_coordinates(v.astype(cp.float32), co, order=1, mode="nearest").reshape(X.shape)
+    s, c = cp.asarray(np.sin(th), cp.float32), cp.asarray(np.cos(th), cp.float32)
+    vt = cp.asnumpy((vv * c[None] - uu * s[None]).mean(axis=1))
+    return rr, vt
+
+
+def find_vortex_tornadoes(f: "PatchRadarFields", env) -> list:
+    """The tornadoes of a grid that resolves them (VORTEX_DX), by the vortex's own strength: lowest-level vorticity
+    maxima (VORTEX_ZETA), each a tornado when its azimuthal-mean tangential wind peaks at VORTEX_VT or more within
+    VORTEX_RMAX of it and its strongest ground-relative wind inside VORTEX_REACH_X of that radius is EF0 or more.
+    Only pushes and eyewalls still rule one out (no updraft-age or outflow gates).  As find_tornadoes returns them,
+    with "vt" (peak tangential wind) and "rmax" (its radius, m) too."""
+    import cupy as cp
+    from cupyx.scipy import ndimage
+    dx = f.dx
+    u0, v0 = f.uc[0], f.vc[0]
+    zeta = cp.gradient(v0, dx, axis=1) - cp.gradient(u0, dx, axis=0)
+    n = min(max(1, int(round(500.0 / dx))), FEATURE_CELLS)
+    peak = (zeta >= VORTEX_ZETA) & (zeta == ndimage.maximum_filter(zeta, size=2 * n + 1))
+    if not bool(peak.any()):
+        return []
+    spd = cp.hypot(u0, v0)
+    jj, ii = cp.nonzero(peak)
+    order = cp.argsort(-zeta[jj, ii])[:8]
+    found = []
+    for j, i in zip(cp.asnumpy(jj[order]).tolist(), cp.asnumpy(ii[order]).tolist()):
+        x, y = _peak_xy(zeta, j, i, f)
+        rr, vt = vortex_profile(u0, v0, x, y, f)
+        k = int(np.argmax(vt))
+        if vt[k] < VORTEX_VT or rr[k] > VORTEX_RMAX:
+            continue
+        m = max(1, int(math.ceil(VORTEX_REACH_X * rr[k] / dx)))
+        blk = spd[max(j - m, 0):j + m + 1, max(i - m, 0):i + m + 1]
+        wmax = float(blk.max()) if blk.size else 0.0
+        if wmax < EF_WIND[0]:
+            continue
+        found.append({"x": x, "y": y, "s": min(max((wmax - EF_WIND[0]) / (DEBRIS_V1 - EF_WIND[0]), 0.02), 1.0),
+                      "ve": None, "vrot": float(vt[k]), "vt": float(vt[k]), "rmax": float(rr[k]), "wmax": wmax})
+    ok = getattr(env, "tornado_forced", None)       # storm-start / nudger pushes, hurricane eyewalls
+    return [d for d in _merge_tornadoes(found, within=max(4.0 * dx, 400.0)) if ok is None or not ok(d["x"], d["y"])]
 
 
 def _tornado_allowed(f: "PatchRadarFields", env, d: dict) -> bool:
@@ -1781,7 +1851,10 @@ def add_debris(f: "PatchRadarFields", env, seed: int) -> bool:
     dx = f.dx
     x1, y1 = f.x0 + f.nx * dx, f.y0 + f.ny * dx
     inside = lambda c, m=0.0: f.x0 - m <= c.x <= x1 + m and f.y0 - m <= c.y <= y1 + m     # noqa: E731
-    tors = [c for c in f.clouds if c.ve is not None and c.aw > 0.02 and inside(c)]
+    # a grid that resolves its tornadoes (VORTEX_DX: nests, the tornado zoom) gets no sub-grid couplet: its
+    # velocities are the model's own winds only (the user, 2026-11-10)
+    tors = ([] if dx <= VORTEX_DX else
+            [c for c in f.clouds if c.ve is not None and c.aw > 0.02 and inside(c)])
     if tors:
         f.tornadoes, f.tornado_winds = tornado_winds(f, tors, env.z_h)
     strong = (DEBRIS_STRONG - DEBRIS_V0) / (DEBRIS_V1 - DEBRIS_V0)

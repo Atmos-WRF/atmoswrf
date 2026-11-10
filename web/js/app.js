@@ -19,7 +19,7 @@ const GRID_PRODUCTS = [
   ['cref', 'Composite reflectivity'], ['ref1km', '1 km AGL reflectivity'], ['reflow', 'Lowest-level reflectivity'],
   ['thp', 'Surface θ′ (cold pools)'], ['wmax', 'Max updraft'], ['uh25', '2–5 km updraft helicity'],
   ['wspd', 'Lowest-level wind'], ['vort', 'Lowest-level vorticity'], ['rain', 'Accumulated rain'],
-  ['uhtrack', 'Storm tracks (run-max UH)'], ['windtrack', 'Wind swaths (run-max)'],
+  ['uhtrack', 'Storm tracks (run-max UH)'], ['windtrack', 'Wind swaths (run-max)'], ['efswath', 'EF swath (tornado winds, ≤200 m grids)'],
   ['ir', 'Satellite IR (simulated)'], ['wind10', '10 m wind (1-min sustained)'], ['slp', 'Sea-level pressure'],
   ['sst', 'Sea-surface temperature'],
 ];
@@ -30,7 +30,7 @@ const RADAR_PRODUCTS = [
 const LEGEND_RANGE = {
   dbz: [-10, 80, 10], vel: [-60, 60, 20], zdr: [-2, 6, 1], cc: [0.2, 1.05, 0.1], sw: [0, 20, 4], thp: [-12, 5, 3],
   w: [0, 80, 10], uh: [0, 2000, 250], wspd: [0, 55, 10], vort: [-0.05, 0.25, 0.05], rain: [0, 8, 1],
-  ir: [-90, 40, 10], sst: [20, 32, 2], slp: [900, 1020, 20], hwind: [0, 75, 15],
+  ir: [-90, 40, 10], sst: [20, 32, 2], slp: [900, 1020, 20], hwind: [0, 75, 15], ef: [25, 100, 15],
 };
 
 const S = {
@@ -849,10 +849,34 @@ function packedToRaster(buf, pal) {
         img.data[o] = lut[c]; img.data[o + 1] = lut[c + 1]; img.data[o + 2] = lut[c + 2]; img.data[o + 3] = lut[c + 3];
       }
     }
+    if (pal.edges) bandEdges(img.data, codes, p.nx, p.ny, pal, scale, offset);
     g.putImageData(img, 0, 0);
     return { x0: p.x0 / 1000, y0: p.y0 / 1000, x1: p.x1 / 1000, y1: p.y1 / 1000, nx: p.nx, ny: p.ny, canvas: cv, codes };
   });
   return { header, patches, scale, offset };
+}
+
+// a banded palette's outlines (the EF swath): a pixel of a band next to a weaker one (or to nothing) goes white,
+// as on a damage survey's EF map
+function bandEdges(px, codes, nx, ny, pal, scale, offset) {
+  const band = new Int8Array(256);
+  for (let c = 1; c < 256; c++) {
+    const v = (c - offset) / scale;
+    let b = 0;
+    for (const s of pal.stops) if (v >= s.v) b++;
+    band[c] = b;
+  }
+  const at = (i, j) => (i < 0 || j < 0 || i >= nx || j >= ny) ? 0 : band[codes[j * nx + i]];
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
+      const b = band[codes[j * nx + i]];
+      if (!b) continue;
+      if (at(i - 1, j) < b || at(i + 1, j) < b || at(i, j - 1) < b || at(i, j + 1) < b) {
+        const o = (j * nx + i) * 4;
+        px[o] = px[o + 1] = px[o + 2] = 255; px[o + 3] = 255;
+      }
+    }
+  }
 }
 
 // the "PC explosion" details' warning before one is placed or switched to (size: the box, km); true to go on
@@ -895,6 +919,11 @@ function drawLegend(pal, fam) {
     g.fillRect(i, 0, 1, cv.height);
   }
   const ticks = [];
+  if (pal.efTicks) {                 // the EF swath: each band's name and lowest gust (mph) at its start
+    for (const [n, v, mph] of pal.efTicks) ticks.push(`<span style="left:${((v - lo) / (hi - lo) * 100).toFixed(1)}%">${n} ${mph}</span>`);
+    $('legendTicks').innerHTML = ticks.join('');
+    return;
+  }
   for (let v = lo; v <= hi + 1e-9; v += step) ticks.push(`<span style="left:${((v - lo) / (hi - lo) * 100).toFixed(1)}%">${+v.toFixed(3)}</span>`);
   $('legendTicks').innerHTML = ticks.join('');
 }

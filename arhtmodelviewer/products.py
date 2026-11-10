@@ -23,6 +23,7 @@ CODECS = {
     "rain": (8.0, 1.0, "mm", "Accumulated rain (log2 scale)"),
     "uhtrack": (0.1, 1.0, "m2/s2", "Run-max 2-5 km UH (storm tracks)"),
     "windtrack": (2.0, 1.0, "m/s", "Run-max lowest-level wind (wind swaths)"),
+    "efswath": (2.0, 1.0, "m/s", "EF swath: the tornadoes' run-max wind (grids of 200 m or finer)"),
     # hurricane runs (hurricane.py)
     "ir": (1.5, 166.0, "C", "Simulated IR satellite (10.3 um)"),
     "sst": (7.0, 1.0, "C", "Sea-surface temperature"),

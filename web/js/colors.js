@@ -91,11 +91,21 @@ DEFAULT_PALETTES.hwind = { units: 'm/s', stops: [
   { v: 58.1, c: [210, 60, 210, 255] }, { v: 70.5, c: [255, 255, 255, 255] },
 ] };
 
+// the EF swath (efswath.py): one solid colour per EF band from its lowest 3-s gust (EF0 65 mph = 29 m/s .. EF5
+// 201 mph = 89.9 m/s), nothing under EF0; the bands are outlined in white (app.js bandEdges)
+DEFAULT_PALETTES.ef = { units: 'm/s', edges: true, efTicks: [
+  ['EF0', 29.06, 65], ['EF1', 38.45, 86], ['EF2', 49.62, 111], ['EF3', 60.80, 136], ['EF4', 74.21, 166], ['EF5', 89.86, 201],
+], stops: [
+  { v: 29.06, c: [110, 215, 255, 255], solid: true }, { v: 38.45, c: [70, 210, 80, 255], solid: true },
+  { v: 49.62, c: [250, 235, 50, 255], solid: true }, { v: 60.80, c: [250, 150, 30, 255], solid: true },
+  { v: 74.21, c: [230, 30, 30, 255], solid: true }, { v: 89.86, c: [240, 60, 220, 255], solid: true },
+] };
+
 // which default palette each product uses
 const PRODUCT_PALETTE = {
   cref: 'dbz', ref1km: 'dbz', reflow: 'dbz', REF: 'dbz', VEL: 'vel', SRV: 'vel', SW: 'sw', ZDR: 'zdr', RHO: 'cc',
   thp: 'thp', wmax: 'w', uh25: 'uh', wspd: 'wspd', vort: 'vort', rain: 'rain', uhtrack: 'uh', windtrack: 'wspd',
-  ir: 'ir', sst: 'sst', slp: 'slp', wind10: 'hwind',
+  ir: 'ir', sst: 'sst', slp: 'slp', wind10: 'hwind', efswath: 'ef',
 };
 // GR palette "Product:" keys that fit each family
 const PAL_FAMILY = { dbz: ['BR', 'REF', 'DBZ', 'CR'], vel: ['BV', 'SRV', 'VEL', 'SR'], zdr: ['ZDR'], cc: ['CC', 'RHO'], sw: ['SW'] };

@@ -425,6 +425,8 @@ class Simulation:
         self.boundaries: list[Boundary] = []
         self.lows = []
         self.tracks = products.TrackStore()
+        from .efswath import EFSwath
+        self.efswath = EFSwath()                 # the tornadoes' EF swath on the fine grids (efswath.py)
         self.swath_version = 0                  # swath updates so far (the placefile's image URL)
         self._next_swath = 0.0
         self.uh_peaks: list[dict] = []          # each new run-max 2-5 km UH: value, t, x, y
@@ -598,6 +600,7 @@ class Simulation:
         self._set_roughness(ph)
         self.env.tornado_ok = self._tornado_ok     # only mature, unforced storms make tornadoes (radar.TORNADO_COLD)
         self.env.tornado_near = self._tornado_near
+        self.env.tornado_forced = self._tornado_forced  # the only test on grids that resolve their tornadoes
         eo = s.get("engine", {}) or {}
         dom = s.get("domain") or {}
         fixed = dom.get("mode") == "fixed"
@@ -805,24 +808,34 @@ class Simulation:
         w = STORM_W_GAIN * math.sqrt(2.0 * max(self.inflow_cape(x, y), 0.0))
         return min(max(w, STORM_W_FLOOR), 12.0) / 12.0
 
-    def _tornado_ok(self, x: float, y: float) -> bool:
-        """May a circulation at (x, y) be a tornado: no storm-start or nudger push is forcing the air
-        there, and a deep updraft followed for radar.TORNADO_MIN_AGE is within 15 km of it."""
+    def _tornado_forced(self, x: float, y: float) -> bool:
+        """Is the air at (x, y) not the model's own: a storm-start push still forcing it, or a hurricane's eyewall
+        (its spin and small vortices read as tornadoes but are the hurricane's winds; rainband tornadoes farther out
+        stay possible).  The only test a grid that resolves its tornadoes keeps (radar.find_vortex_tornadoes)."""
         eng = self.engine
         if eng is None:
-            return True
-        # hurricane runs: none in the core -- the eyewall's spin and its small-scale vortices read as TVSs and
-        # debris on the radar, but are the hurricane's own winds; rainband tornadoes farther out stay possible
+            return False
         for c in self.cyclones:
             if c["active"] and math.hypot(x - c["x"], y - c["y"]) < max(EYEWALL_NO_TORNADO,
                                                                        4.0 * min(c.get("rmw") or 0.0, 60000.0)):
-                return False
+                return True
         t = eng.t
         for s in eng.starts:
             if s.kind == "nudge" and s.t0 <= t <= s.t1:
                 sx, sy = s.position(t)
                 if math.hypot(x - sx, y - sy) < s.radius + 3000.0:
-                    return False
+                    return True
+        return False
+
+    def _tornado_ok(self, x: float, y: float) -> bool:
+        """May a circulation at (x, y) be a tornado (on a storm-scale grid): nothing forcing the air there
+        (_tornado_forced), and a deep updraft followed for radar.TORNADO_MIN_AGE is within 15 km of it."""
+        eng = self.engine
+        if eng is None:
+            return True
+        if self._tornado_forced(x, y):
+            return False
+        t = eng.t
         scale = self.storm_scale(x, y)
         age = rd.TORNADO_MIN_AGE * scale
         live = [tr for tr in eng.tracks.live if t - tr.last[0] <= 180.0]
@@ -1510,6 +1523,7 @@ class Simulation:
                         tw0 = time.perf_counter()
                     try:
                         eng.step()
+                        self._ef_step()
                         if timing:
                             import cupy as _cp
                             _cp.cuda.Device().synchronize()
@@ -2552,6 +2566,13 @@ class Simulation:
             blob = self.tracks.pack(eng.t, dst, dx)
             if blob is not None:
                 fr.products[dst] = products.compress(blob)
+        # the EF swath: packed again only when it has changed (frames share the bytes)
+        ef = getattr(self, "_ef_blob", None)
+        if ef is None or ef[0] != self.efswath.version:
+            blob = self.efswath.pack(eng.t)
+            ef = self._ef_blob = (self.efswath.version, None if blob is None else products.compress(blob))
+        if ef[1] is not None:
+            fr.products["efswath"] = ef[1]
         for r in self.radars:
             fr.radars[r.icao] = {m: products.compress(self._pack_polar(meta, arr))
                                  for m, (meta, arr) in r.latest.items()}
@@ -2607,6 +2628,23 @@ class Simulation:
                     per.setdefault(name, []).append((meta, arr[f:arr.shape[0] - f, f:arr.shape[1] - f]))
             lv = lv.inner
 
+    def _ef_step(self) -> None:
+        """The EF swath (efswath.py) after each model step: the fine grids' wind round the tornadoes followed,
+        each moved on at its motion since the last radar refresh."""
+        eng = self.engine
+        grids = [p for p in eng.patches + eng.nest_patches() if p.env.grid.dx <= rd.VORTEX_DX]
+        if not grids and not self.efswath.bufs:
+            return
+        tk = self.tornadoes
+        age = max(0.0, eng.t - tk.t) if tk.t is not None else 0.0
+        tors = [(c.x + c.vx * age, c.y + c.vy * age) for c in tk.items if c.found]
+        try:
+            self.efswath.step(grids, tors)
+        except Exception as exc:              # (out of memory included) never the run's end
+            if not getattr(self, "_ef_failed", False):
+                self._ef_failed = True
+                log.warning("EF swath: %s", exc)
+
     def _update_swaths(self):
         """The run-max swaths, every SWATH_EVERY s of model time: storm tracks (2-5 km UH) and wind
         swaths on world tiles that outlive the patches, and the run's strongest UH (when and where)
@@ -2629,6 +2667,10 @@ class Simulation:
             if math.isfinite(v) and (best is None or v > best[0]):
                 j, i = divmod(k, r.nx)
                 best = (v, p.world_x0() + (i + 0.5) * dx, p.world_y0() + (j + 0.5) * dx)
+        try:
+            self.efswath.flush()
+        except Exception:                     # the EF swath must never stop the run
+            log.exception("EF swath flush failed")
         self.swath_version += 1
         self._next_swath = t + SWATH_EVERY
         prev = self.uh_peaks[-1]["value"] if self.uh_peaks else 0.0

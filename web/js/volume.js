@@ -267,6 +267,7 @@ const Vol = (() => {
   uniform sampler2D gnd; uniform int hasG; uniform float relief; uniform vec3 texel;
   uniform sampler2D mapTex; uniform int hasMap, mapDark;
   uniform float detail, detailKm, frameSeed; uniform vec3 kmOrigin; uniform int quality;
+  uniform float mainDx; uniform float insDx[4];               // km: the model grids' spacing (box, nests)
   uniform sampler3D lightTex; uniform int useLight;           // the light volume (FS_LIGHT): sun and sky depth
   uniform float hazeKm;                                       // the visibility: the air's haze grows over it
   uniform sampler2D mapTex2; uniform int hasMap2; uniform vec4 map2Box;   // the sharp ground around the camera
@@ -350,11 +351,22 @@ const Vol = (() => {
     vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
     if (any(lessThan(uvw, vec3(-0.01))) || any(greaterThan(uvw, vec3(1.01)))) return vec2(0.0);
     vec3 k = p * toKm + kmOrigin;                              // km on the ground: the detail stays put as the box moves
+    float det = detail;
     if (mode > 0 && detail > 0.0) {
+      // the detail is the structure a coarse grid has not got: none where the model's own grid resolves it (a
+      // tornado zoom's nests, ~37-110 m), whose cloud it shredded -- the funnel's thin lower part eroded away
+      float dxl = mainDx > 0.0 ? mainDx : 1.0e3;
+      vec3 bp = vec3((uvw.x - 0.5) * size.x, (uvw.y - 0.5) * size.y, uvw.z * size.z), iu;
+      for (int i = 0; i < 4; i++) {
+        if (i < insN && insDx[i] > 0.0 && insW(bp, i, iu) > 0.0) dxl = min(dxl, insDx[i]);
+      }
+      det = detail * smoothstep(0.12, 0.35, dxl);
+    }
+    if (mode > 0 && det > 0.0) {
       // domain warp: the surface pushed in and out by about a grid cell -- towers, billows, cauliflower
       vec3 wq = k / (detailKm * 5.0);
       vec3 wv = vec3(texture(noiseTex, wq).rg, texture(noiseTex, wq.zxy + 0.41).r) - 0.5;
-      uvw += wv * texel * 2.2 * detail;
+      uvw += wv * texel * 2.2 * det;
     }
     vec2 raw = mode == 2 && quality > 0 ? cubic(uvw) : texture(vol, uvw).rg;
     if (insN > 0) raw = nested(vec3((uvw.x - 0.5) * size.x, (uvw.y - 0.5) * size.y, uvw.z * size.z), vec4(raw, 0.0, 0.0)).rg;
@@ -362,17 +374,17 @@ const Vol = (() => {
     vec2 s = vec2(25.0 * m.x, 1.2 * rain * m.y) * density;   // rain: the Rain slider (x the model's)
     vec2 e = min(uvw.xy, 1.0 - uvw.xy) / 0.03;                 // the box's sides fade: no walls of cloud
     s *= clamp(min(e.x, e.y), 0.0, 1.0);
-    if (mode > 0 && detail > 0.0 && s.x + s.y > 1e-3) {
+    if (mode > 0 && det > 0.0 && s.x + s.y > 1e-3) {
       float n = texture(noiseTex, k / (detailKm * 20.0)).r * 0.55 + texture(noiseTex, k / (detailKm * 7.0) + 0.37).r * 0.45;
       // erosion: thin cloud breaks into wisps and billows, the solid core keeps its shape
       float cov = clamp(s.x / 30.0, 0.0, 1.0);
-      float thr = 0.8 * detail * smoothstep(0.3, 0.7, n) * (1.0 - cov);
+      float thr = 0.8 * det * smoothstep(0.3, 0.7, n) * (1.0 - cov);
       float kept = clamp((cov - thr) / max(1.0 - thr, 0.05), 0.0, 1.0);
       s.x *= cov > 1e-4 ? kept / cov : 0.0;
-      s.x *= max(mix(1.0, 2.6 * n - 0.3, 0.55 * detail), 0.0);   // lumps inside, the mean kept
+      s.x *= max(mix(1.0, 2.6 * n - 0.3, 0.55 * det), 0.0);   // lumps inside, the mean kept
       // rain curtains: streaks that hang down, thicker and thinner side by side
       float r = texture(noiseTex, vec3(k.xy / (detailKm * 9.0), k.z / (detailKm * 90.0)) + 0.61).g;
-      s.y *= max(mix(1.0, 2.4 * r - 0.2, 0.8 * detail), 0.0);
+      s.y *= max(mix(1.0, 2.4 * r - 0.2, 0.8 * det), 0.0);
     }
     return s;
   }
@@ -847,6 +859,12 @@ const Vol = (() => {
     }
     gl.uniform1i(u('insN'), ins.length);
     gl.uniform4fv(u('insBox'), B); gl.uniform1fv(u('insTop'), T);
+    // the model grids' spacing (km) for the cloud's detail (none where a grid resolves its own)
+    const D = new Float32Array(4);
+    ins.forEach((s, i) => { D[i] = (s.dx || 0) / 1000; });
+    gl.uniform1fv(u('insDx'), D);
+    const runDx = (head && head.dx) || (S.run && S.run.dx) || 0;
+    gl.uniform1f(u('mainDx'), runDx ? Math.max(runDx / 1000, (box[2] - box[0]) / head.nx) : 0);
   }
 
   function bindGround(u) {

@@ -1377,11 +1377,15 @@ TDS_CC = 0.80                                       # CC this low in the tornado
 TDS_STRONG_CC = 0.60
 
 
-def ef_estimate(wind: float | None, vrot: float | None, cc: float | None) -> int:
+def ef_estimate(wind: float | None, vrot: float | None, cc: float | None, resolved: bool = False) -> int:
     """EF rating (0-5, -1 = not a tornado) from the radar's Vrot (m/s) and CC; the model's peak wind (m/s) when
-    there is no Vrot."""
+    there is no Vrot.  ``resolved``: a tornado its grid resolves (find_vortex_tornadoes), rated on the model's own
+    peak ground-relative wind like a damage survey (the EF swath's wind) -- the Vrot bands are real radars' (a
+    tornado blurred by the beam): a 100-200 m grid's vortex read EF5 Vrot over EF2 winds."""
     def band(v, edges):
         return -1 if v is None else max([k for k, e in enumerate(edges) if v >= e], default=-1)
+    if resolved and wind is not None:
+        return min(band(wind, EF_WIND), 5)
     est = band(vrot * 1.943844 + 1e-6, EF_VROT_KT) if vrot is not None else band(wind, EF_WIND)
     tds = cc is not None and cc < TDS_CC
     if tds:
@@ -1618,12 +1622,13 @@ class Tornado:
     vrot: float = 0.0             # m/s: the model's low-level rotation at it (lowlevel_vrot)
     id: int = 0                   # TornadoTracker's number for it (its track)
     ej: float = 0.0               # 0..1: how much debris it has thrown out around itself (_debris_ejection)
+    wm: float | None = None       # m/s: a resolved one's (find_vortex_tornadoes) peak ground-relative wind now
 
     @classmethod
     def grown(cls, d: dict) -> "Tornado":
         """A tornado found once, its debris and winds fully grown (fields built alone)."""
         return cls(d["x"], d["y"], s=d["s"], ve=d["ve"], a=d["s"], g=1.0, aw=1.0, seen=TORNADO_CONFIRM,
-                   vrot=d.get("vrot") or 0.0)
+                   vrot=d.get("vrot") or 0.0, wm=d.get("wmax"))
 
 
 class TornadoTracker:
@@ -1666,6 +1671,7 @@ class TornadoTracker:
                 c.vx, c.vy = c.vx + w * (vx - c.vx), c.vy + w * (vy - c.vy)
             c.x, c.y, c.s, c.found = d["x"], d["y"], d["s"], True
             c.vrot = d.get("vrot") or c.vrot
+            c.wm = d.get("wmax")                     # resolved now or not (a coarser grid's detection: None)
             if d["ve"] is not None:
                 c.ve = d["ve"]
         for ci, c in enumerate(self.items):
@@ -1690,7 +1696,7 @@ class TornadoTracker:
         for di, d in enumerate(found):
             if di not in used_d:
                 self.items.append(Tornado(d["x"], d["y"], s=d["s"], ve=d["ve"], a=d["s"], vrot=d.get("vrot") or 0.0,
-                                          id=self._next))
+                                          id=self._next, wm=d.get("wmax")))
                 self._next += 1
         self.items = [c for c in self.items if c.found or c.g > 0.0 or c.aw > 0.01 or c.ej > 0.01]
         # what the radar sees: confirmed tornadoes, and the debris and winds of lost ones dying away

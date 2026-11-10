@@ -2439,12 +2439,14 @@ class Simulation:
             pts = self.tor_paths.setdefault(c.id, [])
             if pts and t - pts[-1][0] < self.TRACK_EVERY:
                 continue
-            wind = c.ve if c.ve is not None else rd.DEBRIS_V0 + c.s * (rd.DEBRIS_V1 - rd.DEBRIS_V0)
+            resolved = c.wm is not None                 # its grid resolves it: the model's own peak wind
+            wind = (c.wm if resolved else c.ve if c.ve is not None
+                    else rd.DEBRIS_V0 + c.s * (rd.DEBRIS_V1 - rd.DEBRIS_V0))
             rad = self._tor_radar.get(c.id, {})
             fresh = t - rad.get("t", -1e9) < 300.0
             vr = rad.get("vrot") if fresh else None
             cc = rad.get("cc") if fresh else None
-            ef = rd.ef_estimate(wind, vr if vr is not None else c.vrot, cc)
+            ef = rd.ef_estimate(wind, vr if vr is not None else c.vrot, cc, resolved=resolved)
             pts.append((t, float(c.x), float(c.y), round(float(wind), 1), round(float(c.vrot), 1),
                         None if vr is None else round(vr, 1), None if cc is None else round(cc, 2), ef))
 

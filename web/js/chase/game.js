@@ -793,11 +793,18 @@ const Chase = (() => {
       st.rolledT = (st.rolledT || 0) + dt;
       if (st.rolledT > 2 && !st.rolledSaid) { st.rolledSaid = true; say('Rolled over by the wind! Press R to get back on your wheels', 6000); }
     } else if (c.upright > 0.8) { st.rolledT = 0; st.rolledSaid = false; }
-    if (!isFinite(c.p[0]) || c.p[2] < -50) resetCar();
+    // fallen through the ground (or lost: NaN): measured against the ground under the car, not the model's zero -- the
+    // detailed world's real terrain lies far below it in low country, and every frame there reset the car again
+    // (the user: "spam teleported", 2026-11-09); and at most once every 3 s, whatever the cause
+    const lost = !isFinite(c.p[0]) || !isFinite(c.p[1]) || !isFinite(c.p[2]);
+    if ((lost || c.p[2] < surfAt(c.p[0], c.p[1]).h - 50) && now - (st.autoResetT || 0) > 3000) {
+      st.autoResetT = now;
+      resetCar();
+    }
     // on foot: you, on the same ground, in the model's wind, against walls, trunks and the car
     if (st.foot) {
       st.foot.update(dt, st.footCtl, { ground, push: footPush, wind: footWind(now), car: c });
-      if (!isFinite(st.foot.p[0]) || st.foot.p[2] < -50) { st.foot = null; say('Back in the car', 1500); }
+      if (!isFinite(st.foot.p[0]) || st.foot.p[2] < surfAt(st.foot.p[0], st.foot.p[1]).h - 50) { st.foot = null; say('Back in the car', 1500); }
     }
     // the detailed map: loaded the first time it is wanted, streamed in round the car (round you, on foot), what the
     // car runs into

@@ -1245,6 +1245,10 @@ class Handler(BaseHTTPRequestHandler):
                 sim.settings["wind_brushes"] = list(body.get("brushes") or [])
                 sim._apply_boundaries()          # the air masses again, with the brushes' winds
                 return self._json({"ok": True})
+            if path == "/api/run/pockets":
+                sim.settings["sounding_pockets"] = list(body.get("pockets") or [])
+                sim.set_pockets()                # the air masses again, with the pockets' air (balanced increments)
+                return self._json({"ok": True})
             if path == "/api/run/fire_area":
                 box = body.get("box")
                 sim.settings["fire_area"] = [float(v) for v in box] if box else None

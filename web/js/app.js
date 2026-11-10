@@ -77,6 +77,7 @@ async function boot() {
   for (const [k, l] of GRID_PRODUCTS.concat(RADAR_PRODUCTS)) $('product').add(new Option(l, k));
   S.soundingFiles = await getJSON('/api/soundings');
   fillSoundingList('');
+  fillPocketList('');
   S.palettes = await getJSON('/api/palettes');
   const st = await getJSON('/api/state');
   if (st.status && st.status !== 'none') adoptRun(st);
@@ -382,6 +383,7 @@ const esc = v => String(v).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
 async function refreshLibraryLists() {
   S.soundingFiles = await getJSON('/api/soundings');
   fillSoundingList($('sndFilter').value);
+  fillPocketList($('pkFilter').value);
   S.palettes = await getJSON('/api/palettes');
   fillPaletteSelect();
 }
@@ -938,6 +940,7 @@ function drawOverlay(g, m) {
   // the automatic warnings in force (warnings_auto.py), NWS colours in a black casing
   if ($('showWarnings').checked && run && run.warnings) drawWarnings(g, m, run.warnings);
   drawBrushes(g, m);
+  drawPockets(g, m);
   // the storm firing area: orange dashes
   const fa = (S.run && S.run.settings && S.run.settings.fire_area) || S.setup.fire_area;
   if (fa) {
@@ -1221,7 +1224,7 @@ function setTool(t) {
   if (S.tool !== 'front') Fronts.cancelDraft();
   for (const [id, name] of [['toolStorm', 'storm'], ['toolZone', 'zone'], ['toolRadar', 'radar'], ['pickCenter', 'center'],
                             ['toolFront', 'front'], ['toolFire', 'fire'], ['toolBrush', 'brush'], ['ndSend', 'nudger'],
-                            ['synSndTool', 'synsnd'], ['synDomainTool', 'fire'], ['toolLow', 'tclow'], ['toolVolume', 'volume'], ['toolTornado', 'tornado'], ['toolMove', 'move'], ['toolDow', 'dow']]) {
+                            ['synSndTool', 'synsnd'], ['synDomainTool', 'fire'], ['toolLow', 'tclow'], ['toolVolume', 'volume'], ['toolTornado', 'tornado'], ['toolMove', 'move'], ['toolDow', 'dow'], ['toolPocket', 'pocket']]) {
     $(id).classList.toggle('on', S.tool === name);
   }
   $('map').classList.toggle('crosshair', S.tool !== 'pan');
@@ -1236,7 +1239,8 @@ function setTool(t) {
     move: 'Drag a patch or a nest to move it (Shift when dropping a patch: lock it there) · click a storm: add a nest on it',
     synsnd: 'Click anywhere: the simulated sounding there (Weather tab)',
     tclow: 'Click over warm water to place a surface low (Tropics tab settings)',
-    brush: 'Hold the mouse and paint: the low-level winds under the stroke change (Atmosphere tab settings)' };
+    brush: 'Hold the mouse and paint: the low-level winds under the stroke change (Atmosphere tab settings)',
+    pocket: 'Click the map: the sounding picked in the Atmosphere tab becomes a pocket there' };
   $('toolhint').textContent = hints[S.tool] || '';
   $('toolhint').classList.toggle('hidden', S.tool === 'pan');
   map.redraw();
@@ -1253,6 +1257,7 @@ async function onMapClick(x, y) {
   }
   if (S.tool === 'synsnd') { Syn.soundingAt(x, y); return; }
   if (S.tool === 'move') { await addNestAt(x, y); return; }
+  if (S.tool === 'pocket') { await placePocket(x, y); return; }
   if (S.tool === 'storm') {
     const st = {
       x: x * 1000, y: y * 1000, kind: $('stormKind').value, motion: $('stormMotion').value,
@@ -1385,6 +1390,77 @@ function drawBrushes(g, m) {
   }
 }
 
+// sounding pockets (pockets.py): other soundings eased into the run's over a radius
+function pocketList() { return (S.setup.sounding_pockets = S.setup.sounding_pockets || []); }
+
+function fillPocketList(filter) {
+  const sel = $('pkList');
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '';
+  sel.add(new Option('The sounding loaded above (with its changes)', '__current__'));
+  const f = (filter || '').toLowerCase();
+  let group = null, og = null, n = 0;
+  for (const it of S.soundingFiles) {
+    if (f && !(it.name.toLowerCase().includes(f) || it.group.toLowerCase().includes(f))) continue;
+    if (it.group !== group) { group = it.group; og = document.createElement('optgroup'); og.label = group; sel.appendChild(og); }
+    og.appendChild(new Option(it.name, it.path));
+    if (++n > 1500) break;
+  }
+  sel.value = [...sel.options].some(o => o.value === cur) ? cur : '__current__';
+}
+
+async function placePocket(x, y) {
+  const sel = $('pkList'), v = sel.value || '__current__';
+  let spec, title;
+  if (v === '__current__') {
+    if (!S.setup.sounding) { alert('Load a sounding first.'); return; }
+    spec = JSON.parse(JSON.stringify(S.setup.sounding));
+    title = (S.snd && S.snd.title) || 'sounding';
+  } else {
+    spec = { file: v };
+    title = sel.options[sel.selectedIndex].text;
+  }
+  pocketList().push({ x_km: +x.toFixed(2), y_km: +y.toFixed(2), radius_km: Math.max(10, +$('pkRadius').value || 60),
+    sounding: spec, title });
+  await pushPockets();
+}
+
+async function pushPockets() {
+  if (runActive()) {
+    try { await api('/api/run/pockets', { pockets: pocketList() }); }
+    catch (e) { alert('Could not change the sounding pockets: ' + e.message); }
+  }
+  renderPockets(); map.redraw();
+}
+
+function renderPockets() {
+  const el = $('pocketList');
+  if (!el) return;
+  el.innerHTML = pocketList().map((p, i) => `<div class="item"><div>${esc(p.title || 'Sounding')} <span class="meta">at ` +
+    `${Math.round(p.x_km)}, ${Math.round(p.y_km)} km, ${p.radius_km} km radius</span></div>` +
+    `<button data-pocket="${i}" title="Remove this pocket">✕</button></div>`).join('');
+}
+
+function drawPockets(g, m) {
+  const list = (S.run && S.run.settings && S.run.settings.sounding_pockets) || S.setup.sounding_pockets || [];
+  for (const p of list) {
+    const [cx, cy] = m.toScreen(p.x_km, p.y_km), r = p.radius_km * m.scale;
+    g.save();
+    g.fillStyle = 'rgba(56,189,248,0.07)';
+    g.beginPath(); g.arc(cx, cy, r, 0, 2 * Math.PI); g.fill();
+    g.strokeStyle = 'rgba(56,189,248,0.75)'; g.lineWidth = 1.5; g.setLineDash([6, 5]);
+    g.beginPath(); g.arc(cx, cy, r, 0, 2 * Math.PI); g.stroke();
+    g.setLineDash([]); g.strokeStyle = 'rgba(56,189,248,0.9)';
+    g.beginPath(); g.arc(cx, cy, 0.35 * r, 0, 2 * Math.PI); g.stroke();
+    g.font = 'bold 11px Segoe UI'; g.fillStyle = '#e0f2fe'; g.strokeStyle = '#000'; g.lineWidth = 3;
+    const label = (p.title || 'Sounding').slice(0, 40);
+    g.strokeText(label, cx + 5, cy - 5); g.fillText(label, cx + 5, cy - 5);
+    g.fillStyle = 'rgba(56,189,248,0.95)'; g.fillRect(cx - 3, cy - 3, 6, 6);
+    g.restore();
+  }
+}
+
 // the storm firing area (sim._start_box): for the next run, and for the running one at once
 async function setFireArea(box) {
   S.setup.fire_area = box;
@@ -1513,6 +1589,7 @@ function renderLists() {
   Fronts.render();
   showFireNote();
   renderBrushes();
+  renderPockets();
 }
 
 function setHTML(id, html) {
@@ -1644,6 +1721,13 @@ function bindUI() {
   $('toolBrush').onclick = () => { map.brushKm = +$('brSize').value; setTool('brush'); };
   $('brSize').onchange = () => { map.brushKm = +$('brSize').value; };
   $('brClear').onclick = () => { S.setup.wind_brushes = []; pushBrushes(); };
+  $('toolPocket').onclick = () => setTool('pocket');
+  $('pkFilter').oninput = () => fillPocketList($('pkFilter').value);
+  $('pkClear').onclick = () => { S.setup.sounding_pockets = []; pushPockets(); };
+  $('pocketList').addEventListener('click', e => {
+    const b = e.target.closest('button[data-pocket]');
+    if (b) { pocketList().splice(+b.dataset.pocket, 1); pushPockets(); }
+  });
   $('brushList').addEventListener('click', e => {
     const b = e.target.closest('button[data-brush]');
     if (b) { brushList().splice(+b.dataset.brush, 1); pushBrushes(); }

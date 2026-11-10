@@ -360,8 +360,9 @@ class Patch:
         """Air-mass maps (boundaries.MAP_NAMES) of this patch at time t, on the device."""
         import cupy as cp
         am = self.env.airmass
-        if self.env.terrain is not None:
-            # each column over its own ground: 3-D rim / keep targets (forcing._apply_synoptic)
+        if self.env.terrain is not None or getattr(am, "pockets", None) is not None:
+            # each column over its own ground, or its own blend of soundings: 3-D rim / keep targets
+            # (forcing._apply_synoptic)
             self.am_maps = self.env.terrain_targets(self.rect, t)
             self.am_time = t
             return

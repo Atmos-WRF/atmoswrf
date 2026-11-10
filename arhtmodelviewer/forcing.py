@@ -721,7 +721,8 @@ def _has_fronts(patch) -> bool:
     synoptic mode's simulated atmosphere."""
     am = patch.env.airmass
     return getattr(patch, "am_maps", None) is not None and (bool(getattr(am, "boundaries", None))
-                                                            or getattr(am, "synoptic", False))
+                                                            or getattr(am, "synoptic", False)
+                                                            or getattr(am, "pockets", None) is not None)
 
 
 def _synoptic_level0(patch, maps):

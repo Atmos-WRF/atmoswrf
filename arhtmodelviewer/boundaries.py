@@ -524,8 +524,9 @@ class AirMasses:
     small variations, ``texture``, wherever no air mass covers it, and the hodograph brushes' winds)."""
 
     def __init__(self, boundaries: list[Boundary], env, texture: WarmSectorTexture | None = None,
-                 brushes: list | None = None):
+                 brushes: list | None = None, pockets=None):
         self.boundaries = list(boundaries)
+        self.pockets = pockets if pockets else None     # pockets.SoundingPockets: more soundings eased in
         self.env = env
         self.texture = texture
         u0, v0 = float(env.u_ground[0]), float(env.v_ground[0])
@@ -555,7 +556,7 @@ class AirMasses:
         return ur - u0 + jet * ex, vr - v0 + jet * ey
 
     def __bool__(self):
-        return bool(self.boundaries) or self.texture is not None or bool(self.brushes)
+        return bool(self.boundaries) or self.texture is not None or bool(self.brushes) or self.pockets is not None
 
     def maps(self, X: np.ndarray, Y: np.ndarray, t: float) -> dict:
         """Per-column anomaly parameters at ground points (X, Y) (m) and time t (s)."""

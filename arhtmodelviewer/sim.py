@@ -423,6 +423,7 @@ class Simulation:
         self.nudger_plans: list[dict] = []      # scheduled nudgers (settings "nudgers"), each with an id
         self._plans_done: set = set()
         self.boundaries: list[Boundary] = []
+        self.pockets = None                     # pockets.SoundingPockets: more soundings eased into the run's
         self.lows = []
         self.tracks = products.TrackStore()
         from .efswath import EFSwath
@@ -588,6 +589,7 @@ class Simulation:
                                   "is that far round from the grid's north")
         self.env = Environment(grid_snd, grid, phys, motion=motion)
         self.env.start_time = start
+        self._build_pockets(s, hc)
         self.env.latlon = lambda X, Y: self.proj.inv(X, Y)
         self.env.longitude = float(self.proj.lon0)
         if self.terrain_on:
@@ -1242,9 +1244,55 @@ class Simulation:
 
     def _airmasses(self):
         brushes = self.settings.get("wind_brushes") or []
-        if not (self.boundaries or self.texture is not None or brushes):
+        if not (self.boundaries or self.texture is not None or brushes or self.pockets):
             return None
-        return AirMasses(self.boundaries, self.env, self.texture, brushes)
+        return AirMasses(self.boundaries, self.env, self.texture, brushes, self.pockets)
+
+    def set_pockets(self) -> None:
+        """The running run's sounding pockets changed (server /api/run/pockets): built again and put in."""
+        if self.env is None:
+            return
+        self.pockets = None
+        self._build_pockets(self.settings, self._hurricane())
+        if self.synoptic is None:
+            self._apply_boundaries()
+
+    def _build_pockets(self, s: dict, hc: dict) -> None:
+        """The run's sounding pockets (pockets.py): each sounding eased into the run's over its radius, its winds
+        turned onto the grid as the run's are."""
+        specs = s.get("sounding_pockets") or []
+        if not specs:
+            return
+        if hc.get("on") or self._syn_cfg().get("on"):
+            self.notes.append("sounding pockets are not used in hurricane or synoptic runs (their air is their own)")
+            return
+        import dataclasses
+        from . import pockets as pk
+
+        def turn(snd_):
+            a = float(self.proj.north_angle(self._turn_lon)) if self._turn_lon is not None else 0.0
+            if abs(a) <= 0.05:
+                return snd_
+            gu, gv = self.proj.to_grid(np.asarray(snd_.u), np.asarray(snd_.v), self._turn_lon)
+            return dataclasses.replace(snd_, u=np.asarray(gu), v=np.asarray(gv))
+
+        try:
+            self.pockets = pk.from_settings(specs, self.env, load_sounding, turn)
+        except Exception as exc:
+            self.pockets = None
+            self.notes.append(f"sounding pockets left out: {exc}")
+            return
+        if self.pockets:
+            from .sounding import diagnostics
+            for d, it in zip([d for d in specs if d.get("sounding")], self.pockets.items):
+                try:
+                    dg = diagnostics(load_sounding(d["sounding"]))
+                    extra = (f": MLCAPE {dg.get('mlcape') or 0:.0f} J/kg, 0-6 km shear "
+                             f"{dg.get('shear6') or 0:.0f} m/s, 0-1 km SRH {dg.get('srh1') or 0:.0f} m2/s2")
+                except Exception:
+                    extra = ""
+                self.notes.append(f"sounding pocket {it['title'] or 'sounding'} at ({it['x'] / 1000:.0f}, "
+                                  f"{it['y'] / 1000:.0f}) km, {it['r'] / 1000:.0f} km across its blend{extra}")
 
     def _apply_boundaries(self) -> None:
         t = self.engine.t if self.engine else 0.0

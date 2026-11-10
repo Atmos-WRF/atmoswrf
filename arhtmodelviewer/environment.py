@@ -496,6 +496,10 @@ class Environment:
             thp_am, qfac, _, _ = self.airmass.fields_3d(m, self.z_h)
             thp = thp + thp_am
             qv = qv * qfac
+            pk = self._pockets(X, Y)
+            if pk is not None:
+                thp = thp + pk[0]
+                qv = qv * pk[1]
         dth = getattr(self, "ls_dth", None)
         if dth is not None and np.any(dth):              # large-scale ascent so far (largescale.py)
             thp = thp + np.asarray(dth)[:, None, None]
@@ -514,8 +518,9 @@ class Environment:
     TERRAIN_STRIDE = 2           # rim / keep targets of terrain patches every this many cells
 
     def terrain_targets(self, rect, t: float) -> dict:
-        """Rim (and air-mass keep) targets of a patch over the terrain, the synoptic-target layout
-        (forcing._apply_synoptic): u, v, theta', qv (nz, cy, cx) at every TERRAIN_STRIDE-th cell centre."""
+        """Rim (and air-mass keep) targets of a patch over the terrain -- or on flat ground with sounding pockets,
+        whose columns the air-mass maps cannot describe -- in the synoptic-target layout (forcing._apply_synoptic):
+        u, v, theta', qv (nz, cy, cx) at every TERRAIN_STRIDE-th cell centre."""
         import cupy as cp
         s = self.TERRAIN_STRIDE
         cx, cy = max(1, -(-rect.nx // s)), max(1, -(-rect.ny // s))
@@ -524,14 +529,28 @@ class Environment:
         x = (rect.i0 + (np.arange(cx) + 0.5) * s) * dx + ox
         y = (rect.j0 + (np.arange(cy) + 0.5) * s) * dx + oy
         X, Y = np.meshgrid(x, y)
-        _, thp, qv, _, _ = self.terrain_columns(X, Y, t)
-        out = {"thp": thp, "qv": qv, "u": self.terrain_wind(X, Y, t, "u"), "v": self.terrain_wind(X, Y, t, "v")}
+        if self.terrain is not None:
+            _, thp, qv, _, _ = self.terrain_columns(X, Y, t)
+            out = {"thp": thp, "qv": qv, "u": self.terrain_wind(X, Y, t, "u"), "v": self.terrain_wind(X, Y, t, "v")}
+        else:
+            thp, qv, _, _ = self.airmass_columns(X, Y, t)
+            out = {"thp": thp, "qv": qv, "u": self.u_env[:, None, None] + self.airmass_wind(X, Y, t, "u"),
+                   "v": self.v_env[:, None, None] + self.airmass_wind(X, Y, t, "v")}
         maps = {k: cp.asarray(v, dtype=cp.float32) for k, v in out.items()}
         maps.update(cy=cy, cx=cx, stride=float(s), keep=bool(self.airmass))
         if self.airmass and not getattr(self.airmass, "synoptic", False):
             # the boundaries' keep as on flat ground: kept air masses, the backed winds ahead of them and
-            # the frontal zones' hold (forcing.relax_target3d), not only the edge rim
+            # the frontal zones' hold (forcing.relax_target3d), not only the edge rim; and the sounding pockets'
+            # gentle hold (pockets.keep_maps), deeper
             m = self.airmass.maps(X, Y, t)
+            pk = getattr(self.airmass, "pockets", None)
+            if pk is not None:
+                from .pockets import keep_maps
+                kt, kw, kh = keep_maps(pk, X, Y)
+                for h, w, k in (("H", "nudge", kt), ("Hq", "nudge", kt), ("Hw", "wnudge", kw)):
+                    m[h] = np.where(k > m[w], kh, m[h])
+                m["nudge"] = np.maximum(m["nudge"], kt)
+                m["wnudge"] = np.maximum(m["wnudge"], kw)
             if np.any(m["nudge"] > 0) or np.any(m["wnudge"] > 0):
                 g = {k: cp.asarray(m[k], dtype=cp.float32)
                      for k in ("nudge", "wnudge", "H", "Hq", "Hw", "hold", "pin", "pin_lo")}
@@ -569,6 +588,10 @@ class Environment:
         thp, qfac, _, _ = self.airmass.fields_3d(m, self.z_h)
         qv_env = xp.asarray(self.qv_f(self.z_h)).reshape((-1,) + (1,) * (thp.ndim - 1))
         qv = qv_env * qfac
+        pk = self._pockets(X, Y, xp)
+        if pk is not None:
+            thp = thp + pk[0]
+            qv = qv * pk[1]
         dth = getattr(self, "ls_dth", None)
         if dth is not None and np.any(dth):              # large-scale ascent so far (largescale.py)
             shape = (-1,) + (1,) * (thp.ndim - 1)
@@ -583,7 +606,15 @@ class Environment:
         if xp is not np:
             m = self.airmass.to_device(m)
         _, _, du, dv = self.airmass.fields_3d(m, self.z_h)
+        pk = self._pockets(X, Y, xp)
+        if pk is not None:
+            du, dv = du + pk[2], dv + pk[3]
         return du if which == "u" else dv
+
+    def _pockets(self, X, Y, xp=np, levels=None):
+        """The sounding pockets' (theta' added, vapour factor, du, dv) at ground points, or None."""
+        pk = getattr(self.airmass, "pockets", None) if self.airmass else None
+        return pk.fields(X, Y, xp, levels) if pk is not None else None
 
     def new_state(self, cfg, rect=None):
         """A gpuwm state for ``cfg``: the environment, plus the air masses of the

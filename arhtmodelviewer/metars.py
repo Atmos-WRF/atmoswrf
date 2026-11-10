@@ -223,6 +223,12 @@ class MetarNet:
                 qv *= np.asarray(qf[0], float)
                 u += np.asarray(du[0], float)
                 v += np.asarray(dv[0], float)
+                pk = env._pockets(X, Y, levels=slice(0, 1))
+                if pk is not None:
+                    th += np.asarray(pk[0][0], float)
+                    qv *= np.asarray(pk[1][0], float)
+                    u += np.asarray(pk[2][0], float)
+                    v += np.asarray(pk[3][0], float)
             except Exception:
                 pass
         return u, v, th, qv, p, tke

@@ -148,6 +148,21 @@
       <div class="row buttons"><button id="toolBrush" class="tool" title="Hold the mouse and paint on the map: the low-level winds under the stroke change as set above, smoothed out toward its edge and its ends">Paint on the map</button>
         <button id="brClear" title="Remove every hodograph brush stroke">Clear strokes</button></div>
       <div id="brushList" class="list"></div>
+      <h3>Sounding pockets (more soundings on the map)</h3>
+      <p class="hint">Put other soundings on the map: each is the air within its radius (all of it in the inner third,
+        easing into the run's own sounding by its edge), so you can have a pocket of stronger shear, a moister
+        boundary layer or weaker lapse rates where you want it. Overlapping pockets share the air between them.
+        New patches and their edges start from the blend, and the patches are held to it gently (storms keep their
+        own air). Not used in hurricane or simulated-weather runs.</p>
+      <div class="row buttons">
+        <input id="pkFilter" type="search" placeholder="Filter soundings…" style="flex:1">
+        <label title="How far the pocket reaches: its own sounding within a third of this, eased out to the run's by here">Radius (km)
+          <input id="pkRadius" type="number" value="60" min="10" max="400" step="5" style="width:58px"></label>
+      </div>
+      <select id="pkList" size="5" title="The sounding to place (the first entry: the one loaded above, with its changes)"></select>
+      <div class="row buttons"><button id="toolPocket" class="tool" title="Click the map: the sounding picked above becomes a pocket there (during a run as well: the air there changes at once, balanced)">Place on the map</button>
+        <button id="pkClear" title="Remove every sounding pocket">Clear pockets</button></div>
+      <div id="pocketList" class="list"></div>
       </div>
       <div id="sndTitle" class="title"></div>
       <div class="row buttons snd-actions"><button id="sndEdit" title="Open the sounding in an editor: every level in a table, points to drag on a large skew-T and hodograph, the parameters recomputed as you go (or double-click the skew-T)">Edit level by level…</button>

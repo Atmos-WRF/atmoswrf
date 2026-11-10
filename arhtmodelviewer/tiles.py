@@ -20,7 +20,7 @@ from . import PROJECT
 
 CACHE = PROJECT / "output" / "cache" / "tiles"
 TILE_DAYS = 30
-UA = "Atmos-WRF/1.2 (storm model viewer; +https://github.com/Atmos-WRF/atmoswrf)"
+UA = "Atmos-WRF/2.0 (storm model viewer; +https://github.com/Atmos-WRF/atmoswrf)"
 # id: (URL template, max zoom, attribution, tile size)
 SOURCES = {
     "osm": ("https://tile.openstreetmap.org/{z}/{x}/{y}.png", 19, "© OpenStreetMap contributors"),

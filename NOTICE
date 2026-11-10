@@ -27,3 +27,13 @@ The 3-D view's landscape, fetched while running (not included):
 - ESA WorldCover 10 m 2021 v200, (c) ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data
   (2021) processed by ESA WorldCover consortium (CC BY 4.0).
 - Roads from OpenStreetMap, (c) OpenStreetMap contributors (ODbL), through the Overpass API.
+
+Chase mode:
+- web/js/chase/world/ (the Detailed map) is built by tools/world/build_world.py from OpenDrive (formerly
+  "Real Roads Drive"), a single-page driving world made by a friend of the author.
+- Car models: Kenney's Car Kit 3.1 (www.kenney.nl), Creative Commons Zero (CC0) 1.0.
+- three.js (MIT License, (c) three.js authors) and earcut (ISC License, (c) Mapbox), loaded from jsDelivr.
+- Fetched while running (not included): FEMA USA Structures (public domain, U.S. Government); OpenFreeMap vector
+  tiles ((c) OpenMapTiles, data (c) OpenStreetMap contributors, ODbL); AWS Terrain Tiles (Mapzen terrarium: SRTM,
+  GMTED, NED, ETOPO and others); NAIP and Sentinel-2 imagery and USDA Cropland Data Layer through Microsoft's
+  Planetary Computer; ESA WorldCover (CC BY 4.0); Poly Haven textures (CC0).

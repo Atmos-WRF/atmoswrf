@@ -9,6 +9,7 @@
 const WorldLink = (() => {
   const st = { W: null, loading: false, err: '', proj: null, zOff: null, ready: false };
   const D2R = Math.PI / 180;
+  const PUSH_MAX = 6;                                   // m: the most a wall pushes the car (or you) back in a frame
   // the run's map plane (as map.js): metres <-> degrees
   function inv(x, y) {
     const p = st.proj, dy = p.rho0 - y, sg = p.n > 0 ? 1 : -1;
@@ -85,6 +86,10 @@ const WorldLink = (() => {
     const V = st.W.collide({ x: wx, z: wz, y: p[2] + st.zOff, heading: Math.atan2(fw[0], fw[2]), vx: vw[0], vz: vw[2],
                              yawRate: yr, len: dims[0] / sc, wid: dims[1] / sc, kg: S.mass || 2150,
                              Iz: car.I ? car.I[2] / (sc * sc) : 4800, wheelR: S.wheelR || 0.38 });
+    // deep inside a footprint (put there by a reset, a jump or the start on chase's own roads, or a big site mapped
+    // as one building): the map would throw it out to the nearest wall, up to a few hundred metres in one frame
+    // ("spam teleported", 2026-11-09). A car that drove in is at most a few metres in, so such a push is let go
+    if (Math.hypot(V.x - wx, V.z - wz) * sc > PUSH_MAX) return false;
     const moved = Math.hypot(V.x - wx, V.z - wz) > 1e-4 || Math.hypot(V.vx - vw[0], V.vz - vw[2]) > 1e-4;
     if (car.w && Math.abs(V.yawRate - yr) > 1e-6) car.w[2] = V.yawRate;   // a corner clipped: the car turned
     if (!moved) return false;
@@ -101,6 +106,7 @@ const WorldLink = (() => {
     const [wx, wz] = toW(x, y), d = st.W.pushOut(wx, wz, rad);
     if (!d) return null;
     const a = fromW(wx + d[0], wz + d[1]);
+    if (Math.hypot(a[0] - x, a[1] - y) > PUSH_MAX) return null;           // deep inside (as collide)
     return [a[0] - x, a[1] - y];
   }
 

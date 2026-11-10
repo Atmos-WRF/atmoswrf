@@ -90,11 +90,20 @@ const Chase = (() => {
     if (!g.road && st.wet > 0.5 && [SURF.grass, SURF.crops, SURF.bare].includes(s)) s = SURF.mud;
     if (g.water > 0.25) s = SURF.water;
     let h = g.h;
+    const world = true;
     if (s.rough) h += s.rough * (vnoise(x / 1.6, y / 1.6) + 0.5 * vnoise(x / 0.55 + 31, y / 0.55)) - s.rough * 0.6;
-    return { h, s };
+    return { h, s, world };
   }
   const detailed = () => st.vis && st.vis.map !== 'basic';
+  // the ground under a point, kept continuous where the detailed map's tiles come and go (groundTrack): its offset
+  // from the model's terrain carried on where a tile has not come in, and any step left when the car's ground
+  // changes source eased out over a second or more instead of a jump
   function surfAt(x, y) {
+    const r = surfRaw(x, y);
+    if (st.gShift) r.h += st.gShift;
+    return r;
+  }
+  function surfRaw(x, y) {
     const ap = Stations.apron(x, y);                   // a gas station's concrete (stations.js)
     if (ap !== null) return { h: ap, s: st.wet > 0.3 ? SURF.wet : SURF.asphalt };
     const w = worldSurf(x, y);
@@ -107,7 +116,7 @@ const Chase = (() => {
       s = SURF[LC[Land.coverAt(x / 1000, y / 1000)] || 'grass'];
       if (st.wet > 0.5 && ['grass', 'crops', 'bare', 'verge'].includes(LC[Land.coverAt(x / 1000, y / 1000)])) s = SURF.mud;
     }
-    let h = Render.terrain(x, y) + r.raise;
+    let h = Render.terrain(x, y) + r.raise + (st.gOff !== null && st.gOff !== undefined && detailed() ? st.gOff : 0);
     if (s.rough) h += s.rough * (vnoise(x / 1.6, y / 1.6) + 0.5 * vnoise(x / 0.55 + 31, y / 0.55)) - s.rough * 0.6;
     if (s === SURF.water) h -= 0.35;
     return { h, s };
@@ -760,6 +769,35 @@ const Chase = (() => {
     return { eye, target: eye.map((v, i) => v + dir[i] * 10), up: M[2], fov: cam.mode === 'driver' ? 1.2 : 1.1 };
   }
 
+  // once a frame, round the car (or you, on foot): the detailed map's ground less the model's terrain (gOff, used
+  // where its tiles have not come in yet, so the ground there is the model's shape at the map's level), and when the
+  // ground under the car changes source (a tile came in or is not there yet, the map switched) the difference eased
+  // out (gShift) over 1.2-8 s (at most ~6 m/s) -- not a snap that drops the car or buries it and sets it back on the
+  // road ("spam teleported", 2026-11-09).  A jump (G, a reset far away) starts afresh.
+  function groundTrack(b, now) {
+    const x = b.p[0], y = b.p[1];
+    if (!isFinite(x) || !isFinite(y)) return;
+    const jump = !st.gPos || Math.hypot(x - st.gPos[0], y - st.gPos[1]) > 200;
+    st.gPos = [x, y];
+    const g = detailed() && WorldLink.ready() ? WorldLink.ground(x, y, b.p[2]) : null;
+    if (g) st.gOff = g.h - Render.terrain(x, y) - Roads.at(x, y).raise;
+    const raw = surfRaw(x, y), src = raw.world ? 1 : 0;
+    if (jump) st.gBlend = null;
+    else if (src !== st.gSrc && isFinite(st.gLastH)) {
+      const d = st.gLastH - raw.h;
+      if (Math.abs(d) > 0.05) st.gBlend = { d, t: now, T: Math.min(8000, Math.max(1200, Math.abs(d) / 6 * 1000)) };
+    }
+    st.gSrc = src;
+    st.gShift = 0;
+    if (st.gBlend) {
+      const f = 1 - (now - st.gBlend.t) / st.gBlend.T;
+      if (f > 0) st.gShift = st.gBlend.d * f * f * (3 - 2 * f);   // smooth (eases in and out)
+      else st.gBlend = null;
+    }
+    st.gLastH = raw.h + st.gShift;
+  }
+  function groundJump() { st.gOff = null; st.gBlend = null; st.gShift = 0; st.gPos = null; st.gLastH = NaN; }
+
   // ---------------------------------------------------------------- the frame
   function tick(now) {
     const dt = Math.min(0.1, (now - st.last) / 1000);
@@ -787,6 +825,7 @@ const Chase = (() => {
     const pr = Render.sample ? Render.sample(c.p[0], c.p[1]) : 0;
     st.rain += (pr - st.rain) * Math.min(1, dt * 0.5);
     st.wet = Math.max(st.wet - dt / 600, Math.min(1, st.rain / 0.6));
+    groundTrack(st.foot || c, now);                    // (a tile that came in since: eased before the car steps on it)
     if (st.spawned) c.update(dt);
     // rolled over (on its side or roof, stopped): R puts it back on its wheels on the road
     if (st.spawned && !st.foot && c.upright < 0.35 && c.speed < 3) {
@@ -813,6 +852,7 @@ const Chase = (() => {
       WorldLink.update(st.foot || c, Render.terrain);
       if (st.spawned) WorldLink.collide(c);
     }
+    groundTrack(st.foot || c, now);
     if (Scenery.updateTrees(c.p[0], c.p[1], Render.terrain, TREE_BUDGET[st.vis.trees] || 0)) {
       const ss = Scenery.state;
       Render.setTrees(ss.trees, ss.treeN, ss.treeNear, ss.treeOrigin);
@@ -1355,8 +1395,9 @@ const Chase = (() => {
     const c = st.car;
     if (!c) return;
     const s = storm(), yaw = s ? Math.atan2(s.y - y, s.x - x) : c.yaw;
-    c.reset(x, y, yaw);
     WorldLink.moved();
+    groundJump();
+    c.reset(x, y, yaw);
     st.cam.yaw = yaw; st.cam.eye = null;
     Object.assign(st, { spawned: false, dropT: 0, offroadStart: null, mmPan: null,
                         spawnHint: { x, y, yaw, what: s ? s.what : 'the storm' } });

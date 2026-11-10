@@ -1357,7 +1357,10 @@ TORNADO_CONFIRM = 120.0       # s
 # Only storm-start and nudger pushes and hurricane eyewalls still rule one out (Simulation._tornado_ok(forced_only)).
 VORTEX_DX = 200.0             # m: grids this fine or finer
 VORTEX_ZETA = 0.03            # 1/s at the lowest level: a candidate's core
-VORTEX_VT = 18.0              # m/s of azimuthal-mean tangential wind
+VORTEX_VT = 18.0              # m/s of azimuthal-mean tangential wind (grids of 100 m or finer) ...
+VORTEX_VT_COARSE = 12.0       # ... easing to this at VORTEX_DX: a 200 m grid smooths a tornado's core over two or three
+                              # cells, its tangential wind reads ~zeta r / 2 (a 0.14/s vortex with 33 m/s ground winds
+                              # read 14 m/s at 200 m and was missed, test run 2026-11-10)
 VORTEX_RMAX = 1000.0          # m
 VORTEX_REACH_X = 2.0          # x the radius of the peak tangential wind
 
@@ -1522,6 +1525,7 @@ def find_vortex_tornadoes(f: "PatchRadarFields", env) -> list:
     if not bool(peak.any()):
         return []
     spd = cp.hypot(u0, v0)
+    vt_need = VORTEX_VT + (VORTEX_VT_COARSE - VORTEX_VT) * min(max((dx - 100.0) / (VORTEX_DX - 100.0), 0.0), 1.0)
     jj, ii = cp.nonzero(peak)
     order = cp.argsort(-zeta[jj, ii])[:8]
     found = []
@@ -1529,11 +1533,11 @@ def find_vortex_tornadoes(f: "PatchRadarFields", env) -> list:
         x, y = _peak_xy(zeta, j, i, f)
         rr, vt = vortex_profile(u0, v0, x, y, f)
         k = int(np.argmax(vt))
-        if vt[k] < VORTEX_VT or rr[k] > VORTEX_RMAX:
-            continue
         m = max(1, int(math.ceil(VORTEX_REACH_X * rr[k] / dx)))
         blk = spd[max(j - m, 0):j + m + 1, max(i - m, 0):i + m + 1]
         wmax = float(blk.max()) if blk.size else 0.0
+        if vt[k] < vt_need or rr[k] > VORTEX_RMAX:
+            continue
         if wmax < EF_WIND[0]:
             continue
         found.append({"x": x, "y": y, "s": min(max((wmax - EF_WIND[0]) / (DEBRIS_V1 - EF_WIND[0]), 0.02), 1.0),

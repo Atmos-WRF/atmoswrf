@@ -875,6 +875,11 @@ async function drawFrame() {
     }
   } catch (e) {
     if (radar) { map.setPPI(null); S.ppiInfo = null; }
+    else if (/no product/.test(e.message || '')) {
+      // a product this frame has not got (the EF swath before any tornado): an empty map, not the last product's
+      map.setRaster(null); S.rasterInfo = null;
+      try { drawLegend(await paletteFor(product), Colors.PRODUCT_PALETTE[product]); } catch (e2) { /* no legend */ }
+    }
   }
 }
 

@@ -16,6 +16,13 @@ INNER = 0.35          # x the radius: the pocket's own sounding, unblended
 KEEP_WIND = 0.5       # the pocket's winds held at this share of the air-mass keep rate (Engine airmass_keep_tau)
 KEEP_THERMO = 0.25    # ... and its theta / vapour (storms keep their own heating and outflow)
 KEEP_DEPTH = 6000.0   # m: held up to about this height (forcing's taper ends ~1.3 km above it)
+# the pocket's own air only in the troposphere: its theta and vapour differences fade out over THERMO_FADE (m AGL),
+# its winds over WIND_FADE.  Two soundings' tropopauses and stratospheres differ by kilometres and 10-20 K (CBN
+# 27 April 2011 vs OUN 3 May 1999: +12 K at 11 km, +17 K at 14 km); blended over a pocket's edge that was a
+# front aloft no atmosphere has, held there, and it drove rings of updrafts round the pocket (test run 2026-11-10)
+THERMO_FADE = (9000.0, 12000.0)
+WIND_FADE = (12000.0, 15000.0)
+WARN_DTH = 2.0        # K below 8 km: a contrast that will act as a front across the pocket's edge (noted in the Log)
 
 
 def _smoothstep(a, b, x, xp=np):
@@ -32,14 +39,19 @@ class SoundingPockets:
         ztop = env.grid.ztop + 5000.0
         th0, q0 = env.theta_f(z), np.maximum(env.qv_f(z), 1e-7)
         u0, v0 = np.asarray(env.u_ground, np.float64), np.asarray(env.v_ground, np.float64)
+        ft = 1.0 - _smoothstep(*THERMO_FADE, z)
+        fw = 1.0 - _smoothstep(*WIND_FADE, z)
+        low = z < 8000.0
         for it in items:
             th, qv, uf, vf = it["sounding"].profile_functions(ztop=ztop)
+            dth = (th(z) - th0) * ft
             self.items.append({
                 "x": float(it["x"]), "y": float(it["y"]), "r": max(float(it["radius"]), 2000.0),
                 "title": getattr(it["sounding"], "title", "") or "",
-                "dth": th(z) - th0,
-                "qr": np.clip(np.maximum(qv(z), 1e-7) / q0, 0.05, 6.0),
-                "du": uf(z) - u0, "dv": vf(z) - v0,
+                "dth": dth,
+                "qr": 1.0 + (np.clip(np.maximum(qv(z), 1e-7) / q0, 0.05, 6.0) - 1.0) * ft,
+                "du": (uf(z) - u0) * fw, "dv": (vf(z) - v0) * fw,
+                "dth_max": float(np.max(np.abs(dth[low]))) if low.any() else 0.0,
             })
         self._dev = {}
 

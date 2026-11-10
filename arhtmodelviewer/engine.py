@@ -1104,7 +1104,7 @@ class Engine:
         """A fixed-size domain takes a storm start inside it, or shifts to hold it along
         with the storms it has; a start it cannot hold is refused (False).  The first
         start places the domain."""
-        core = self._start_rect(s).expanded(self.trigger)
+        core = self._shaped(self._start_rect(s).expanded(self.trigger))
         if not self.patches:
             if self._commit(self._fixed_rect(core, core), [], f"storm start #{s.id}") is None:
                 self._wait_for_memory(s)
@@ -1113,7 +1113,7 @@ class Engine:
         if p.rect.contains(core):
             return True
         box = self._activity_box(p)
-        hold = core if box is None else core.union(box.expanded(self.trigger))
+        hold = core if box is None else core.union(self._shaped(box.expanded(self.trigger)))
         b = self.opt.block                           # a block to spare, as in _follow_fixed
         if hold.nx <= self.fixed - b and hold.ny <= self.fixed_ny - b:
             if self._commit(self._fixed_rect(hold, hold), [p], f"storm start #{s.id}") is None:
@@ -1139,6 +1139,35 @@ class Engine:
 
         return Rect(edge(around.i0 + 0.5 * around.nx + lead[0], hold.i0, hold.i1, nx),
                     edge(around.j0 + 0.5 * around.ny + lead[1], hold.j0, hold.j1, ny), nx, ny)
+
+    def _shape_margins(self):
+        """A shaped fixed domain (domain_shape): cells (west, south, east, north) between its box and the largest
+        rectangle inside its outline, or None for a plain box."""
+        if not (self.fixed and self.opt.domain_shape):
+            return None
+        m = getattr(self, "_shape_m", None)
+        if m is None:
+            fx0, fy0, fx1, fy1 = forcing.shape_inner_rect(self.opt.domain_shape)
+            # the rim's own width is inside the box already (trigger): only what the outline takes on top of it
+            m = self._shape_m = (int(math.ceil(fx0 * self.fixed)), int(math.ceil(fy0 * self.fixed_ny)),
+                                 int(math.ceil((1.0 - fx1) * self.fixed)), int(math.ceil((1.0 - fy1) * self.fixed_ny)))
+        return m
+
+    def _shaped(self, r: Rect) -> Rect:
+        """What the box must hold for ``r`` to be inside a shaped domain's outline: ``r`` grown by the margins
+        between the box and the outline's inner rectangle (``r`` itself for a plain box).  A storm the domain
+        placed in a corner of its box sat outside an ellipse, where the outside's relaxation killed it."""
+        m = self._shape_margins()
+        if not m:
+            return r
+        return Rect(r.i0 - m[0], r.j0 - m[1], r.nx + m[0] + m[2], r.ny + m[1] + m[3])
+
+    def _inner_side(self) -> int:
+        """The fixed domain's smaller side in cells, inside its outline when shaped."""
+        m = self._shape_margins()
+        if not m:
+            return min(self.fixed, self.fixed_ny)
+        return min(self.fixed - m[0] - m[2], self.fixed_ny - m[1] - m[3])
 
     def _fixed_rect(self, around: Rect, hold: Rect, lead=(0.0, 0.0)) -> Rect:
         """The fixed-size domain centred on ``around``, shifted as little as needed to hold ``hold``."""
@@ -1181,9 +1210,12 @@ class Engine:
             return None
         p = self.patches[0]
         dx = self.env.grid.dx
-        inset = self.trigger * dx + 15000.0          # its edge zone and a storm start's radius
+        # its edge zone (or a shaped domain's margin to its outline's inner rectangle, whichever is wider) and a
+        # storm start's radius
+        m = self._shape_margins() or (0, 0, 0, 0)
+        w, so, e, n = (max(self.trigger, k) * dx + 15000.0 for k in m)
         x0, y0 = p.world_x0(), p.world_y0()
-        return (x0 + inset, y0 + inset, x0 + p.rect.nx * dx - inset, y0 + p.rect.ny * dx - inset)
+        return (x0 + w, y0 + so, x0 + p.rect.nx * dx - e, y0 + p.rect.ny * dx - n)
 
     # ---------------------------------------------------------- patches
     def total_cells(self) -> int:
@@ -1666,7 +1698,7 @@ class Engine:
     def _follow_fixed(self, p: Patch, box: Rect) -> None:
         """A fixed-size domain shifts (it never grows) to keep its storms away from its
         edges, or, once they no longer fit in it, its strongest storm."""
-        n, b = min(self.fixed, self.fixed_ny), self.opt.block
+        n, b = self._inner_side(), self.opt.block
         hr = self._hold_rect()
         if hr is not None:
             # a hurricane run: the domain stays centred on its cyclone (rainbands and outer cells must not
@@ -1678,14 +1710,15 @@ class Engine:
                 if rect != p.rect:
                     self._commit(rect, [p], "following the cyclone")
             return
-        hold, why = box.expanded(self.trigger), "following the storms"
+        every = self._shaped(box.expanded(self.trigger))
+        hold, why = every, "following the storms"
         # a block to spare: a box any bigger may fit no block-aligned place, and the domain would
         # hop between two places every minute
         if hold.nx > self.fixed - b or hold.ny > self.fixed_ny - b:
             core = self._main_updraft(p)
             if core is None:
                 return                            # no deep updraft left to follow: stay
-            hold, why = core.expanded(self.trigger), "following its strongest storm"
+            hold, why = self._shaped(core.expanded(self.trigger)), "following its strongest storm"
         ride = self._ride(p)
         if ride is not None:
             if ride != p.rect:
@@ -1693,7 +1726,7 @@ class Engine:
             return
         core = self._storms_core(p, n)
         if core is not None:
-            rect = self._storm_window(p, core, self.fixed, hold if hold == box.expanded(self.trigger) else None,
+            rect = self._storm_window(p, core, self.fixed, hold if hold == every else None,
                                       ny=self.fixed_ny)
             if rect is not None:
                 self._commit(rect, [p], why)
@@ -1732,7 +1765,7 @@ class Engine:
             return None
         win = self._drift_window(p) or p.rect
         core = self._main_updraft(p)
-        if core is not None and not win.contains(core.expanded(self.trigger)):
+        if core is not None and not win.contains(self._shaped(core.expanded(self.trigger))):
             return None
         return win
 
@@ -1759,7 +1792,7 @@ class Engine:
         FOLLOW_RECENTRE of its side, the storm well inside) or has only just moved.  With a grid fixed to
         the ground (a physics suite) the storms cross the patches, which only shifted once the storm was a
         trigger distance from an edge: the storm rode the leading edge and the domain seemed to stand still."""
-        need = need or core.expanded(self.trigger)       # what must stay inside: all its storms when they fit
+        need = need or self._shaped(core.expanded(self.trigger))   # what must stay inside: all its storms when they fit
         if self.t - p.moved_at < self.opt.fixed_settle and p.rect.contains(need):
             return None
         vx, vy = self._patch_motion(p)
@@ -1833,7 +1866,7 @@ class Engine:
         jj, ii = (cp.asnumpy(a) for a in cp.nonzero(wm >= 0.75 * peak))
         m = int(np.argmin((jj - 0.5 * p.rect.ny) ** 2 + (ii - 0.5 * p.rect.nx) ** 2))
         r = int(round(radius_km * 1000.0 / env.grid.dx))
-        side = min(self.fixed, self.fixed_ny) or self.cap
+        side = (self._inner_side() if self.fixed else 0) or self.cap
         if side:                                   # small enough to fit with the trigger distance around it
             r = min(r, side // 2 - self.trigger - 1)
         r = max(1, r)

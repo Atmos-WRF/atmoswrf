@@ -1242,12 +1242,14 @@ class Handler(BaseHTTPRequestHandler):
             if sim is None:
                 return self._error(409, "no run; create one first")
             if path == "/api/run/brushes":
-                sim.settings["wind_brushes"] = list(body.get("brushes") or [])
-                sim._apply_boundaries()          # the air masses again, with the brushes' winds
+                with sim.lock:                   # between model steps: the patches' air changes
+                    sim.settings["wind_brushes"] = list(body.get("brushes") or [])
+                    sim._apply_boundaries()      # the air masses again, with the brushes' winds
                 return self._json({"ok": True})
             if path == "/api/run/pockets":
-                sim.settings["sounding_pockets"] = list(body.get("pockets") or [])
-                sim.set_pockets()                # the air masses again, with the pockets' air (balanced increments)
+                with sim.lock:
+                    sim.settings["sounding_pockets"] = list(body.get("pockets") or [])
+                    sim.set_pockets()            # the air masses again, with the pockets' air (balanced increments)
                 return self._json({"ok": True})
             if path == "/api/run/fire_area":
                 box = body.get("box")

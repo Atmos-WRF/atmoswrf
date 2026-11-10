@@ -836,6 +836,29 @@ def shape_signed_distance(poly, nx: int, ny: int) -> np.ndarray:
     return np.where(inside, d, -d)
 
 
+def shape_inner_rect(poly, n: int = 96) -> tuple:
+    """The largest axis-aligned rectangle inside the outline ``poly`` ((fx, fy) fractions of its box), as
+    fractions (fx0, fy0, fx1, fy1): where a shaped fixed domain keeps its storms (engine.Engine._shaped)."""
+    inside = shape_signed_distance(poly, n, n) > 0.5
+    best, h = (0, 0, 0, 0, 0), np.zeros(n, int)
+    for j in range(n):                       # the largest rectangle under each row's histogram
+        h = np.where(inside[j], h + 1, 0)
+        stack = []
+        for i in range(n + 1):
+            cur = h[i] if i < n else 0
+            start = i
+            while stack and stack[-1][1] >= cur:
+                s, hh = stack.pop()
+                if hh * (i - s) > best[0]:
+                    best = (hh * (i - s), s, j - hh + 1, i, j + 1)
+                start = s
+            stack.append((start, cur))
+    if best[0] == 0:
+        return 0.0, 0.0, 1.0, 1.0
+    _, i0, j0, i1, j1 = best
+    return i0 / n, j0 / n, i1 / n, j1 / n
+
+
 def apply_shape(patch, poly, dt: float, width_cells: float, tau_edge: float) -> None:
     """A fixed domain of another shape than its box (an ellipse, an outline drawn on the map): the cells outside
     the outline are relaxed toward the environment (+ air masses) like the edge rim -- at its full rate outside,

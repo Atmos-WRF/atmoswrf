@@ -108,11 +108,13 @@ def _tc(x: float) -> str:
 
 
 class _Station:
-    __slots__ = ("i", "icao", "x", "y", "z0", "hg", "samples", "rain", "rain_total", "rain_t", "best", "hist", "now")
+    __slots__ = ("i", "icao", "x", "y", "z0", "hg", "samples", "rain", "rain_total", "rain_t", "best", "hist", "now",
+                 "_north")
 
     def __init__(self, i, icao, x, y, z0, hg=0.0):
         self.i, self.icao, self.x, self.y, self.z0 = i, icao, x, y, z0
         self.hg = hg               # the model's ground here, m above its zero (terrain runs; 0 when flat)
+        self._north = None         # true north's angle from the grid's here (MetarNet._north), once asked
         self.samples = deque()     # (t, u10, v10, gust m/s, gust direction) of the last hour
         self.rain = deque()        # (t, mm) of the last hour
         self.rain_total = 0.0

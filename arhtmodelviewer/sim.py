@@ -1310,7 +1310,13 @@ class Simulation:
                 except Exception:
                     extra = ""
                 self.notes.append(f"sounding pocket {it['title'] or 'sounding'} at ({it['x'] / 1000:.0f}, "
-                                  f"{it['y'] / 1000:.0f}) km, {it['r'] / 1000:.0f} km across its blend{extra}")
+                                  f"{it['y'] / 1000:.0f}) km, radius {it['r'] / 1000:.0f} km{extra}")
+                if it["dth_max"] > pk.WARN_DTH:
+                    self.notes.append(f"sounding pocket {it['title'] or 'sounding'}: its air is up to "
+                                      f"{it['dth_max']:.1f} K warmer or colder than the run's below 8 km; across its "
+                                      f"{it['r'] * (1 - pk.INNER) / 1000:.0f} km blend that acts as a front and makes "
+                                      "its own circulation (and storms on its edge). A wider radius or a closer sounding "
+                                      "gives a gentler pocket")
 
     def _apply_boundaries(self) -> None:
         t = self.engine.t if self.engine else 0.0

@@ -132,6 +132,20 @@ class MetarNet:
         self.version = 0
         self._fields = None
 
+    def _north(self, s) -> float:
+        """Degrees true north lies clockwise of the model grid's north at station ``s``: the model's winds are along its
+        map grid (Lambert), a wind direction is from true north (geo.Lambert.north_angle)."""
+        a = getattr(s, "_north", None)
+        if a is None:
+            proj = getattr(self.sim, "proj", None)
+            if proj is None:
+                a = 0.0
+            else:
+                lon = float(np.ravel(proj.inv(np.array([s.x]), np.array([s.y]))[1])[0])
+                a = float(proj.north_angle(lon))
+            s._north = a
+        return a
+
     # ------------------------------------------------------------ which stations
     def _reach(self):
         """The stations near the run now: within RADAR_REACH of a radar or PATCH_REACH of a patch."""
@@ -271,7 +285,7 @@ class MetarNet:
             spd = math.hypot(u10, v10)
             sig = math.sqrt(max(tke, 0.0) * 2.0 / 3.0) * fac if tke >= 0 else 0.0
             gust = spd + max(GUST_SIGMA * sig, GUST_MIN * spd)
-            wdir = (math.degrees(math.atan2(-u10, -v10)) + 360.0) % 360.0
+            wdir = (math.degrees(math.atan2(-u10, -v10)) - self._north(s) + 360.0) % 360.0
             s.samples.append((t, u10, v10, gust, wdir))
             while s.samples and s.samples[0][0] < t - 3600.0:
                 s.samples.popleft()
@@ -397,7 +411,7 @@ class MetarNet:
             um = sum(q[1] for q in two) / len(two)
             vm = sum(q[2] for q in two) / len(two)
             spd_kt = sum(math.hypot(q[1], q[2]) for q in two) / len(two) / KT
-            wdir = (math.degrees(math.atan2(-um, -vm)) + 360.0) % 360.0
+            wdir = (math.degrees(math.atan2(-um, -vm)) - self._north(s) + 360.0) % 360.0
             g10 = max(ten, key=lambda q: q[3])
             gust_kt = g10[3] / KT
             pk = max(hour, key=lambda q: q[3])

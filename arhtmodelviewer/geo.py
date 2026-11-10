@@ -73,6 +73,21 @@ class Lambert:
         """Angle (deg) from true north to grid north at longitude ``lon``."""
         return self.n * ((np.asarray(lon) - self.lon0 + 180.0) % 360.0 - 180.0)
 
+    def north_angle(self, lon) -> np.ndarray:
+        """Angle (deg) of TRUE north clockwise from grid north (+y) at longitude ``lon``: 0 on the central meridian,
+        ~13 deg in California on a map centred on Oklahoma, ~70 over Japan (checked against fwd: 2026-11-09)."""
+        return -self.convergence(lon)
+
+    def to_grid(self, u, v, lon):
+        """Earth-relative wind (u east, v north) -> grid-relative (along +x, +y) at longitude ``lon``."""
+        a = np.radians(self.north_angle(lon))
+        return u * np.cos(a) + v * np.sin(a), -u * np.sin(a) + v * np.cos(a)
+
+    def to_earth(self, u, v, lon):
+        """Grid-relative wind -> earth-relative (u east, v north) at longitude ``lon``."""
+        a = np.radians(self.north_angle(lon))
+        return u * np.cos(a) - v * np.sin(a), u * np.sin(a) + v * np.cos(a)
+
     def to_json(self) -> dict:
         return {"lat0": self.lat0, "lon0": self.lon0, "truelat1": self.t1,
                 "truelat2": self.t2, "n": self.n, "F": self.F, "rho0": self.rho0,

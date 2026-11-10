@@ -521,6 +521,9 @@ class Simulation:
                               mp_physics=self._microphysics(ph), suite=self._suite(ph), les=bool(ph.get("les")),
                               soil_moisture=float(ph.get("soil_moisture", 0.25)),
                               vegetation=float(ph.get("vegetation", 50.0)))
+        # the environment's winds on the model's grid at the storm area (_storm_lon); synoptic runs (the simulated
+        # atmosphere, HRRR) make their winds on the grid themselves
+        self._turn_lon = None if self._syn_cfg().get("on") else self._storm_lon()
         # the model grid moves with the storms (CM1 umove/vmove); everything shown stays ground-relative
         follow = s.get("grid_motion", "rm") == "follow"
         motion = self._motion("rm" if follow else s.get("grid_motion", "rm"))
@@ -572,7 +575,16 @@ class Simulation:
             # a domain at its size limit rides the set motion with the grid instead of chasing updrafts
             # (left splits and far-off cells dragged it away from the right movers)
             self._domain_motion = motion
-        self.env = Environment(self.sounding, grid, phys, motion=motion)
+        grid_snd = self.sounding
+        if self._turn_lon is not None and abs(float(self.proj.north_angle(self._turn_lon))) > 0.05:
+            import dataclasses
+            gu, gv = self.proj.to_grid(np.asarray(self.sounding.u), np.asarray(self.sounding.v), self._turn_lon)
+            grid_snd = dataclasses.replace(self.sounding, u=np.asarray(gu), v=np.asarray(gv))
+            if abs(float(self.proj.north_angle(self._turn_lon))) >= 0.5:
+                self.notes.append(f"the sounding's winds are turned {float(self.proj.north_angle(self._turn_lon)):+.1f} deg "
+                                  f"onto the map's grid at the storms' longitude ({self._turn_lon:.1f}): true north there "
+                                  "is that far round from the grid's north")
+        self.env = Environment(grid_snd, grid, phys, motion=motion)
         self.env.start_time = start
         self.env.latlon = lambda X, Y: self.proj.inv(X, Y)
         self.env.longitude = float(self.proj.lon0)
@@ -975,11 +987,38 @@ class Simulation:
         self.settings["grid_follow_min"] = every
 
     def _motion(self, spec):
+        """A motion (m/s) on the model's grid: given as a vector (on the grid already), or the sounding's (its Bunkers
+        movers, its 0-6 km mean wind: earth-relative, turned onto the grid at the run's storm area, _grid_turn)."""
         d = self.diag
         if isinstance(spec, (list, tuple)):
             return float(spec[0]), float(spec[1])
-        return {"rm": tuple(d["rm"]), "lm": tuple(d["lm"]), "mean": tuple(d["mean6"]),
+        u, v = {"rm": tuple(d["rm"]), "lm": tuple(d["lm"]), "mean": tuple(d["mean6"]),
                 "none": (0.0, 0.0)}.get(spec or "rm", tuple(d["rm"]))
+        return self._to_grid(u, v)
+
+    # The sounding's winds are earth-relative (from true north); the model's are along its map grid (Lambert
+    # conformal), whose north tilts from true north by the convergence, ~0.58 deg per degree of longitude from the
+    # map's centre.  Taken as grid winds they turned: a storm area 22 deg west of the centre had every wind turned
+    # 13 deg anticlockwise, 70 deg over Japan -- eastward storms went north (the user, 2026-11-09).  So a run's
+    # environment (its sounding, the Bunkers movers, the grid's motion) is turned onto the grid at its storm area,
+    # as WRF turns earth-relative winds onto its grid (sinalpha / cosalpha).  One angle for the run: the domain
+    # moves as one frame, and across a 350 km patch the convergence changes ~2 deg.
+    def _storm_lon(self) -> float:
+        """Longitude of the run's storm area: its storm starts', cyclones' or nudgers' mean, else the map's centre."""
+        s = self.settings
+        pts = [(float(q["x"]), float(q["y"])) for k in ("storms", "cyclones", "nudgers") for q in (s.get(k) or [])
+               if isinstance(q, dict) and "x" in q and "y" in q]
+        if not pts:
+            return float(self.proj.lon0)
+        x, y = sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+        return float(np.ravel(self.proj.inv(np.array([x]), np.array([y]))[1])[0])
+
+    def _to_grid(self, u, v):
+        lon = getattr(self, "_turn_lon", None)
+        if lon is None:
+            return float(u), float(v)
+        gu, gv = self.proj.to_grid(float(u), float(v), lon)
+        return float(gu), float(gv)
 
     def _add_storm(self, kw):
         vx, vy = self._motion(kw.get("motion", "rm"))
@@ -2426,8 +2465,8 @@ class Simulation:
             code = cp.where(h, cp.clip(cp.rint(v * vsc + 129), 2, 255), 0)
             code = cp.where(rf, 1, code).astype(cp.uint8)             # range folded: purple
             disp["VEL"] = (dict(meta, ngate=nd, scale=vsc, offset=129.0), cp.asnumpy(code))
-            # storm-relative: subtract the Bunkers right-mover along each radial
-            um, vm = self.diag["rm"]
+            # storm-relative: subtract the Bunkers right-mover along each radial (on the grid, as az is)
+            um, vm = self.env.storm_motion
             az = cp.radians((cp.arange(cut.nrad) + 0.5) * 360.0 / cut.nrad - meta["conv"])
             vs = (um * cp.sin(az) + vm * cp.cos(az))[:, None] * math.cos(math.radians(cut.elev))
             srv = v - vs

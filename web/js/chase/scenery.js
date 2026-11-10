@@ -324,7 +324,9 @@ const Scenery = (() => {
   // ---------------------------------------------------------------- solid things for the car
   // a point (world m) inside a wall or a trunk: { n: outward [x, y, 0], d: how deep m } or null
   function solid(x, y, z) {
-    const hit = building(x, y);
+    // (a mapped road through a footprint is a way through -- an arcade, a carport, a footprint drawn over the street:
+    // its walls don't stop a car on the road, as on the detailed map)
+    const hit = window.Roads && Roads.at(x, y).seg >= 0 ? null : building(x, y);
     if (hit && z < hit.b.top && z > hit.b.zb - 1) {
       const P = hit.b.P;
       let best = 1e9, n = null;

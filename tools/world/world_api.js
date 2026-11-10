@@ -129,6 +129,76 @@ const TREE_DMG = `
     return m;
   };
 }
+// ---- what the car runs into: chase mode's own collisions (as before the OpenDrive rebuild, 7445792), not the friend's
+// page's impulse ones (carHitCircle / carImpulse: they threw the car, and were called here without their dt).  Two
+// circles along the car (front and back, 1 m), each pushed out of a trunk, a building's footprint, a post or a fence
+// and its speed into it turned back (a little bounce); a knockable prop hit at speed goes flying.  The map's newer
+// data as it is: tunnels (V.inTunnel: nothing up on the surface), footbridge decks, deck-level railings.
+function chaseHitTrees() {
+  if (V.inTunnel) return;
+  const fx = Math.sin(V.heading), fz = Math.cos(V.heading);
+  for (const along of [1.3, -1.3]) {
+    const px = V.x + fx * along, pz = V.z + fz * along;
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+      const list = trunkHash.get(thKey(px + dx * TH_CELL, pz + dz * TH_CELL));
+      if (!list) continue;
+      for (let i = 0; i < list.length; i += 3) {
+        const ex = px - list[i], ez = pz - list[i + 1], d = Math.hypot(ex, ez), min = 0.95 + list[i + 2];
+        if (d >= min || d < 1e-4) continue;
+        const nx = ex / d, nz = ez / d, push = min - d;
+        V.x += nx * push; V.z += nz * push;
+        const vn = V.vx * nx + V.vz * nz;
+        if (vn < 0) { V.vx -= nx * vn * 1.35; V.vz -= nz * vn * 1.35; V.hit = Math.max(V.hit || 0, -vn); }
+      }
+    }
+  }
+}
+function chaseHitBuildings() {
+  if (V.inTunnel) return;
+  const fx = Math.sin(V.heading), fz = Math.cos(V.heading);
+  for (const along of [1.4, -1.4]) {
+    const p = pushOutOfBuildings(V.x + fx * along, V.z + fz * along, 1.0, V.segOff >= 0 || V.onDeck);
+    if (!p) continue;
+    const l = Math.hypot(p[0], p[1]);
+    if (l < 1e-6) continue;
+    const nx = p[0] / l, nz = p[1] / l;
+    V.x += p[0]; V.z += p[1];
+    const vn = V.vx * nx + V.vz * nz;
+    if (vn < 0) { V.vx -= nx * vn * 1.3; V.vz -= nz * vn * 1.3; V.hit = Math.max(V.hit || 0, -vn); }
+  }
+}
+function chaseHitProps() {
+  if (!colCircles.length && !colSegs.length) return;
+  if (V.onDeck) return;
+  const fx = Math.sin(V.heading), fz = Math.cos(V.heading), speed = Math.hypot(V.vx, V.vz);
+  for (const along of [1.4, -1.4]) {
+    const px = V.x + fx * along, pz = V.z + fz * along, R = 1.0;
+    for (let o = 0; o < colCircles.length && !V.inTunnel; o += 4) {
+      const ex = px - colCircles[o], ez = pz - colCircles[o + 1];
+      if (Math.abs(ex) > 3 || Math.abs(ez) > 3) continue;
+      const d = Math.hypot(ex, ez), min = R + colCircles[o + 2];
+      if (d >= min || d < 1e-4) continue;
+      const kid = colCircles[o + 3], nx = ex / d, nz = ez / d;
+      if (kid > 0 && speed > 2.5) { knock(kid, nx, nz, speed); colCircles[o + 3] = -2; colCircles[o] = 1e9; V.vx *= 0.96; V.vz *= 0.96; continue; }
+      V.x += nx * (min - d); V.z += nz * (min - d);
+      const vn = V.vx * nx + V.vz * nz;
+      if (vn < 0) { V.vx -= nx * vn * 1.35; V.vz -= nz * vn * 1.35; }
+    }
+    for (let o = 0; o < colSegs.length; o += 5) {
+      const ax = colSegs[o], az = colSegs[o + 1], bx = colSegs[o + 2], bz = colSegs[o + 3], sy = colSegs[o + 4];
+      if (!Number.isNaN(sy) && (V.y < sy - 1.5 || V.y > sy + 2.5)) continue;   // bridge railings only at deck level
+      if (Number.isNaN(sy) && V.inTunnel) continue;
+      if (Math.min(ax, bx) - 3 > px || Math.max(ax, bx) + 3 < px || Math.min(az, bz) - 3 > pz || Math.max(az, bz) + 3 < pz) continue;
+      const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz || 1e-9, u = Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / l2));
+      const qx = ax + dx * u, qz = az + dz * u, ex = px - qx, ez = pz - qz, d = Math.hypot(ex, ez);
+      if (d >= R + 0.1 || d < 1e-4) continue;
+      const nx = ex / d, nz = ez / d;
+      V.x += nx * (R + 0.1 - d); V.z += nz * (R + 0.1 - d);
+      const vn = V.vx * nx + V.vz * nz;
+      if (vn < 0) { V.vx -= nx * vn * 1.25; V.vz -= nz * vn * 1.25; }
+    }
+  }
+}
 const ChaseWorld = {
   START_LAT, START_LON, TILE_SIZE, SURF, SURF_NAMES, LAND, LAND_SURFACE, CLASS_LIST, SEG,
   toLatLon, fromLatLon, scene, camera, renderer, V, tiles,
@@ -201,9 +271,9 @@ const ChaseWorld = {
   collide(p) {
     for (const k of ['len', 'wid', 'kg', 'Iz', 'wheelR']) if (p[k] > 0) CAR[k] = p[k];
     Object.assign(V, p);
-    collideTrees();
-    collideBuildings();
-    collideProps();
+    chaseHitTrees();
+    chaseHitBuildings();
+    chaseHitProps();
     return V;
   },
   // something round (a person on foot: rad m) at x, z pushed out of buildings, landmarks and tree trunks: [dx, dz]

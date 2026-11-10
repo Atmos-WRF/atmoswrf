@@ -414,15 +414,15 @@ const Render = (() => {
   }
   // the view's march step at p: in a nest at most k of its cell (the box's own step is ~1/420 of the box, ~340 m
   // over chase's 100 km, which steps over a 200 m funnel), else dt.  Only the tornado's own nests (cells under
-  // 100-200 m, faded in between), and coarser with the distance from the eye (a 200 m funnel 6 km off is a few
-  // pixels): the step is k cells x nestStep x the km past 1.5 km over 1.5
+  // 100-200 m, faded in between), and a little coarser far off: at most 2x, from 6 km (a 150 m funnel 7 km off
+  // is still ~20 pixels wide -- the old growth, 5x there, stepped right over it)
   uniform float nestStep;                                      // x the cell (0: off): the Settings' quality
   float nestDt(vec3 p, float dt, float k) {
     if (insN == 0 || nestStep <= 0.0) return dt;
     float cell = cellAt(p), fade = smoothstep(0.1, 0.2, cell * toKm.x);
     if (fade >= 1.0) return dt;
     float dk = length((p - eye) * toKm);
-    return mix(min(dt, cell * k * nestStep * max(1.0, dk / 1.5)), dt, fade);
+    return mix(min(dt, cell * k * nestStep * clamp(dk / 6.0, 1.0, 2.0)), dt, fade);
   }
   vec2 shapeDetail(vec3 k, vec2 s) {
     // the noise on the box's scale everywhere (detailKm): on a nest's (gDkm, down to 37 m) its ~20 m features
@@ -531,9 +531,11 @@ const Render = (() => {
       // the grid's cell here, as a share of the box's (1 outside the nests)
       float rc = insN > 0 ? cellAt(p) / (size.x * texel.x) : 1.0;
       gDkm = detailKm * rc;
-      gDet = detail * mix(0.1, 1.0, smoothstep(0.05, 0.2, gDkm));
+      // none at all on a grid that resolves the cloud itself (a tornado zoom's nests, ~37-110 m), as the 3-D view
+      // (volume.js media): even a tenth of it shifted the funnel by ~50 m and eroded its thin lower part away
+      gDet = detail * smoothstep(0.12, 0.35, cellAt(p) * toKm.x);
       // domain warp: the surface pushed in and out by about a box cell -- towers, billows, cauliflower; on the
-      // box's scale (see shapeDetail), weaker in the nests (gDet: a tenth in a tornado's, which it shredded)
+      // box's scale (see shapeDetail), none in the tornado's nests (gDet)
       vec3 wq = (p * toKm + kmOrigin - vec3(drift * flowT / 1000.0, 0.0)) / (detailKm * 5.0);
       vec3 wv = vec3(texture(noiseTex, wq).rg, texture(noiseTex, wq.zxy + 0.41).r) - 0.5;
       uvw += wv * texel * 2.2 * gDet;
@@ -716,7 +718,7 @@ const Render = (() => {
     // (every step lit)
     const marchHooks = [
       ['for (int i = 0; i < 900; i++) {', 'for (int i = 0; i < 2400; i++) {'],
-      ['if (sg <= 1e-3) { t += dt * 1.8; continue; }', 'if (sg <= 1e-3) { t += nestDt(p, dt * 1.8, 3.0); continue; }'],
+      ['if (sg <= 1e-3) { t += dt * 1.8; continue; }', 'if (sg <= 1e-3) { t += nestDt(p, dt * 1.8, 2.0); continue; }'],
       ['float ds = dt * kmPer;', 'float ds = nestDt(p, dt, s.x > 0.2 * sg ? 0.6 : 4.0) * kmPer;'],
       ['        t += dt;\n', '        t += nestDt(p, dt, s.x > 0.2 * sg ? 0.6 : 4.0);\n'],
     ];

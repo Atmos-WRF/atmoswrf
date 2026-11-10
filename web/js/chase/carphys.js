@@ -45,7 +45,7 @@
       maxSteer: 0.58, steerRate: 2.6, idle: 750, redline: 5800, peakT: 640, peakRpm: 4000, engI: 0.24,
       gears: [4.03, 2.36, 1.53, 1.15, 0.85, 0.67], final: 3.42, rev: 3.6, split: 0.4, lsd: 70,
       brake: 3500, brakeBias: 0.64, cdA: 1.3, cyA: 7, clA: 2.2, cy: 0.8, cls: 0.33, ground: 0.24, tire: 1.15,
-      model: { hubF: 1.70, eye: [0.05, 0.37, 1.42] },
+      model: { hubF: 1.70, eye: [0.05, 0.37, 1.42], hood: [1.55, 1.66] },
     },
     p_pickup: {
       name: 'Probe 2 Pickup (4WD)', mass: 2700, dims: [6.27, 2.02, 2.25], cgH: 0.56, wheelbase: 3.70, cgFront: 1.67, track: 1.671,
@@ -53,7 +53,7 @@
       maxSteer: 0.55, steerRate: 2.4, idle: 700, redline: 5600, peakT: 680, peakRpm: 3800, engI: 0.26,
       gears: [4.17, 2.34, 1.52, 1.14, 0.87, 0.69], final: 3.55, rev: 3.6, split: 0.4, lsd: 80,
       brake: 3700, brakeBias: 0.66, cdA: 1.4, cyA: 7.6, clA: 2.0, cy: 0.78, cls: 0.3, ground: 0.26, tire: 1.13,
-      model: { hubF: 1.95, eye: [0.15, 0.37, 1.56] },
+      model: { hubF: 1.95, eye: [0.15, 0.37, 1.56], hood: [1.8, 1.67] },
     },
     p_sedan: {
       name: 'Probe 3 Sedan (RWD)', mass: 1900, dims: [5.65, 1.92, 1.8], cgH: 0.495, wheelbase: 2.91, cgFront: 1.40, track: 1.661,
@@ -61,7 +61,7 @@
       maxSteer: 0.62, steerRate: 2.9, idle: 700, redline: 6200, peakT: 470, peakRpm: 4400, engI: 0.17,
       gears: [3.54, 2.06, 1.40, 1.03, 0.84, 0.69], final: 3.27, rev: 3.3, split: 0, lsd: 45,
       brake: 2700, brakeBias: 0.66, cdA: 0.8, cyA: 5.0, clA: 1.4, cy: 0.68, cls: 0.27, ground: 0.15, tire: 1.15,
-      model: { hubF: 1.62, eye: [-0.45, 0.37, 1.24] },
+      model: { hubF: 1.62, eye: [-0.45, 0.37, 1.24], hood: [1.3, 1.32] },
     },
     p_van: {
       name: 'Probe 4 Minivan (FWD)', mass: 2100, dims: [5.35, 2.0, 2.05], cgH: 0.50, wheelbase: 3.03, cgFront: 1.27, track: 1.701,
@@ -69,7 +69,7 @@
       maxSteer: 0.6, steerRate: 2.7, idle: 700, redline: 6300, peakT: 400, peakRpm: 4700, engI: 0.17,
       gears: [4.48, 2.87, 1.84, 1.41, 1.0, 0.74], final: 3.24, rev: 3.6, split: 1.0, lsd: 0,
       brake: 2900, brakeBias: 0.68, cdA: 0.95, cyA: 6.2, clA: 1.6, cy: 0.74, cls: 0.3, ground: 0.16, tire: 1.15,
-      model: { hubF: 1.58, eye: [0.25, 0.37, 1.36] },
+      model: { hubF: 1.58, eye: [0.25, 0.37, 1.36], hood: [1.8, 1.5] },
     },
   };
 

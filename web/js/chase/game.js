@@ -799,7 +799,7 @@ const Chase = (() => {
     // hood and driver: fixed in the car, looking along it (turned by the mouse / right stick), rolling with it
     const a = S.cgFront, b = S.wheelbase - a, xF = a + (S.dims[0] - S.wheelbase) / 2;
     const eyeM = S.model && S.model.eye, mo = eyeM ? [S.cgFront - S.model.hubF, -S.cgH] : null;
-    const loc = eyeM ? (cam.mode === 'hood' ? [eyeM[0] + mo[0] + 1.3, 0, eyeM[2] + mo[1] - 0.05] : [eyeM[0] + mo[0], eyeM[1], eyeM[2] + mo[1]])
+    const loc = eyeM ? (cam.mode === 'hood' ? [S.model.hood[0] + mo[0], 0, S.model.hood[1] + mo[1]] : [eyeM[0] + mo[0], eyeM[1], eyeM[2] + mo[1]])
       : cam.mode === 'hood' ? [xF - 0.35, 0, S.ground + (c.kind === 'sedan' ? 0.72 : c.kind === 'truck' ? 1.2 : 0.98) - S.cgH]
       : [xF - (c.kind === 'truck' ? 2.0 : c.kind === 'sedan' ? 2.25 : 2.05), S.dims[1] * 0.2, S.ground + (c.kind === 'sedan' ? 0.95 : c.kind === 'truck' ? 1.55 : 1.28) - S.cgH];
     const eye = CarPhys.toWorld(M, loc).map((v, i) => v + c.p[i]);

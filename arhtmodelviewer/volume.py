@@ -246,15 +246,24 @@ def extract_live(patches, box, name: str = "cloud", ztop: float = 6000.0) -> byt
     return struct.pack("<I", len(head)) + head + cp.asnumpy(data).tobytes()
 
 
-def _plan_insets(entries, box, res):
+def _plan_insets(entries, box, res, crop=False):
     """The insets of the box: of ``entries`` [(key, x0, y0, x1, y1, dx) m], the finest (up to INSET_MAX) finer
     than the box's spacing ``res`` that overlap it, finest first, each its overlap with the box at its own
-    spacing (or INSET_SIDE points a side): [(key, (x0, y0, x1, y1), spacing, nx, ny)]."""
+    spacing (or INSET_SIDE points a side): [(key, (x0, y0, x1, y1), spacing, nx, ny)].  ``crop``: a nest too wide
+    for INSET_SIDE points at its own spacing is cut down to its middle INSET_SIDE points instead of thinned
+    (chase mode's 100 km box took a tornado zoom's whole 37 m nest at 72 m, which thinned the funnel; the nest
+    is centred on the tornado, and its parent nest covers the rest)."""
     x0, y0, x1, y1 = box
     out = []
     for key, a, b, c, d, dx in sorted(entries, key=lambda e: e[5]):
         if dx >= 0.7 * res or a >= x1 or c <= x0 or b >= y1 or d <= y0:
             continue
+        if crop:
+            half = INSET_SIDE * dx / 2
+            mx, my = (a + c) / 2, (b + d) / 2
+            a, b, c, d = max(a, mx - half), max(b, my - half), min(c, mx + half), min(d, my + half)
+            if a >= x1 or c <= x0 or b >= y1 or d <= y0:
+                continue
         ib = (max(x0, a), max(y0, b), min(x1, c), min(y1, d))
         w, h = ib[2] - ib[0], ib[3] - ib[1]
         r = max(dx, max(w, h) / INSET_SIDE)
@@ -281,13 +290,14 @@ def _stack(codes):
 
 def _insets_live(fields, box, name, res, patches, winds=None):
     """The live insets (_plan_insets) from the radar fields of the nests (and their patches' cloud); ``winds`` (a
-    list): each one's wind (_wind_codes) appended to it, its size in the inset's "wind"."""
+    list): each one's wind (_wind_codes) appended to it, its size in the inset's "wind" -- chase mode's, whose
+    nests are cropped to their own spacing (_plan_insets crop)."""
     import cupy as cp
     by = {f.patch_id: f for f in fields.values()}
     ent = [(f.patch_id, f.x0, f.y0, f.x0 + f.nx * f.dx, f.y0 + f.ny * f.dx, f.dx) for f in fields.values()]
     channels = ("cloud", "precip") if name == "cloud" else (name,)
     out = []
-    for key, ib, r, nx, ny in _plan_insets(ent, box, res):
+    for key, ib, r, nx, ny in _plan_insets(ent, box, res, crop=winds is not None):
         if winds is not None:
             ztop_, nz_ = levels_for(by[key].dx)
             wb, wd = _wind_codes(list(fields.values()), patches, ib, nx, ny, ztop_, nz_)

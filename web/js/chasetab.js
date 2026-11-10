@@ -24,7 +24,8 @@ const ChaseTab = (() => {
     const t = d.tunnel || {};
     $('chTunnel').checked = t.state === 'on' || t.state === 'starting';
     $('chTunnel').disabled = !d.on;
-    $('chTunnelNote').innerHTML = t.state === 'on' && t.url ? link(t.url)
+    // chase mode's page on the tunnel (its bare address is the viewer's own page, which friends may not have)
+    $('chTunnelNote').innerHTML = t.state === 'on' && t.url ? link(t.url + '/chase') + link(t.url + '/chase?code=' + encodeURIComponent(d.code || ''))
       : t.state === 'starting' ? 'Starting the internet link…'
       : t.error ? esc(t.error) : d.on ? '' : 'Switch on Let friends join first.';
     const P = d.players || [];

@@ -297,6 +297,14 @@ class Handler(BaseHTTPRequestHandler):
             return False                          # the phone remote: its API checks its own PIN tokens (remote.py)
         if chase.allowed(path, self.command, self.headers.get("X-Chase-Token")):
             return False                          # chase mode's friends, while hosting is on (chase.py)
+        if self.command in ("GET", "HEAD") and path in ("/", "/index.html") and chase._HOST["on"]:
+            # a friend given the bare link (the tunnel's or this PC's address): on to chase mode, with any ?code=
+            q = urllib.parse.urlparse(self.path).query
+            self.send_response(302)
+            self.send_header("Location", "/chase" + (f"?{q}" if q else ""))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
         self._send(403, b"Only the GR2Analyst polling feed (/poll/) is shared with other computers.\n",
                    "text/plain")
         return True

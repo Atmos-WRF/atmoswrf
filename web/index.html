@@ -251,7 +251,14 @@
       <div class="row"><label title="Unlimited: storms live in patches that grow, shift and merge around them anywhere on the map, using as much GPU memory as they need (up to ¾ of what is free). Fixed size: one square domain that shifts to keep its storms away from its edges but never grows, so the run's GPU memory stays what it is at the start. Storms can then start only inside it.">Domain <select id="domainMode">
         <option value="unlimited">Grows with the storms (unlimited)</option>
         <option value="fixed">Fixed size (saves GPU memory)</option></select></label></div>
-      <div id="domainSizeRow" class="row hidden"><label title="Side of the square domain. It follows the storms; once they spread wider than it, it keeps the strongest one well inside.">Size (km, square) <input id="domainSize" type="number" min="48" max="1000" step="16" value="160"></label>
+      <div id="domainSizeRow" class="row hidden">
+        <div class="row grid2">
+          <label title="West-east size of the domain. It follows the storms; once they spread wider than it, it keeps the strongest one well inside.">Width (km) <input id="domainSize" type="number" min="48" max="1000" step="16" value="160"></label>
+          <label title="South-north size of the domain (the same as the width: a square)">Height (km) <input id="domainSizeY" type="number" min="48" max="1000" step="16" value="160"></label>
+        </div>
+        <div class="row buttons"><label title="The domain's shape inside its box: the cells outside it are held to the environment like the edges (storms that leave it die out), so a long, a round or a hand-drawn domain costs only its box's memory">Shape <select id="domainShape">
+          <option value="rect">Rectangle</option><option value="ellipse">Ellipse</option><option value="custom">Drawn on the map</option></select></label>
+          <button id="toolDomShape" class="tool" title="Click the outline's corners on the map, double-click (or Enter) to finish: the domain's box becomes its extent, its shape the outline">Draw the shape</button></div>
         <div id="domainMem" class="hint"></div></div>
       <div id="domainMaxRow" class="row"><label title="The largest a storm's patch may grow, in km a side. A patch that reaches it shifts with its storms instead of growing, as a fixed-size domain does, and once its storms spread wider it keeps the strongest one well inside. Patches that meet become one only if that one fits; otherwise they stay side by side. New storms still start anywhere. Empty or 0: no limit.">Largest size (km, square) <input id="domainMax" type="number" min="0" max="1000" step="16" placeholder="no limit"></label>
         <div id="domainMaxMem" class="hint"></div></div>

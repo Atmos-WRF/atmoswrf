@@ -51,6 +51,7 @@ class EngineOptions:
     manage: bool = True                   # re-fit patches to the storms (unlimited domain)
     fixed_km: float | None = None         # one domain this wide (km a side): shifts with its storms, never grows
     fixed_km_y: float | None = None       # ... and this tall (km); None = square
+    domain_shape: tuple | None = None     # ... and this outline in it ((fx, fy) fractions of the box; None: all of it)
     max_km: float | None = None           # unlimited domain: no patch wider than this (km a side); one that
                                           # reaches it shifts with its storms instead, like the fixed domain
     fixed_settle: float = 600.0           # s after a shift before the fixed domain shifts again (its strongest storm still inside)
@@ -2041,6 +2042,8 @@ class Engine:
                                            min(1.0, self.opt.persistence * self.opt.cap_easing))
             if self.opt.rim:
                 forcing.apply_rim(p, self.dt, self.rim, self.opt.rim_tau)
+            if self.fixed and self.opt.domain_shape:
+                forcing.apply_shape(p, self.opt.domain_shape, self.dt, self.rim, self.opt.rim_tau)
             if self.opt.drift_correction:
                 # only with the steady environment (its seam): without it the reference column runs free, and on
                 # an uncapped sounding its overturning boundary layer's TKE churned every patch edge into echo lines
@@ -2155,6 +2158,7 @@ class Engine:
                         for p in self.patches],
             "cells": self.total_cells(), "max_cells": self.opt.max_cells, "memory_full": self.memory_full(),
             "fixed_cells": self.fixed, "fixed_cells_y": self.fixed_ny, "max_side": self.cap, "start_area": self.start_area(),
+            "domain_shape": [list(q) for q in self.opt.domain_shape] if self.fixed and self.opt.domain_shape else None,
             "tracks": [tr.to_json(self.env.storm_motion) for tr in self.tracks.live],
             "nudgers": [n.to_json() for n in self.nudgers],
             "nests": self.nests.to_json() if self.nests else [],

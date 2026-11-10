@@ -814,6 +814,107 @@ def apply_rim(patch, dt: float, width_cells: float, tau_edge: float,
                                               np.float32(width_cells), coef, ow, oe, os_, on))
 
 
+def shape_signed_distance(poly, nx: int, ny: int) -> np.ndarray:
+    """Signed distance (cells; + inside) of every mass cell of an nx x ny box from the outline ``poly``
+    [(fx, fy), ...] given as fractions of the box (host, (ny, nx))."""
+    P = np.asarray(poly, dtype=np.float64) * np.array([nx, ny], dtype=np.float64)
+    x = np.arange(nx, dtype=np.float64) + 0.5
+    y = np.arange(ny, dtype=np.float64) + 0.5
+    X, Y = np.meshgrid(x, y)
+    inside = np.zeros((ny, nx), bool)
+    d2 = np.full((ny, nx), np.inf)
+    A, B = P, np.roll(P, -1, axis=0)
+    for (ax, ay), (bx, by) in zip(A, B):
+        # even-odd crossing of a ray to +x, and the distance to the segment
+        if by != ay:
+            inside ^= ((ay > Y) != (by > Y)) & (X < (bx - ax) * (Y - ay) / (by - ay) + ax)
+        ex, ey = bx - ax, by - ay
+        L2 = ex * ex + ey * ey
+        t = np.clip(((X - ax) * ex + (Y - ay) * ey) / L2, 0.0, 1.0) if L2 > 0 else np.zeros_like(X)
+        d2 = np.minimum(d2, (X - ax - t * ex) ** 2 + (Y - ay - t * ey) ** 2)
+    d = np.sqrt(d2)
+    return np.where(inside, d, -d)
+
+
+def apply_shape(patch, poly, dt: float, width_cells: float, tau_edge: float) -> None:
+    """A fixed domain of another shape than its box (an ellipse, an outline drawn on the map): the cells outside
+    the outline are relaxed toward the environment (+ air masses) like the edge rim -- at its full rate outside,
+    easing to nothing ``width_cells`` inside the outline -- and their clouds, rain and vertical motion toward
+    none, so storms live only inside it."""
+    import cupy as cp
+    env, st = patch.env, patch.state
+    nx, ny = patch.rect.nx, patch.rect.ny
+    key = (nx, ny, tuple(map(tuple, poly)), float(width_cells))
+    cache = getattr(patch, "_shape_c", None)
+    if cache is None or cache[0] != key:
+        sd = shape_signed_distance(poly, nx, ny)
+        a = np.clip(1.0 - sd / max(width_cells, 1.0), 0.0, 1.0)
+        cache = patch._shape_c = (key, cp.asarray((a * a).astype(np.float32)), {})
+    _, wmass, targets = cache
+    coef = float(min(dt / tau_edge, 1.0))
+
+    def stag(a, fy, fx):                     # a mass-cell map (..., ny, nx) onto a staggered field's shape
+        if a.shape[-1] != fx:
+            a = cp.concatenate([a[..., :1], 0.5 * (a[..., 1:] + a[..., :-1]), a[..., -1:]], axis=-1)
+        if a.shape[-2] != fy:
+            a = cp.concatenate([a[..., :1, :], 0.5 * (a[..., 1:, :] + a[..., :-1, :]), a[..., -1:, :]], axis=-2)
+        return a
+
+    tg = _shape_targets(patch, targets)
+    for name in RIM_FIELDS_ENV + ("w",) + hydrometeor_fields(st):
+        f = getattr(st, name, None)
+        if f is None:
+            continue
+        nk, fy, fx = f.shape
+        c = (coef * stag(wmass, fy, fx))[None].astype(f.dtype)
+        t = tg.get(name)
+        if t is None:
+            f -= c * f                                          # w and condensate: toward none
+            continue
+        if t.ndim == 1:
+            if t.shape[0] != nk:
+                continue
+            t = t[:, None, None]
+        else:
+            if t.shape[0] != nk:
+                continue
+            t = stag(t, fy, fx)
+        f += c * (t.astype(f.dtype) - f)
+
+
+def _shape_targets(patch, cache: dict) -> dict:
+    """What the outside of a shaped domain is relaxed to: the 3-D rim targets (terrain, pockets, simulated
+    weather), the air masses' columns (renewed with the patch's maps), or the environment's profiles."""
+    import cupy as cp
+    env = patch.env
+    maps = getattr(patch, "am_maps", None)
+    nx, ny = patch.rect.nx, patch.rect.ny
+    if isinstance(maps, dict):
+        if cache.get("maps") is not maps:
+            s = int(round(maps["stride"]))
+            cache.clear()
+            cache["maps"] = maps
+            cache["t"] = {n: cp.repeat(cp.repeat(maps[n], s, axis=-2), s, axis=-1)[..., :ny, :nx]
+                          for n in RIM_FIELDS_ENV if maps.get(n) is not None}
+        return cache["t"]
+    th_t, qv_t = env_targets(env)
+    prof = {"u": _cached_device(env, "u_env", env.u_env), "v": _cached_device(env, "v_env", env.v_env),
+            "thp": th_t, "qv": qv_t}
+    if maps is None or not env.airmass:
+        return prof
+    at = getattr(patch, "am_time", None)
+    if cache.get("am_time") != at or cache.get("rect") != (patch.rect.i0, patch.rect.j0, nx, ny):
+        cache.clear()
+        cache["am_time"], cache["rect"] = at, (patch.rect.i0, patch.rect.j0, nx, ny)
+        X, Y = env.ground_xy(patch.rect, t=env.clock)
+        thp, qv, _, _ = env.airmass_columns(X, Y, env.clock, xp=cp)
+        u = cp.asarray(env.u_env)[:, None, None] + env.airmass_wind(X, Y, env.clock, "u", xp=cp)
+        v = cp.asarray(env.v_env)[:, None, None] + env.airmass_wind(X, Y, env.clock, "v", xp=cp)
+        cache["t"] = {"thp": thp.astype(cp.float32), "qv": qv.astype(cp.float32),
+                      "u": u.astype(cp.float32), "v": v.astype(cp.float32)}
+    return cache["t"]
+
+
 AIRMASS_KINDS = {"thp": 0, "qv": 1, "u": 2, "v": 3}
 AIRMASS_HOLD_TAU = 120.0    # s: the frontal zone's one-sided hold (warm air blown across a kept boundary)
 WIND_HOLD_TAU = 200.0       # s: the air masses' winds (backed winds ahead of boundaries) held at the large scale

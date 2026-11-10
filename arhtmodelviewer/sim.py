@@ -607,7 +607,8 @@ class Simulation:
         dom = s.get("domain") or {}
         fixed = dom.get("mode") == "fixed"
         fixed_km = float(dom.get("size_km") or 160.0) if fixed else None
-        fixed_km_y = None
+        fixed_km_y = min(max(float(dom.get("size_km_y") or fixed_km), 48.0), 1000.0) if fixed else None
+        shape = self._domain_shape(dom) if fixed else None
         if hc.get("on"):                          # one domain on the cyclone, the size the Tropics tab sets
             fixed_km = min(max(float(hc.get("domain_km") or 900.0), 200.0), 2400.0)
             fixed_km_y = min(max(float(hc.get("domain_km_y") or fixed_km), 200.0), 2400.0)
@@ -617,6 +618,7 @@ class Simulation:
             rim=eo.get("rim", True), manage=True, follow_storms=follow,
             follow_interval=60.0 * max(1.0, float(s.get("grid_follow_min") or 10.0)),
             persistence=float(s.get("persistence", 0.0)), fixed_km=fixed_km, fixed_km_y=fixed_km_y, max_km=max_km,
+            domain_shape=None if hc.get("on") else shape,
             refine_ratio=self._refine_ratio(grid), refine_km=float((s.get("refine") or {}).get("size_km") or 40.0),
             refine_max=max(1, int((s.get("refine") or {}).get("max") or 2)),
             refine_inner_ratio=self._refine_inner(grid), refine_inner_km=float((s.get("refine") or {}).get("inner_km") or 16.0),
@@ -1247,6 +1249,19 @@ class Simulation:
         if not (self.boundaries or self.texture is not None or brushes or self.pockets):
             return None
         return AirMasses(self.boundaries, self.env, self.texture, brushes, self.pockets)
+
+    @staticmethod
+    def _domain_shape(dom: dict):
+        """A fixed domain's outline in its box ((fx, fy) fractions), or None for the whole box: an ellipse filling
+        it, or an outline drawn on the map (the box then its extent)."""
+        kind = dom.get("shape") or "rect"
+        if kind == "ellipse":
+            a = np.linspace(0.0, 2.0 * math.pi, 72, endpoint=False)
+            return tuple((0.5 + 0.5 * math.cos(t), 0.5 + 0.5 * math.sin(t)) for t in a)
+        if kind == "custom":
+            P = [(min(max(float(p[0]), 0.0), 1.0), min(max(float(p[1]), 0.0), 1.0)) for p in dom.get("polygon") or []]
+            return tuple(P) if len(P) >= 3 else None
+        return None
 
     def set_pockets(self) -> None:
         """The running run's sounding pockets changed (server /api/run/pockets): built again and put in."""

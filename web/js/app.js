@@ -49,7 +49,7 @@ async function boot() {
   map.onHover = onHover;
   map.onDragRect = onZoneDrawn;
   map.onDragPath = onBrushPainted;
-  map.onDblClick = () => { if (S.tool === 'front') Fronts.finish(); };
+  map.onDblClick = () => { if (S.tool === 'front') Fronts.finish(); else if (S.tool === 'domshape') finishDomainShape(); };
   map.onPress = (x, y, e) => S.tool === 'pan' ? Fronts.press(x, y, e) : S.tool === 'move' ? moveGrab(x, y) : null;  // drag the L
   map.grabbable = (x, y) => (S.tool === 'pan' && !!Fronts.lowAt(x, y)) || (S.tool === 'move' && !!moveHit(x, y));
   bindUI();
@@ -119,6 +119,9 @@ function applySetupToForm() {
   const dom = s.domain || {};
   $('domainMode').value = dom.mode === 'fixed' ? 'fixed' : 'unlimited';
   $('domainSize').value = dom.size_km || 160;
+  $('domainSizeY').value = dom.size_km_y || dom.size_km || 160;
+  $('domainShape').value = ['ellipse', 'custom'].includes(dom.shape) ? dom.shape : 'rect';
+  S.domainPolygon = dom.polygon || null;
   $('domainMax').value = dom.max_km > 0 ? dom.max_km : '';
   const rf = s.refine || {};
   $('refineRatio').value = String(rf.ratio || 0);
@@ -198,7 +201,12 @@ function readSetupFromForm() {
   s.map = { lat0: +$('lat0').value, lon0: +$('lon0').value };
   s.start_time = ($('startTime').value || '2011-04-27T20:00') + ':00Z';
   s.grid = $('grid').value;
-  s.domain = { mode: $('domainMode').value, size_km: domainKm(), max_km: domainMaxKm() };
+  s.domain = { mode: $('domainMode').value, size_km: domainKm(), size_km_y: domainKmY(), max_km: domainMaxKm(),
+    shape: $('domainShape').value };
+  if (s.domain.shape === 'custom') {
+    if (S.domainPolygon && S.domainPolygon.length >= 3) s.domain.polygon = S.domainPolygon;
+    else s.domain.shape = 'rect';
+  }
   s.grid_motion = gridMotionFromForm();
   s.grid_follow_min = +$('gridFollowMin').value;
   s.large_scale = { w_cms: Math.max(0, +$('lsW').value || 0), top_km: Math.min(16, Math.max(4, +$('lsTop').value || 10)) };
@@ -228,13 +236,49 @@ function readSetupFromForm() {
 // a fixed-size domain: one square that follows its storms but never grows (engine.Engine.fixed);
 // an unlimited one whose patches grow up to a largest size (engine.Engine.cap), 0 = no limit
 const domainKm = () => { const v = parseFloat($('domainSize').value); return isFinite(v) ? Math.min(1000, Math.max(48, v)) : 160; };
+const domainKmY = () => { const v = parseFloat($('domainSizeY').value); return isFinite(v) ? Math.min(1000, Math.max(48, v)) : domainKm(); };
 const domainMaxKm = () => { const v = parseFloat($('domainMax').value); return isFinite(v) && v > 0 ? Math.min(1000, Math.max(48, v)) : 0; };
 
-function domainCells(km, g) {
-  // the engine rounds the side up to whole 16-cell blocks; cell_bytes is its GPU memory per cell
+function domainCells(km, g, kmY) {
+  // the engine rounds each side up to whole 16-cell blocks; cell_bytes is its GPU memory per cell
   const n = Math.max(32, Math.ceil(km * 1000 / g.dx / 16) * 16);
-  const gb = n * n * g.nz * (S.defaults.cell_bytes || 600) / 2 ** 30;
-  return `${n}×${n} cells at ${g.label}: about ${gb < 1 ? gb.toFixed(2) : gb.toFixed(1)} GB of GPU memory`;
+  const ny = Math.max(32, Math.ceil((kmY || km) * 1000 / g.dx / 16) * 16);
+  const gb = n * ny * g.nz * (S.defaults.cell_bytes || 600) / 2 ** 30;
+  return `${n}×${ny} cells at ${g.label}: about ${gb < 1 ? gb.toFixed(2) : gb.toFixed(1)} GB of GPU memory`;
+}
+
+// a fixed domain's outline drawn on the map (Draw the shape): its corners in km while drawing
+function finishDomainShape() {
+  const P = (S.shapeDraft || []).filter((p, i, a) => !i || Math.hypot(p[0] - a[i - 1][0], p[1] - a[i - 1][1]) > 0.5);
+  S.shapeDraft = null;
+  setTool('pan');
+  if (P.length < 3) { alert('The shape needs at least three corners.'); return; }
+  const xs = P.map(p => p[0]), ys = P.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const w = Math.max(48, x1 - x0), h = Math.max(48, y1 - y0);
+  S.domainPolygon = P.map(([x, y]) => [+((x - x0) / w).toFixed(4), +((y - y0) / h).toFixed(4)]);
+  S.domainShapeAt = [x0, y0, w, h];
+  $('domainSize').value = Math.round(w); $('domainSizeY').value = Math.round(h);
+  $('domainShape').value = 'custom';
+  showDomain(); map.redraw();
+}
+
+function drawDomainShape(g, m) {
+  const line = (pts, closed) => {
+    g.beginPath(); pts.forEach(([x, y], i) => { const [a, b] = m.toScreen(x, y); i ? g.lineTo(a, b) : g.moveTo(a, b); });
+    if (closed) g.closePath(); g.stroke();
+  };
+  g.save(); g.lineWidth = 2; g.strokeStyle = 'rgba(120,200,255,.85)';
+  if (S.shapeDraft && S.shapeDraft.length) { g.setLineDash([4, 3]); line(S.shapeDraft, false); }
+  const run = S.run, p0 = run && run.domain_shape && run.patches && run.patches[0];
+  if (p0) {                                    // the running fixed domain's shape, in its box
+    const w = p0.x1 - p0.x0, h = p0.y1 - p0.y0;
+    g.setLineDash([]); line(run.domain_shape.map(([fx, fy]) => [(p0.x0 + fx * w) / 1000, (p0.y0 + fy * h) / 1000]), true);
+  } else if (!runActive() && S.domainPolygon && S.domainShapeAt && $('domainShape').value === 'custom') {
+    const [x0, y0, w, h] = S.domainShapeAt;         // where it was drawn (the run puts it on its storms)
+    g.setLineDash([8, 6]); line(S.domainPolygon.map(([fx, fy]) => [x0 + fx * w, y0 + fy * h]), true);
+  }
+  g.restore();
 }
 
 // the grid's motion (CM1's umove/vmove): a named motion, "follow", or [umove, vmove] in m/s
@@ -363,11 +407,13 @@ function showDomain() {
   const g = S.defaults && S.defaults.grids[$('grid').value];
   const cap = domainMaxKm();
   if (g) {
-    $('domainMem').textContent = domainCells(domainKm(), g);
+    $('domainMem').textContent = domainCells(domainKm(), g, domainKmY());
     $('domainMaxMem').textContent = cap ? 'Each patch at most ' + domainCells(cap, g) : '';
   }
   $('domainHint').textContent = fixed
-    ? 'One fixed square that follows its storms. Storms start only inside it.'
+    ? `One fixed ${{ rect: domainKm() === domainKmY() ? 'square' : 'rectangle', ellipse: 'ellipse',
+        custom: 'hand-drawn domain' }[$('domainShape').value]} that follows its storms. Storms start only inside it.` +
+      ($('domainShape').value === 'custom' && !(S.domainPolygon && S.domainPolygon.length >= 3) ? ' Draw its shape first.' : '')
     : cap ? `Unlimited, with storm areas up to ${cap} km wide.`
     : 'Unlimited: storms can go anywhere on the map.';
 }
@@ -941,6 +987,7 @@ function drawOverlay(g, m) {
   if ($('showWarnings').checked && run && run.warnings) drawWarnings(g, m, run.warnings);
   drawBrushes(g, m);
   drawPockets(g, m);
+  drawDomainShape(g, m);
   // the storm firing area: orange dashes
   const fa = (S.run && S.run.settings && S.run.settings.fire_area) || S.setup.fire_area;
   if (fa) {
@@ -1222,9 +1269,10 @@ function setTool(t) {
   S.tool = S.tool === t ? 'pan' : t;
   map.tool = S.tool;
   if (S.tool !== 'front') Fronts.cancelDraft();
+  if (S.tool !== 'domshape') S.shapeDraft = null;
   for (const [id, name] of [['toolStorm', 'storm'], ['toolZone', 'zone'], ['toolRadar', 'radar'], ['pickCenter', 'center'],
                             ['toolFront', 'front'], ['toolFire', 'fire'], ['toolBrush', 'brush'], ['ndSend', 'nudger'],
-                            ['synSndTool', 'synsnd'], ['synDomainTool', 'fire'], ['toolLow', 'tclow'], ['toolVolume', 'volume'], ['toolTornado', 'tornado'], ['toolMove', 'move'], ['toolDow', 'dow'], ['toolPocket', 'pocket']]) {
+                            ['synSndTool', 'synsnd'], ['synDomainTool', 'fire'], ['toolLow', 'tclow'], ['toolVolume', 'volume'], ['toolTornado', 'tornado'], ['toolMove', 'move'], ['toolDow', 'dow'], ['toolPocket', 'pocket'], ['toolDomShape', 'domshape']]) {
     $(id).classList.toggle('on', S.tool === name);
   }
   $('map').classList.toggle('crosshair', S.tool !== 'pan');
@@ -1240,7 +1288,8 @@ function setTool(t) {
     synsnd: 'Click anywhere: the simulated sounding there (Weather tab)',
     tclow: 'Click over warm water to place a surface low (Tropics tab settings)',
     brush: 'Hold the mouse and paint: the low-level winds under the stroke change (Atmosphere tab settings)',
-    pocket: 'Click the map: the sounding picked in the Atmosphere tab becomes a pocket there' };
+    pocket: 'Click the map: the sounding picked in the Atmosphere tab becomes a pocket there',
+    domshape: 'Click the corners of the domain\'s outline — double-click or Enter to finish, Esc to cancel' };
   $('toolhint').textContent = hints[S.tool] || '';
   $('toolhint').classList.toggle('hidden', S.tool === 'pan');
   map.redraw();
@@ -1258,6 +1307,7 @@ async function onMapClick(x, y) {
   if (S.tool === 'synsnd') { Syn.soundingAt(x, y); return; }
   if (S.tool === 'move') { await addNestAt(x, y); return; }
   if (S.tool === 'pocket') { await placePocket(x, y); return; }
+  if (S.tool === 'domshape') { (S.shapeDraft = S.shapeDraft || []).push([x, y]); map.redraw(); return; }
   if (S.tool === 'storm') {
     const st = {
       x: x * 1000, y: y * 1000, kind: $('stormKind').value, motion: $('stormMotion').value,
@@ -1762,6 +1812,8 @@ function bindUI() {
   $('toolSurvey').onclick = () => Survey.open(S.detached ? null : (S.run && S.run.run_id));
   $('lat0').onchange = $('lon0').onchange = async () => { readSetupFromForm(); if (!runActive()) await recenterSetup(); };
   $('domainMode').onchange = $('domainSize').oninput = $('domainMax').oninput = $('grid').onchange = showDomain;
+  $('domainSizeY').oninput = $('domainShape').onchange = showDomain;
+  $('toolDomShape').onclick = () => { S.shapeDraft = []; setTool('domshape'); };
   $('refineRatio').onchange = () => $('refineRow').classList.toggle('hidden', !(+$('refineRatio').value));
   $('tornadoDetail').onchange = changeZoomDetail;       // a running zoom switches in place
   $('terrainKind').onchange = showTerrain;
@@ -1857,6 +1909,7 @@ function bindUI() {
     if (e.code === 'ArrowRight') step(1);
     if (e.code === 'Escape') setTool('pan');
     if ((e.code === 'Enter' || e.code === 'NumpadEnter') && S.tool === 'front') Fronts.finish();
+    if ((e.code === 'Enter' || e.code === 'NumpadEnter') && S.tool === 'domshape') finishDomainShape();
   });
   document.body.addEventListener('click', async e => {
     const b = e.target.closest('button');

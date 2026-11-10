@@ -72,6 +72,7 @@ if "%BACKEND%"=="cuda" (
   if not defined ASKED echo No suitable NVIDIA graphics card: the viewer will run ArWen on the processor ^(CPU^). That works,
   echo but it is much slower than an NVIDIA card: use 2-3 km grids. First-time setup downloads about
   echo 0.4 GB ^(ArWen and a C++ compiler^) and takes 3-10 minutes.
+  if not defined ASKED if exist "%SystemRoot%\System32\amdhip64*.dll" echo An AMD graphics card was found: CuPy has no ROCm build for Windows, so the GPU cannot run the model here. For it, see docs\AMD.md ^(WSL2 or Linux^).
 )
 echo.
 

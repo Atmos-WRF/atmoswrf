@@ -501,6 +501,9 @@ class Simulation:
         grid = GRID_PRESETS[s["grid"]] if s["grid"] in GRID_PRESETS else GRID_PRESETS["1km"]
         ph = s.get("physics", {})
         self.notes = []
+        from . import backend as _backend
+        if _backend.note():
+            self.notes.append(_backend.note())
         if microtweaks.describe():
             self.notes.append(microtweaks.describe())
         if self._heating_skipped:

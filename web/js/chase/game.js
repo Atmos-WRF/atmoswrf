@@ -538,7 +538,11 @@ const Chase = (() => {
       if (Array.isArray(p)) [sx, sy] = p;
     }
     st.car = new CarPhys.Car(st.kind, ground);
-    st.car.solid = (x, y, z) => Stations.solid(x, y, z) || Scenery.solid(x, y, z);
+    // what the car's body runs into (carphys.js: its points pushed out of walls and trunks): the gas stations, then
+    // what is drawn -- the detailed map's buildings, trunks, posts and fences once it is in round the car, else
+    // chase mode's own buildings and trees (hidden under the detailed map, so not hit there)
+    st.car.solid = (x, y, z) => Stations.solid(x, y, z)
+      || (detailed() && WorldLink.ready() ? WorldLink.solid(x, y, z, st.car.v) : Scenery.solid(x, y, z));
     st.car.windAt = windAt;     // the model's wind at the car, every physics step
     st.extraCars = remoteCars; st.extraMap = remoteMap;
     st.car.reset(sx, sy, 0);
@@ -850,7 +854,7 @@ const Chase = (() => {
     if (detailed() && st.run && st.run.proj) {
       WorldLink.start(Render.gl(), st.run.proj, c.p[0], c.p[1]);
       WorldLink.update(st.foot || c, Render.terrain);
-      if (st.spawned) WorldLink.collide(c);
+      // (the car hits the map through st.car.solid, as chase mode's own buildings: not the map's collide())
     }
     groundTrack(st.foot || c, now);
     if (Scenery.updateTrees(c.p[0], c.p[1], Render.terrain, TREE_BUDGET[st.vis.trees] || 0)) {

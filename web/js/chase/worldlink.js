@@ -99,6 +99,17 @@ const WorldLink = (() => {
     return true;
   }
 
+  // a point of the car's body (chase x, y, z m; the car's velocity v) inside what the map has standing: { n: outward
+  // [x, y, 0], d m } or null -- carphys.js's walls and trunks, as with chase mode's own buildings and trees
+  function solid(x, y, z, v) {
+    if (!st.W || st.zOff === null || !st.W.solid) return null;
+    const [wx, wz] = toW(x, y), vw = v ? dirToW([x, y, z], [v[0], v[1], 0]) : [0, 0, 0];
+    const s = st.W.solid(wx, wz, z + st.zOff, vw[0], vw[2]);
+    if (!s) return null;
+    const a = fromW(wx, wz), b = fromW(wx + s.n[0], wz + s.n[1]), nx = b[0] - a[0], ny = b[1] - a[1], l = Math.hypot(nx, ny) || 1;
+    return { n: [nx / l, ny / l, 0], d: s.d * scaleAt(x, y) };
+  }
+
   // something round (a person on foot: rad m) at chase x, y pushed out of the map's buildings, landmarks and trunks:
   // [dx, dy] m or null
   function pushOut(x, y, rad) {
@@ -154,6 +165,6 @@ const WorldLink = (() => {
     st.W.damage({ x0, z0, size, n: N, deg });
     return true;
   }
-  return { st, start, update, moved, ground, collide, pushOut, drawer, wind, toW, fromW, damage, ready: () => !!(st.W && st.ready && st.zOff !== null) };
+  return { st, start, update, moved, ground, collide, solid, pushOut, drawer, wind, toW, fromW, damage, ready: () => !!(st.W && st.ready && st.zOff !== null) };
 })();
 window.WorldLink = WorldLink;

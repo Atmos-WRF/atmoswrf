@@ -4695,6 +4695,58 @@ function chaseHitProps() {
     }
   }
 }
+// ---- a point of the car's body against this map (chase mode's car physics as before the zip, carphys.js probes:
+// a point inside something is pushed out along n by a stiff spring, its speed into it damped): { n: [x, z] outward,
+// d: how deep (m, at most 1.5) } or null.  Buildings (not where a mapped road runs through: arches, gates), tree
+// trunks, posts and poles, fences and deck-level railings; a knockable prop (a sign, a bin, a mailbox) hit faster
+// than 2.5 m/s (vx, vz the car's) goes flying instead.  Nothing up on the surface for a point in a tunnel.
+function chaseSolid(x, z, y, vx, vz) {
+  const th = terrainHeight(x, z);
+  if (th === null) return null;
+  const surf = y > th - 2;                                         // (below: in a tunnel)
+  if (surf) {
+    const g = groundAt(x, z, y + 1);
+    const onRoad = g && g.seg >= 0;
+    const p = onRoad ? null : pushOutOfBuildings(x, z, 0.02, false);
+    if (p) {
+      const l = Math.hypot(p[0], p[1]);
+      if (l > 1e-6) return { n: [p[0] / l, p[1] / l], d: Math.min(1.5, l) };
+    }
+    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+      const list = trunkHash.get(thKey(x + dx * TH_CELL, z + dz * TH_CELL));
+      if (!list) continue;
+      for (let i = 0; i < list.length; i += 3) {
+        const ex = x - list[i], ez = z - list[i + 1], d = Math.hypot(ex, ez), r = list[i + 2] + 0.2;
+        if (d >= r) continue;
+        return d > 1e-4 ? { n: [ex / d, ez / d], d: r - d } : { n: [1, 0], d: r };
+      }
+    }
+  }
+  const sp = Math.hypot(vx || 0, vz || 0);
+  for (let o = 0; surf && o < colCircles.length; o += 4) {
+    const ex = x - colCircles[o], ez = z - colCircles[o + 1];
+    if (Math.abs(ex) > 3 || Math.abs(ez) > 3) continue;
+    const d = Math.hypot(ex, ez), r = colCircles[o + 2] + 0.2;
+    if (d >= r) continue;
+    const kid = colCircles[o + 3], nx = d > 1e-4 ? ex / d : 1, nz = d > 1e-4 ? ez / d : 0;
+    if (kid > 0 && sp > 2.5) {
+      V.vx = vx; V.vz = vz;
+      knock(kid, nx, nz, sp); colCircles[o + 3] = -2; colCircles[o] = 1e9;
+      continue;
+    }
+    return { n: [nx, nz], d: r - d };
+  }
+  for (let o = 0; o < colSegs.length; o += 5) {
+    const ax = colSegs[o], az = colSegs[o + 1], bx = colSegs[o + 2], bz = colSegs[o + 3], sy = colSegs[o + 4];
+    if (Number.isNaN(sy) ? !surf : (y < sy - 1.5 || y > sy + 2.5)) continue;   // fences up top; railings at the deck
+    if (Math.min(ax, bx) - 1 > x || Math.max(ax, bx) + 1 < x || Math.min(az, bz) - 1 > z || Math.max(az, bz) + 1 < z) continue;
+    const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz || 1e-9, u = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / l2));
+    const ex = x - ax - dx * u, ez = z - az - dz * u, d = Math.hypot(ex, ez), r = 0.3;
+    if (d >= r) continue;
+    return d > 1e-4 ? { n: [ex / d, ez / d], d: r - d } : { n: [-dz / Math.sqrt(l2), dx / Math.sqrt(l2)], d: r };
+  }
+  return null;
+}
 const ChaseWorld = {
   START_LAT, START_LON, TILE_SIZE, SURF, SURF_NAMES, LAND, LAND_SURFACE, CLASS_LIST, SEG,
   toLatLon, fromLatLon, scene, camera, renderer, V, tiles,
@@ -4790,6 +4842,7 @@ const ChaseWorld = {
     return hit ? [mx, mz] : null;
   },
   nearestRoad,
+  solid: chaseSolid,
   // the wind for the trees, grass and crops: { u, z m/s (this map's axes), gust (factor) } -- the model's at the camera
   wind(o) {
     windU.value.set(o.u || 0, o.z || 0, o.gust || 1);

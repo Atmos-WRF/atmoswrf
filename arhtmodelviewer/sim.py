@@ -2727,6 +2727,13 @@ class Simulation:
         tk = self.tornadoes
         age = max(0.0, eng.t - tk.t) if tk.t is not None else 0.0
         tors = [(c.x + c.vx * age, c.y + c.vy * age) for c in tk.items if c.found]
+        # and the tornado zoom's own vortex (its pressure minimum, searched every few seconds) while its wind is EF0
+        # or more: the radar's tracker confirms a tornado only after a few refreshes and can lose one for a moment,
+        # and the swath had a gap there -- the first ~100 s of an EF5's path (test run 2026-11-10)
+        tz = getattr(eng, "tornado", None)
+        got = getattr(tz, "found", None) if tz is not None else None
+        if got is not None and float(got[6]) >= rd.EF_WIND[0]:
+            tors.append((float(got[3]), float(got[4])))
         try:
             self.efswath.step(grids, tors)
         except Exception as exc:              # (out of memory included) never the run's end

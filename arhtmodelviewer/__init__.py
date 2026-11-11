@@ -12,7 +12,7 @@ import os
 import warnings
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 PROJECT = Path(__file__).resolve().parents[1]
 

@@ -1,3 +1,22 @@
+# Atmos-WRF 2.1
+
+**New:** tornado detection by vortex strength (200 m and finer grids, nests and the tornado zoom), EF swath map, purely simulated velocities on nests and the tornado zoom, sounding pockets (multiple soundings blended across the map), rectangular, elliptical and hand-drawn fixed domains, southern-hemisphere storms, map re-centred on far-off storms, AMD GPU support (ROCm on Linux / WSL2), mesonet probe chase vehicles (SUV, pickup, sedan, minivan), chase lightning and player-tag settings, cinematic view (V), tornado dust cloud in chase mode
+
+**Changed:** resolved tornadoes rated by the model's own winds, no made-up cloud detail on fine grids (3-D view and chase), the tornado's funnel kept in chase mode's clouds, subtler car dust, chase Play draws at once with a status line
+
+**Fixed:**
+- METARs failing at every run start
+- storms pushed out of shaped domains
+- fake storm rings round very different pocket soundings
+- missed tornadoes on 200 m grids
+- EF5 labels on EF2 tornadoes
+- gaps in the EF swath
+- map turned from true north far from its centre
+- live map edits during a run
+- the last product's image left on an empty map
+- black screen after pressing Play in chase mode
+- probe cars' hood camera
+
 # Atmos-WRF 2.0
 
 **New:** Chase mode: driving under your run's live storms, car handling, SUV / sedan / truck, Basic map, Detailed map (OpenDrive world), model-driven 3-D clouds, far cloud, rain and snow, wind pushes and rolls the car, swaying trees, on foot, gas stations with interiors, route to the nearest gas station, other players on foot, night, lightning and thunder, mesonet probe, building damage, debris and dust, sound, minimap with radar, multiplayer, Cloudflare internet link, Chase tab

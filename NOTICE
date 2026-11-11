@@ -32,6 +32,8 @@ Chase mode:
 - web/js/chase/world/ (the Detailed map) is built by tools/world/build_world.py from OpenDrive (formerly
   "Real Roads Drive"), a single-page driving world made by a friend of the author.
 - Car models: Kenney's Car Kit 3.1 (www.kenney.nl), Creative Commons Zero (CC0) 1.0.
+- Mesonet probe vehicles (web/models/cars/probes: SUV, pickup, sedan, minivan; unbranded glTF models from the
+  Mesonet Chase Fleet configurator), supplied by the author for Atmos-WRF.
 - three.js (MIT License, (c) three.js authors) and earcut (ISC License, (c) Mapbox), loaded from jsDelivr.
 - Fetched while running (not included): FEMA USA Structures (public domain, U.S. Government); OpenFreeMap vector
   tiles ((c) OpenMapTiles, data (c) OpenStreetMap contributors, ODbL); AWS Terrain Tiles (Mapzen terrarium: SRTM,

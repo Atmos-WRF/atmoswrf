@@ -518,9 +518,41 @@ const Render = (() => {
   float fdiff(float tau) { return 1.0 / (1.0 + 0.12 * tau) - exp(-0.12 * tau); }
 `;
 
+  // The tornado's dust and debris cloud: lifted off the ground wherever the model's wind near the ground (its two
+  // lowest wind levels in the tornado's nests, ~45 and ~135 m up) is past DUST_W0 (about 100 mph), thicker and taller
+  // the stronger it is, full at DUST_W1, and stirred along that wind (its ragged edges carried round the vortex).
+  // dustTex: two layers (the volume before, the newest: blended as the cloud is) of R the amount, G, B the wind (as
+  // volume.py's codes) over dustBox[layer] (box units)
+  const DUST_GLSL = `
+  uniform highp sampler2DArray dustTex; uniform vec4 dustBox[2]; uniform float dustF, dustT; uniform int dustOn;
+  float gDust = 0.0;
+  vec4 dustRead(vec2 xy, int l) {
+    vec4 b = dustBox[l];
+    vec2 u = (xy - b.xy) / (b.zw - b.xy);
+    if (any(lessThan(u, vec2(0.0))) || any(greaterThan(u, vec2(1.0)))) return vec4(0.0, 128.0 / 255.0, 128.0 / 255.0, 0.0);
+    return texture(dustTex, vec3(u, float(l)));
+  }
+  float dustAt(vec3 p) {
+    if (dustOn == 0) return 0.0;
+    vec4 c = mix(dustRead(p.xy, 0), dustRead(p.xy, 1), dustF);
+    float D = c.r;
+    if (D < 0.004) return 0.0;
+    float hm = max(0.0, (p.z - gz(p.xy)) * toKm.z * 1000.0);  // m above the ground
+    float H = 40.0 + 180.0 * D;                                // its height scale: a stronger vortex lifts it higher
+    if (hm > 4.0 * H) return 0.0;
+    vec2 w = (c.gb * 255.0 - 128.0) * 0.5;                     // the model's wind there, m/s
+    vec2 k = (p.xy * toKm.xy + kmOrigin.xy) * 1000.0;          // m on the ground
+    // its texture carried along that wind: two phases of a 2.5 s cycle, each faded out as it wraps
+    float P = 2.5, f1 = fract(dustT / P), f2 = fract(dustT / P + 0.5);
+    float n1 = texture(noiseTex, vec3((k - w * f1 * P) / 400.0, hm / 260.0)).r;
+    float n2 = texture(noiseTex, vec3((k - w * f2 * P) / 400.0 + 0.37, hm / 260.0)).r;
+    float n = mix(n1, n2, abs(2.0 * f1 - 1.0));
+    return 28.0 * D * exp(-hm / H) * max(0.0, 0.25 + 1.4 * (n - 0.2)) * density;
+  }`;
+
   // volume.js's media(): the cloud and rain at box point p (extinction per km), its detail (mode > 0) carried along
-  // with the storm (flowK)
-  const MEDIA_GLSL = `
+  // with the storm (flowK); and the tornado's dust (dustAt: counted with the rain, its share in gDust)
+  const MEDIA_GLSL = DUST_GLSL + `
   vec2 media(vec3 p, int mode) {
     vec3 uvw = vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z);
     if (any(lessThan(uvw, vec3(-0.01))) || any(greaterThan(uvw, vec3(1.01)))) return vec2(0.0);
@@ -549,6 +581,8 @@ const Render = (() => {
     if (mode > 0 && detail > 0.0 && s.x + s.y > 1e-3) {
       s = shapeDetail(ka, s);
     }
+    gDust = dustAt(p);
+    s.y += gDust;
     return s;
   }`;
 
@@ -707,6 +741,15 @@ const Render = (() => {
     ];
     if (nightHooks.every(([a]) => src.split(a).length === 2)) for (const [a, b] of nightHooks) src = src.replace(a, b);
     else console.warn('chase: night hooks not found:', nightHooks.filter(([a]) => src.split(a).length !== 2).map(([a]) => a.trim().slice(0, 40)));
+    // the tornado's dust (DUST_GLSL): its share of each step's extinction (taken before the light's own reads of
+    // media()), a dull albedo and its colour, a grey-brown of dry soil
+    const dustHooks = [
+      ['        vec2 s = media(p, 2);\n        float sg = sig(s);\n', '        vec2 s = media(p, 2);\n        float sg = sig(s);\n        float dsh = clamp(gDust / (sg + 1e-6), 0.0, 1.0);\n'],
+      ['float albedo = mix(0.98, 0.78, s.y / (sg + 1e-6));', 'float albedo = mix(mix(0.98, 0.78, s.y / (sg + 1e-6)), 0.6, dsh);'],
+      ['          float fog = 1.0 - exp(-t * kmPer / hazeKm);', '          S *= mix(vec3(1.0), vec3(1.0, 0.8, 0.6), dsh);\n          float fog = 1.0 - exp(-t * kmPer / hazeKm);'],
+    ];
+    if (dustHooks.every(([a]) => src.split(a).length === 2)) for (const [a, b] of dustHooks) src = src.replace(a, b);
+    else console.warn('chase: dust hooks not found; the tornado\'s dust drawn as rain');
     // the light coming up off the ground
     const sHook = 'vec3 S = albedo * (SUN * L * 4.5 + ';
     // and the light diffused down through the cloud above (fdiff): the storm's base grey, not black
@@ -1032,16 +1075,73 @@ const Render = (() => {
     });
     // then the wind: the box's, each nest's (RGB bytes at every second point)
     if (hasWind) {
-      const put = (tex, d) => { const n = d[0] * d[1] * d[2] * 3; alloc3D(tex, gl.RGB8, d[0], d[1], d[2], gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array(data.buffer, off, n)); off += n; };
+      const put = (tex, d) => { const n = d[0] * d[1] * d[2] * 3, a = new Uint8Array(data.buffer, off, n); alloc3D(tex, gl.RGB8, d[0], d[1], d[2], gl.RGB, gl.UNSIGNED_BYTE, a); off += n; return a; };
       put(windB, header.wind.dims);
+      const wv = [];
       header.insets.forEach((ins, i) => {
         const prev = oldIns[i];
-        if (ins.wind) put(wInsB[i], ins.wind);
+        if (ins.wind) wv[i] = put(wInsB[i], ins.wind);
         mixSt.insWarp[i] = warp && mixSt.insBlend[i] && !!ins.wind && !!(prev && prev.wind) && prev.wind.join() === ins.wind.join();
       });
       mixSt.warp = warp && windA._k === windB._k;     // the same wind grid at both ends
-    } else mixSt.insWarp.fill(false);
+      setDust(header, wv, blend);
+    } else { mixSt.insWarp.fill(false); setDust(header, [], false); }
     return header;
+  }
+
+  // the tornado's dust (DUST_GLSL) from the newest volume: over the tornado's nests (finer than 150 m), each point the
+  // finest nest's wind at its two lowest wind levels (the stronger), as dustTex's newest layer; the one before it
+  // stays as the other, the two blended as the cloud is
+  const DUST_N = 256, DUST_W0 = 45, DUST_W1 = 60;       // m/s: dust from about 100 mph, full by about 135
+  const dust = { tex: null, prev: null, cur: null, data: new Uint8Array(DUST_N * DUST_N * 4 * 2) };
+  function dustLayer(header, wv) {
+    const fine = header.insets.map((s, i) => ({ s, w: wv[i] })).filter(o => o.w && o.s.wind && o.s.dx < 150).sort((a, b) => a.s.dx - b.s.dx);
+    if (!fine.length) return null;
+    const x0 = Math.min(...fine.map(o => o.s.box[0])), y0 = Math.min(...fine.map(o => o.s.box[1]));
+    const x1 = Math.max(...fine.map(o => o.s.box[2])), y1 = Math.max(...fine.map(o => o.s.box[3]));
+    const N = DUST_N, out = new Uint8Array(N * N * 4);
+    let any = false;
+    for (let j = 0; j < N; j++) {
+      const Y = y0 + (j + 0.5) * (y1 - y0) / N;
+      for (let i = 0; i < N; i++) {
+        const X = x0 + (i + 0.5) * (x1 - x0) / N, q = (j * N + i) * 4;
+        out[q + 1] = out[q + 2] = 128;
+        for (const { s, w } of fine) {
+          const b = s.box;
+          if (X < b[0] || X >= b[2] || Y < b[1] || Y >= b[3]) continue;
+          const [wx, wy, wz] = s.wind, ii = Math.floor((X - b[0]) / (b[2] - b[0]) * wx), jj = Math.floor((Y - b[1]) / (b[3] - b[1]) * wy);
+          let best = 0, bu = 128, bv = 128;
+          for (let k = 0; k < Math.min(2, wz); k++) {
+            const o = ((k * wy + jj) * wx + ii) * 3, W = Math.hypot(w[o] - 128, w[o + 1] - 128) / 2;
+            if (W > best) { best = W; bu = w[o]; bv = w[o + 1]; }
+          }
+          const D = Math.max(0, Math.min(1, (best - DUST_W0) / (DUST_W1 - DUST_W0)));
+          if (D > 0) any = true;
+          out[q] = Math.round(255 * D); out[q + 1] = bu; out[q + 2] = bv; out[q + 3] = 255;
+          break;
+        }
+      }
+    }
+    return any ? { box: [x0, y0, x1, y1], px: out } : null;
+  }
+  function setDust(header, wv, blend) {
+    if (!gl) return;
+    const cur = dustLayer(header, wv);
+    dust.prev = blend ? dust.cur : cur;
+    dust.cur = cur;
+    if (!dust.prev && !dust.cur) return;
+    if (!dust.tex) dust.tex = gl.createTexture();
+    const L = DUST_N * DUST_N * 4;
+    dust.data.fill(0);
+    for (let l = 0; l < 2; l++) {
+      const d = l ? dust.cur : dust.prev;
+      if (d) dust.data.set(d.px, l * L);
+      else for (let q = l * L; q < (l + 1) * L; q += 4) { dust.data[q + 1] = 128; dust.data[q + 2] = 128; }
+    }
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, dust.tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage3D(gl.TEXTURE_2D_ARRAY, 0, gl.RGBA8, DUST_N, DUST_N, 2, 0, gl.RGBA, gl.UNSIGNED_BYTE, dust.data);
+    texParams(gl.TEXTURE_2D_ARRAY, gl.LINEAR, gl.CLAMP_TO_EDGE);
   }
 
   // the far cloud's tier i (0 the nearer, 1 the wider): a volume from volume.py extract (far=1), blended into over
@@ -1666,6 +1766,22 @@ const Render = (() => {
       gl.uniform2f(u.farTop, FT[0], FT[1]); gl.uniform2f(u.farCell, FC[0], FC[1]);
     }
     gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_3D, noiseTex); gl.uniform1i(u.noiseTex, 4);
+    // the tornado's dust (unit 14: free in the cloud pass)
+    if (u.dustOn) {
+      const on = !!(dust.tex && (dust.prev || dust.cur));
+      gl.activeTexture(gl.TEXTURE14); gl.bindTexture(gl.TEXTURE_2D_ARRAY, on ? dust.tex : null); gl.uniform1i(u.dustTex, 14);
+      gl.uniform1i(u.dustOn, on ? 1 : 0);
+      if (on) {
+        const DB = new Float32Array(8);
+        [dust.prev, dust.cur].forEach((d, l) => {
+          const b = d ? d.box : [0, 0, 0, 0];
+          DB.set([(b[0] / 1000 - cx) * G.k, (b[1] / 1000 - cy) * G.k, (b[2] / 1000 - cx) * G.k, (b[3] / 1000 - cy) * G.k], 4 * l);
+        });
+        gl.uniform4fv(u.dustBox, DB);
+        gl.uniform1f(u.dustF, Math.min(1, blendFrac(performance.now())));
+        gl.uniform1f(u.dustT, ft === null ? 0 : ft - flowEpoch);
+      }
+    }
     gl.uniform1f(u.detail, view.detail);
     gl.uniform1f(u.detailKm, Math.max(0.05, (box[2] - box[0]) / head.nx));
     gl.uniform1f(u.frameSeed, view.seed || 0);

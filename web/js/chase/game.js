@@ -684,9 +684,11 @@ const Chase = (() => {
     const me = st.foot || st.car, sf = surfAt(me.p[0], me.p[1]);
     const name = Object.keys(SURF).find(k => SURF[k] === sf.s) || 'grass';
     const W = Math.hypot(wx.u, wx.v), dry = 1 - 0.85 * Math.min(1, st.wet * 1.2 + wx.rainI);
-    const lift = Math.max(0, Math.min(1, (W - 8) / 16)) * (DUSTY[name] === undefined ? 0.3 : DUSTY[name]) * dry;
+    // (kept subtle, the user 2026-11-10: from ~12 m/s, at most half as thick; the tornado's own dust cloud is the
+    // cloud pass's, render.js DUST_GLSL)
+    const lift = Math.max(0, Math.min(1, (W - 12) / 20)) * (DUSTY[name] === undefined ? 0.3 : DUSTY[name]) * dry;
     const tor = Math.max(0, Math.min(1, (wx.gust - 38) / 30));
-    const k = Math.max(lift, tor);
+    const k = 0.5 * Math.max(lift, tor);
     if (k < 0.01) return null;
     const L = 0.18 + 0.72 * night.dayK + Math.min(0.5, (flashAt(performance.now(), view.eye).amb[0]) * 0.3);
     return { k, gz: sf.h, wind: [wx.u, wx.v], col: [0.52 * L, 0.45 * L, 0.35 * L] };

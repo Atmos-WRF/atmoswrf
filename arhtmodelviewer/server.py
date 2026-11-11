@@ -70,8 +70,13 @@ def _quick(sim, key, make):
         c = _QUICK.get(k)
     if c is not None and time.monotonic() - c[0] < QUICK_AGE:
         return c[1]
-    with sim.lock:
+    # nothing cached (a page just opened, a new run): read without the lock, as /api/state does, rather than wait out
+    # a whole model step (minutes in a new run's first steps or with a tornado zoom: chase mode's start waited on it)
+    try:
         d = make()
+    except Exception:                          # changed while read: wait for the lock after all
+        with sim.lock:
+            d = make()
     with _QUICK_LOCK:
         _QUICK[k] = (time.monotonic(), d)
     return d

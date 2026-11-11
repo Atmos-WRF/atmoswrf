@@ -237,10 +237,11 @@ const Chase = (() => {
 
   // ---------------------------------------------------------------- the run, the storm, the volume
   async function poll() {
+    const tg = pollTargets();
     try {
       st.run = await getJSON('/api/state');
     } catch (e) { st.run = null; }
-    await pollTargets();
+    await tg;
   }
   // the tornadoes' and storms' positions (pmw.targets: small, and quick to make), more often than the whole state
   async function pollTargets() {
@@ -465,8 +466,9 @@ const Chase = (() => {
       st.volErr = st.noStorm && !far ? '' : e.message;
       // no storm in the box (none in the run yet, or far from them): an empty sky over it, so the ground and the car
       // are drawn anyway; the storm comes in when a fetch first finds it
-      if (!Render.head() || far) { Render.setVolume(b, emptyVolume(b), 0); st.box = b; st.volErr = ''; st.noStorm = true; }
+      if (!Render.head() || far || st.waitGround) { Render.setVolume(b, emptyVolume(b), 0); st.box = b; st.volErr = ''; st.noStorm = true; }
     }
+    if (st.waitGround && st.box === b) groundIn();
     st.volGap = Math.max(VOL_MIN, Math.min(VOL_MAX, VOL_LOAD * (performance.now() - t0)));
     st.volBusy = false;
   }
@@ -545,24 +547,52 @@ const Chase = (() => {
     return !!n;
   }
 
+  // Play to the first frame: the start panel stays up with what is being waited for (and for how long) instead of a
+  // black screen -- a request the model's lock holds waits out a whole model step, seconds to minutes with a tornado
+  // zoom's nests, a new run's first steps or a big domain (the user: "sometimes it takes minutes", 2026-11-10)
+  let stageT = 0, stageTimer = null;
+  function stage(m) {
+    const t0 = stageT = performance.now();
+    clearInterval(stageTimer);
+    const show = () => {
+      const s = (performance.now() - t0) / 1000;
+      $('startMsg').textContent = `${m}${s >= 1.5 ? ` (${Math.round(s)} s)` : ''}` +
+        (s > 8 ? ' -- the model is in the middle of a long step and answers after it' : '');
+    };
+    show();
+    stageTimer = m ? setInterval(show, 500) : null;
+  }
+  // a run with terrain: drawn at once under an empty sky over flat ground, the car held (no physics, no roads or
+  // buildings fetched: they sit on the model's ground) until the first volume brings the model's ground in
+  function groundIn() {
+    st.waitGround = false;
+    const h = st.spawnHint;
+    if (h) st.car.reset(h.x, h.y, 0);
+    st.cam.eye = null;
+    WorldLink.moved();                        // the detailed map's height offset taken again, on the real ground
+    say(st.spawnHint && st.spawnHint.what ? `Heading for ${st.spawnHint.what}: loading the roads…` : 'Loading the roads…', 3000);
+  }
+
   async function start() {
     st.name = ($('name').value || 'Chaser').slice(0, 20);
     st.kind = $('vehicle').value;
     st.color = hexRgb($('color').value);
     try { localStorage.setItem('chase.name', st.name); localStorage.setItem('chase.kind', st.kind); localStorage.setItem('chase.color', $('color').value); } catch (e) { /* private */ }
-    $('go').disabled = true; $('startMsg').textContent = Net.local ? '' : 'Joining…';
+    $('go').disabled = true; stage(Net.local ? 'Starting…' : 'Joining…');
     try { Sound.start(); } catch (e) { console.warn('chase sound:', e); }       // on the click: browsers want a gesture
-    try { await Net.join(st.name, st.kind, st.color, $('code').value.trim()); }
+    try { if (!Net.st.joined) await Net.join(st.name, st.kind, st.color, $('code').value.trim()); }   // (Drive again after "no run")
     catch (e) {
       // this PC on a viewer older than chase multiplayer: drive alone
       if (Net.local && /^404|^unknown/.test(e.message)) Net.st.err = 'restart the viewer for multiplayer and buildings';
-      else { $('go').disabled = false; $('startMsg').textContent = `Could not join: ${e.message}`; return; }
+      else { $('go').disabled = false; stage(''); $('startMsg').textContent = `Could not join: ${e.message}`; return; }
     }
     if (Net.local) Net.hostStatus();
+    stage('Reading the run and finding the storms…');
+    await poll();
+    if (!st.run || st.run.status === 'none' || !st.run.run_id) { stage(''); $('startMsg').textContent = 'No run: start one in the viewer first.'; $('go').disabled = false; return; }
+    stage('');
     $('start').classList.add('hidden');
     st.started = true;
-    await poll();
-    if (!st.run || st.run.status === 'none' || !st.run.run_id) { say('No run: start one in the viewer first.', 1e9); return; }
     // no storm yet: a drive anyway, from the middle of the run's map (or a spot picked on it)
     const s = storm() || { x: 0, y: 0, v: [10, 5], what: 'the open road', none: true };
     // where to start: ahead of the storm on its inflow side (12 km, or 4 km: close), or a spot picked on the map
@@ -587,13 +617,13 @@ const Chase = (() => {
     // on flat ground: driving at once under an empty sky over the box, the storm coming in when its volume does
     // (it is made under the model's lock, so the start waited out a whole model step -- seconds with a tornado
     // zoom's nests -- before the first frame); with terrain the car waits for the model's ground under it
+    // with terrain the car is held until the model's ground comes in with the first volume (groundIn), the scene
+    // drawn meanwhile
     const terr = !!(st.run.settings && st.run.settings.terrain && st.run.settings.terrain.on);
-    if (terr) await loadVolume(true);
-    else {
-      const h = BOX_KM / 2, cx = Math.round(sx / 1000), cy = Math.round(sy / 1000), eb = [cx - h, cy - h, cx + h, cy + h];
-      Render.setVolume(eb, emptyVolume(eb), 0);
-      loadVolume(true);
-    }
+    const h = BOX_KM / 2, cx = Math.round(sx / 1000), cy = Math.round(sy / 1000), eb = [cx - h, cy - h, cx + h, cy + h];
+    Render.setVolume(eb, emptyVolume(eb), 0);
+    st.waitGround = terr; st.waitT = performance.now();
+    loadVolume(true);
     st.last = performance.now();
     requestAnimationFrame(tick);
     setInterval(poll, 4000);
@@ -602,6 +632,11 @@ const Chase = (() => {
     // the streaming (network) on its own clock, not the frames'
     const stream = () => {
       const c = st.car;
+      if (st.waitGround) {
+        if (!st.volBusy) loadVolume(true);
+        say(`Loading the storm and the model's ground… ${Math.round((performance.now() - st.waitT) / 1000)} s${performance.now() - st.waitT > 8000 ? ' (the model is in a long step)' : ''}`, 1500);
+        return;
+      }
       Roads.update(c.p[0], c.p[1], Render.terrain, () => Render.setRoads(Roads.state.mesh, Roads.state.origin));
       loadVolume(false);
       Scenery.updateBuildings(c.p[0], c.p[1], Render.terrain, () => Render.setBuildings(Scenery.state.bMesh, Scenery.state.bOrigin));
@@ -624,8 +659,7 @@ const Chase = (() => {
     };
     stream();
     setInterval(stream, 500);
-    loadFar();
-    setInterval(loadFar, 1000);
+    setInterval(() => { if (!st.waitGround) loadFar(); }, 1000);
     // the car to the others on its own clock: it keeps going while this tab is in the background
     setInterval(() => {
       if (!st.car) return;
@@ -862,7 +896,7 @@ const Chase = (() => {
       const h = st.spawnHint;
       if (place(h.x, h.y, h.yaw)) { st.spawned = true; say(`On the road, ${(Math.hypot(c.p[0] - h.x, c.p[1] - h.y) / 1000).toFixed(1)} km from where you were dropped. Chase ${h.what}!`, 5000); }
     }
-    if (!st.spawned && !st.dropT) st.dropT = now;
+    if (!st.spawned && !st.dropT && !st.waitGround) st.dropT = now;
     if (!st.spawned && now - st.dropT > 45000) {
       st.spawned = true; st.offroadStart = [c.p[0], c.p[1]];
       say('The roads are still loading: off-road for now (you go onto a road as soon as one arrives, or press R).', 6000);
@@ -888,7 +922,7 @@ const Chase = (() => {
     // detailed world's real terrain lies far below it in low country, and every frame there reset the car again
     // (the user: "spam teleported", 2026-11-09); and at most once every 3 s, whatever the cause
     const lost = !isFinite(c.p[0]) || !isFinite(c.p[1]) || !isFinite(c.p[2]);
-    if ((lost || c.p[2] < surfAt(c.p[0], c.p[1]).h - 50) && now - (st.autoResetT || 0) > 3000) {
+    if (!st.waitGround && (lost || c.p[2] < surfAt(c.p[0], c.p[1]).h - 50) && now - (st.autoResetT || 0) > 3000) {
       st.autoResetT = now;
       resetCar();
     }
@@ -905,7 +939,7 @@ const Chase = (() => {
       // (the car hits the map through st.car.solid, as chase mode's own buildings: not the map's collide())
     }
     groundTrack(st.foot || c, now);
-    if (Scenery.updateTrees(c.p[0], c.p[1], Render.terrain, TREE_BUDGET[st.vis.trees] || 0)) {
+    if (!st.waitGround && Scenery.updateTrees(c.p[0], c.p[1], Render.terrain, TREE_BUDGET[st.vis.trees] || 0)) {
       const ss = Scenery.state;
       Render.setTrees(ss.trees, ss.treeN, ss.treeNear, ss.treeOrigin);
     }

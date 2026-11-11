@@ -83,7 +83,7 @@ class WarningCenter:
         if self.rm is None:
             try:
                 from .sounding import diagnostics
-                self.rm = tuple(diagnostics(self.sim.sounding)["rm"])
+                self.rm = tuple(diagnostics(self.sim.sounding, south=getattr(self.sim, "south", False))["rm"])
             except Exception:
                 self.rm = (10.0, 5.0)
         return self.rm
@@ -119,7 +119,7 @@ class WarningCenter:
             wind = float(cp.hypot(f.uc[0][sl], f.vc[0][sl]).max())
             dbz = float(f.dbz[k2:k7 + 1][(slice(None),) + sl].max())
             if id(f) not in vrots:
-                vrots[id(f)] = rd.lowlevel_vrot(f.uc, f.vc, z_h, dx)
+                vrots[id(f)] = rd.lowlevel_vrot(f.uc, f.vc, z_h, dx, getattr(f, "cyc", 1.0))
             nr = max(int(TOR_R / dx), 1)
             vrot = float(vrots[id(f)][max(j - nr, 0):j + nr + 1, max(i - nr, 0):i + nr + 1].max())   # cyclonic only
             tor = owner.get(tr.id, [])

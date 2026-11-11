@@ -473,7 +473,11 @@ class Simulation:
         if self._heating_skipped:
             spec = {k: v for k, v in spec.items() if k != "heating"}
         self.sounding = load_sounding(spec)
-        self.diag = snd.diagnostics(self.sounding)
+        # the southern hemisphere: mesocyclones and tornadoes turn clockwise, the cyclonic (tornadic) supercell is
+        # Bunkers' left mover; "rm" and the helicities are then about it (sounding.diagnostics), and every rotation
+        # check takes the cyclonic sign (env.cyc)
+        self.south = self.proj.lat0 < 0.0
+        self.diag = snd.diagnostics(self.sounding, south=self.south)
 
     @staticmethod
     def _double_heating(s: dict) -> bool:
@@ -596,6 +600,12 @@ class Simulation:
                                   f"onto the map's grid at the storms' longitude ({self._turn_lon:.1f}): true north there "
                                   "is that far round from the grid's north")
         self.env = Environment(grid_snd, grid, phys, motion=motion)
+        self.env.cyc = -1.0 if self.south else 1.0
+        if self.south:
+            self.env.diag = snd.diagnostics(self.env.sounding, south=True)
+            self.env.storm_motion = tuple(self.env.diag["rm"])     # the cyclonic (left) mover
+            self.notes.append("southern hemisphere: mesocyclones and tornadoes are found turning clockwise, and storm "
+                              "motions marked RM are Bunkers' left mover (the cyclonic supercell)")
         self.env.start_time = start
         self._build_pockets(s, hc)
         self.env.latlon = lambda X, Y: self.proj.inv(X, Y)
@@ -2159,7 +2169,7 @@ class Simulation:
         if (self.settings.get("sounding") or {}).get("ice_cap", True):
             s = s.ice_capped()
         self.sounding = s
-        self.diag = snd.diagnostics(s)
+        self.diag = snd.diagnostics(s, south=self.south)
 
     def _synoptic_prepare(self) -> None:
         """Advance the weather ahead of the storms and work out what the next steps will read (fronts,

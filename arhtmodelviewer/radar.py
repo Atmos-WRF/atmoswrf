@@ -549,7 +549,8 @@ __device__ void add_tornado_wind(const float* vort, const float* vtab, int nvort
         if (r >= V[4] || r < 1.0f) continue;
         float fz = h <= V[5] ? 1.0f : fmaxf(0.0f, 1.0f - (h - V[5]) / 2000.0f);
         if (fz <= 0.0f) continue;
-        float vt = r < V[3] ? V[2] * r / V[3] : V[2] * powf(V[3] / r, 0.8f);
+        float sg = V[2] < 0.0f ? -1.0f : 1.0f, pk = fabsf(V[2]);    // clockwise in the southern hemisphere
+        float vt = r < V[3] ? pk * r / V[3] : pk * powf(V[3] / r, 0.8f);
         float fr = r / V[4] * (nvr - 1);
         int j = min((int)fr, nvr - 2);
         float tj = fr - j;
@@ -560,8 +561,8 @@ __device__ void add_tornado_wind(const float* vort, const float* vtab, int nvort
         float s = fmaxf(0.0f, 2.0f * r / V[4] - 1.0f);
         // never weaker than the model's own vortex there: the tornado sharpens it, it does not take it away
         float d = V[6] * fz * (1.0f - s * s * (3.0f - 2.0f * s)) * fmaxf(vt - vm, 0.0f);
-        *u -= d * ey / r;                  // cyclonic (counter-clockwise)
-        *v += d * ex / r;
+        *u -= sg * d * ey / r;             // cyclonic: counter-clockwise (north), clockwise (south)
+        *v += sg * d * ex / r;
     }
 }
 
@@ -581,7 +582,7 @@ __device__ float vortex_hole(const float* vort, int nvort, float x, float y, flo
         float r2 = (ex * ex + ey * ey) / (rh * rh);
         if (r2 >= 9.0f) continue;
         float fz = h <= V[5] ? 1.0f : fmaxf(0.0f, 1.0f - (h - V[5]) / 2000.0f);
-        float st = fminf(fmaxf((V[2] - 35.0f) / 45.0f, 0.0f), 1.0f);
+        float st = fminf(fmaxf((fabsf(V[2]) - 35.0f) / 45.0f, 0.0f), 1.0f);
         float depth = (HOLE_DB0 + (HOLE_DB1 - HOLE_DB0) * st) * V[6] * fz;
         keep *= 1.0f - (1.0f - exp10f(-0.1f * depth)) * expf(-r2);
     }
@@ -927,8 +928,9 @@ class PatchRadarFields:
         # thousands of cells (33 s of every refresh at 1.2 m), on a box smaller than the features; the coarser
         # levels around it carry them
         self.thp0 = st.thp[0]                    # the lowest level's theta': is there RFD / outflow air
+        self.cyc = float(getattr(env, "cyc", 1.0))       # +1 north, -1 south: which way a mesocyclone / tornado turns
         if self.dx >= FEATURE_MIN_DX:
-            self.vrot = lowlevel_vrot(self.uc, self.vc, env.z_h, self.dx)
+            self.vrot = lowlevel_vrot(self.uc, self.vc, env.z_h, self.dx, self.cyc)
             add_fine_lines(self, env, (patch.id * 7919 + int(getattr(env, "clock", 0.0))) & 0x7FFFFFFF)
             add_zdr_arc(self, env, (patch.id * 6271 + int(getattr(env, "clock", 0.0))) & 0x7FFFFFFF)
             add_v_notch(self, env)
@@ -1180,7 +1182,7 @@ def add_zdr_arc(f: "PatchRadarFields", env, seed: int) -> None:
     # the inflow flank: right of the storm's motion (its southern / eastern side), leaning toward where the
     # low-level storm-relative inflow comes from -- for a fast storm that is its front, not its side
     sm = math.hypot(cx, cy)
-    right = np.array([cy, -cx]) / sm if sm > 2.0 else -inf / np.hypot(*inf)
+    right = f.cyc * np.array([cy, -cx]) / sm if sm > 2.0 else -inf / np.hypot(*inf)   # (left, south)
     n_in = right + 0.5 * (-inf / np.hypot(*inf))
     n_in = n_in / max(np.hypot(*n_in), 1e-6)
     fw = fwd / max(np.hypot(*fwd), 1e-6)
@@ -1395,7 +1397,7 @@ def ef_estimate(wind: float | None, vrot: float | None, cc: float | None, resolv
     return min(est, 5)
 
 
-def lowlevel_vrot(uc, vc, z_h, dx: float):
+def lowlevel_vrot(uc, vc, z_h, dx: float, cyc: float = 1.0):
     """The rotational velocity (m/s) a radar would measure at each column: the strongest mean
     tangential wind on a circle about it (the vertical vorticity averaged over the disc, times half
     its radius) for radii up to TVS_RADIUS (2.5 cells at least), at its strongest in the lowest
@@ -1416,7 +1418,7 @@ def lowlevel_vrot(uc, vc, z_h, dx: float):
     top = max(int(np.searchsorted(np.asarray(z_h), 1000.0)), 1)
     best = None
     for k in range(min(top, uc.shape[0])):
-        zeta = cp.gradient(vc[k], dx, axis=1) - cp.gradient(uc[k], dx, axis=0)
+        zeta = cyc * (cp.gradient(vc[k], dx, axis=1) - cp.gradient(uc[k], dx, axis=0))   # cyclonic positive
         for rad, disc in discs:
             v = ndimage.convolve(zeta, disc, mode="nearest") * (0.5 * rad)
             best = v if best is None else cp.maximum(best, v)
@@ -1456,7 +1458,7 @@ def find_tornadoes(f: "PatchRadarFields", env) -> list:
         return find_vortex_tornadoes(f, env)
     found = []
     u0, v0 = f.uc[0], f.vc[0]                       # ground-relative, lowest level
-    zeta = cp.gradient(v0, dx, axis=1) - cp.gradient(u0, dx, axis=0)
+    zeta = f.cyc * (cp.gradient(v0, dx, axis=1) - cp.gradient(u0, dx, axis=0))      # cyclonic positive
     n = min(max(1, int(round(1000.0 / dx))), FEATURE_CELLS)
     # the core threshold grows as the grid resolves more of the vortex, until it resolves all of it (~30 m):
     # at 1.2 m it read 33 1/s, which no tornado reaches, and the finest zoom level found none
@@ -1475,7 +1477,7 @@ def find_tornadoes(f: "PatchRadarFields", env) -> list:
     # is stretching it, the tornado at its strongest rotation
     if dx < FEATURE_MIN_DX:                         # a grid this fine resolves its tornadoes: none below its reach
         return [d for d in _merge_tornadoes(found) if _tornado_allowed(f, env, d)]
-    vrot = f.vrot if f.vrot is not None else lowlevel_vrot(f.uc, f.vc, env.z_h, dx)
+    vrot = f.vrot if f.vrot is not None else lowlevel_vrot(f.uc, f.vc, env.z_h, dx, f.cyc)
     R = max(TVS_RADIUS, 2.5 * dx)
     m = max(3, int(round(2.0 * R / dx)) | 1)
     k1 = min(int(np.searchsorted(env.z_h, 1000.0)), f.nz - 1)
@@ -1523,7 +1525,7 @@ def find_vortex_tornadoes(f: "PatchRadarFields", env) -> list:
     from cupyx.scipy import ndimage
     dx = f.dx
     u0, v0 = f.uc[0], f.vc[0]
-    zeta = cp.gradient(v0, dx, axis=1) - cp.gradient(u0, dx, axis=0)
+    zeta = f.cyc * (cp.gradient(v0, dx, axis=1) - cp.gradient(u0, dx, axis=0))      # cyclonic positive
     n = min(max(1, int(round(500.0 / dx))), FEATURE_CELLS)
     peak = (zeta >= VORTEX_ZETA) & (zeta == ndimage.maximum_filter(zeta, size=2 * n + 1))
     if not bool(peak.any()):
@@ -1536,6 +1538,7 @@ def find_vortex_tornadoes(f: "PatchRadarFields", env) -> list:
     for j, i in zip(cp.asnumpy(jj[order]).tolist(), cp.asnumpy(ii[order]).tolist()):
         x, y = _peak_xy(zeta, j, i, f)
         rr, vt = vortex_profile(u0, v0, x, y, f)
+        vt = f.cyc * vt                                  # cyclonic positive
         k = int(np.argmax(vt))
         m = max(1, int(math.ceil(VORTEX_REACH_X * rr[k] / dx)))
         blk = spd[max(j - m, 0):j + m + 1, max(i - m, 0):i + m + 1]
@@ -1713,7 +1716,7 @@ def tornado_winds(f: "PatchRadarFields", tors: list, z_h):
     rows = []
     for c in tors:
         s = min(max((c.ve - DEBRIS_V0) / (DEBRIS_V1 - DEBRIS_V0), 0.0), 1.0)
-        rows.append((c.x, c.y, c.ve, 150.0 + 250.0 * s, max(TVS_RADIUS, 2.5 * f.dx), 1000.0 + 2000.0 * s,
+        rows.append((c.x, c.y, f.cyc * c.ve, 150.0 + 250.0 * s, max(TVS_RADIUS, 2.5 * f.dx), 1000.0 + 2000.0 * s,
                      min(max(c.aw, 0.0), 1.0)))
     tor = np.array(rows, np.float32)
     nk = min(int(np.searchsorted(np.asarray(z_h), float(tor[:, 5].max()) + 2000.0)) + 2, f.nz)
@@ -1721,7 +1724,7 @@ def tornado_winds(f: "PatchRadarFields", tors: list, z_h):
     th = np.arange(na) * (2.0 * math.pi / na)
     sin_t, cos_t = cp.asarray(np.sin(th), cp.float32), cp.asarray(np.cos(th), cp.float32)
     tables = []
-    for x, y, _, _, reach, _, _ in tor:
+    for x, y, _, _, reach, _, _ in tor:          # (the model's cyclonic tangential wind about each)
         rr = np.linspace(0.0, float(reach), TORNADO_RADII)
         gi = ((x + rr[:, None] * np.cos(th)) - f.x0) / f.dx - 0.5        # (radii, azimuths)
         gj = ((y + rr[:, None] * np.sin(th)) - f.y0) / f.dx - 0.5
@@ -1730,7 +1733,7 @@ def tornado_winds(f: "PatchRadarFields", tors: list, z_h):
                                       np.tile(gi.ravel(), nk)]), dtype=cp.float32)
         u = ndimage.map_coordinates(f.uc[:nk], coords, order=1, mode="nearest").reshape(nk, TORNADO_RADII, na)
         v = ndimage.map_coordinates(f.vc[:nk], coords, order=1, mode="nearest").reshape(nk, TORNADO_RADII, na)
-        tables.append((v * cos_t - u * sin_t).mean(axis=2))           # counter-clockwise
+        tables.append(f.cyc * (v * cos_t - u * sin_t).mean(axis=2))   # cyclonic (counter-clockwise in the north)
     return tor, cp.ascontiguousarray(cp.stack(tables), dtype=cp.float32)
 
 

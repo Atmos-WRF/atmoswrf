@@ -413,7 +413,7 @@ def vortex(patch, x: float, y: float, radius: float):
     x0, y0 = patch.world_x0(), patch.world_y0()
     uc = 0.5 * (st.u[:2, :, 1:] + st.u[:2, :, :-1])
     vc = 0.5 * (st.v[:2, 1:, :] + st.v[:2, :-1, :])
-    zeta = (cp.gradient(vc, dx, axis=2) - cp.gradient(uc, dx, axis=1)).mean(axis=0)
+    zeta = getattr(env, "cyc", 1.0) * (cp.gradient(vc, dx, axis=2) - cp.gradient(uc, dx, axis=1)).mean(axis=0)
     zeta = cnd.uniform_filter(zeta, 3, mode="nearest")
     ny, nx = zeta.shape
     jj, ii = cp.mgrid[0:ny, 0:nx]
@@ -454,7 +454,7 @@ def low_vortex(patches, x: float, y: float, reach: float):
             continue
         uc = 0.5 * (st.u[:2, :, 1:] + st.u[:2, :, :-1])
         vc = 0.5 * (st.v[:2, 1:, :] + st.v[:2, :-1, :])
-        zeta = (cp.gradient(vc, dx, axis=2) - cp.gradient(uc, dx, axis=1)).mean(axis=0)
+        zeta = getattr(p.env, "cyc", 1.0) * (cp.gradient(vc, dx, axis=2) - cp.gradient(uc, dx, axis=1)).mean(axis=0)
         zeta = cnd.uniform_filter(zeta, max(3, int(round(1000.0 / dx))) | 1, mode="nearest")
         ny, nx = zeta.shape
         jj, ii = cp.mgrid[0:ny, 0:nx]
@@ -484,7 +484,7 @@ def meso_near(patches, x: float, y: float, reach: float):
         k3 = max(int(np.searchsorted(env.z_h, 3000.0)), 2)
         u = 0.5 * (st.u[:k3, :, 1:] + st.u[:k3, :, :-1])
         v = 0.5 * (st.v[:k3, 1:, :] + st.v[:k3, :-1, :])
-        zeta = cp.gradient(v, dx, axis=2) - cp.gradient(u, dx, axis=1)
+        zeta = getattr(p.env, "cyc", 1.0) * (cp.gradient(v, dx, axis=2) - cp.gradient(u, dx, axis=1))
         w = cp.maximum(0.5 * (st.w[:k3] + st.w[1:k3 + 1]), 0.0)
         dz = cp.asarray(np.diff(np.asarray(env.z_w))[:k3], dtype=cp.float32)[:, None, None]
         uh = (w * zeta * dz).sum(axis=0)

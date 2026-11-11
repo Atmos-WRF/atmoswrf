@@ -1126,7 +1126,7 @@ def uh03_map(patch):
     k3 = max(int(np.searchsorted(env.z_h, 3000.0)), 2)
     u = 0.5 * (st.u[:k3, :, 1:] + st.u[:k3, :, :-1])
     v = 0.5 * (st.v[:k3, 1:, :] + st.v[:k3, :-1, :])
-    zeta = cp.gradient(v, dx, axis=2) - cp.gradient(u, dx, axis=1)
+    zeta = getattr(env, "cyc", 1.0) * (cp.gradient(v, dx, axis=2) - cp.gradient(u, dx, axis=1))   # cyclonic +
     w = cp.maximum(0.5 * (st.w[:k3] + st.w[1:k3 + 1]), 0.0)
     dz = cp.asarray(np.diff(np.asarray(env.z_w))[:k3], dtype=cp.float32)[:, None, None]
     return (w * zeta * dz).sum(axis=0)
@@ -1139,7 +1139,7 @@ def low_zeta_map(patch):
     st, dx = patch.state, patch.env.grid.dx
     uc = 0.5 * (st.u[:2, :, 1:] + st.u[:2, :, :-1])
     vc = 0.5 * (st.v[:2, 1:, :] + st.v[:2, :-1, :])
-    z = (cp.gradient(vc, dx, axis=2) - cp.gradient(uc, dx, axis=1)).mean(axis=0)
+    z = getattr(patch.env, "cyc", 1.0) * (cp.gradient(vc, dx, axis=2) - cp.gradient(uc, dx, axis=1)).mean(axis=0)
     return cnd.uniform_filter(z, max(3, int(round(1000.0 / dx))) | 1, mode="nearest")
 
 

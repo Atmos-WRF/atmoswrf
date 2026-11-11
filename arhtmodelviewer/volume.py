@@ -94,7 +94,7 @@ def _sample(f, name: str, X, Y, zv, patch=None):
         # the wind, ground-relative: the patch's state now (the cloud's own moment), else the radar fields'
         a = _wind(patch, name) if patch is not None else {"wu": f.uc, "wv": f.vc, "ww": f.wc}[name]
     else:
-        a = cp.gradient(f.vc, f.dx, axis=2) - cp.gradient(f.uc, f.dx, axis=1)
+        a = getattr(f, "cyc", 1.0) * (cp.gradient(f.vc, f.dx, axis=2) - cp.gradient(f.uc, f.dx, axis=1))
     zh = np.asarray(cp.asnumpy(f.z_h) if hasattr(f.z_h, "device") else f.z_h, np.float64)
     gi = (X - f.x0) / f.dx - 0.5
     gj = (Y - f.y0) / f.dx - 0.5
@@ -170,7 +170,7 @@ def _live_field(patch, name: str, win):
         dx = patch.env.grid.dx
         u = 0.5 * (st.u[:, j0:j1, i0:i1] + st.u[:, j0:j1, i0 + 1:i1 + 1])
         v = 0.5 * (st.v[:, j0:j1, i0:i1] + st.v[:, j0 + 1:j1 + 1, i0:i1])
-        return cp.gradient(v, dx, axis=2) - cp.gradient(u, dx, axis=1)
+        return getattr(patch.env, "cyc", 1.0) * (cp.gradient(v, dx, axis=2) - cp.gradient(u, dx, axis=1))
     raise ValueError(f"the tornado view has no field {name!r}")
 
 

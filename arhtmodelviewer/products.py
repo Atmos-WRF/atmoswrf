@@ -89,7 +89,7 @@ def updraft_helicity(patch):
     # vorticity at cell centres from the C-grid winds
     um = 0.5 * (u[:, :, 1:] + u[:, :, :-1])
     vm = 0.5 * (v[:, 1:, :] + v[:, :-1, :])
-    zeta = cp.gradient(vm, dx, axis=2) - cp.gradient(um, dx, axis=1)
+    zeta = getattr(env, "cyc", 1.0) * (cp.gradient(vm, dx, axis=2) - cp.gradient(um, dx, axis=1))   # cyclonic +
     wm = 0.5 * (st.w[k2:k5] + st.w[k2 + 1:k5 + 1])
     return cp.maximum((wm * zeta * dz).sum(axis=0), 0.0)
 

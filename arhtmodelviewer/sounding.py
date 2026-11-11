@@ -765,7 +765,11 @@ def parcel_trace(s: Sounding, top_hpa: float = 100.0) -> dict:
             "lcl_hpa": round(float(plcl) / 100.0, 1)}
 
 
-def diagnostics(s: Sounding) -> dict:
+def diagnostics(s: Sounding, south: bool = False) -> dict:
+    """``south``: a southern-hemisphere run, where the cyclonic supercell (the tornadic one) is Bunkers' LEFT
+    mover and turns clockwise: "rm" is then that mover and the helicities are about it with the sign turned
+    (cyclonic positive, as SHARPpy's southern-hemisphere mode reads them), so STP, SCP and everything that rates a
+    storm by them read as in the north."""
     zz, p, T, qv, u, v = _fine(s)
     out = {}
     sb = lift_parcel(zz, p, T, qv, 0)
@@ -776,9 +780,12 @@ def diagnostics(s: Sounding) -> dict:
     kmu = int(low[np.argmax(the)])
     mu = lift_parcel(zz, p, T, qv, kmu)
     rm, lm, mean6 = bunkers(zz, u, v)
-    srh05 = srh(zz, u, v, rm[0], rm[1], 500.0)
-    srh1 = srh(zz, u, v, rm[0], rm[1], 1000.0)
-    srh3 = srh(zz, u, v, rm[0], rm[1], 3000.0)
+    if south:
+        rm, lm = lm, rm
+    sg = -1.0 if south else 1.0
+    srh05 = sg * srh(zz, u, v, rm[0], rm[1], 500.0)
+    srh1 = sg * srh(zz, u, v, rm[0], rm[1], 1000.0)
+    srh3 = sg * srh(zz, u, v, rm[0], rm[1], 3000.0)
     anv = (zz >= 9000.0) & (zz <= 11000.0)
     sr_anvil = float(math.hypot(u[anv].mean() - rm[0], v[anv].mean() - rm[1])) if anv.any() else float("nan")
     def shear(top):

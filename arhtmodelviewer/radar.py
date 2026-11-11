@@ -1547,7 +1547,7 @@ def find_vortex_tornadoes(f: "PatchRadarFields", env) -> list:
             continue
         if wmax < EF_WIND[0]:
             continue
-        found.append({"x": x, "y": y, "s": min(max((wmax - EF_WIND[0]) / (DEBRIS_V1 - EF_WIND[0]), 0.02), 1.0),
+        found.append({"x": x, "y": y, "s": min(max((wmax - DEBRIS_V0) / (DEBRIS_V1 - DEBRIS_V0), 0.02), 1.0),
                       "ve": None, "vrot": float(vt[k]), "vt": float(vt[k]), "rmax": float(rr[k]), "wmax": wmax})
     ok = getattr(env, "tornado_forced", None)       # storm-start / nudger pushes, hurricane eyewalls
     return [d for d in _merge_tornadoes(found, within=max(4.0 * dx, 400.0)) if ok is None or not ok(d["x"], d["y"])]

@@ -59,6 +59,7 @@
   #picker .pickBar button { cursor: pointer; padding: 5px 12px; }
   #pickMsg { color: var(--text); font-weight: 600; }
   .hidden { display: none !important; }
+  body.cinema #menuBtn, body.cinema #help { visibility: hidden; }
 </style>
 </head>
 <body>
@@ -140,6 +141,7 @@
     <tr><td>T / B</td><td>Traction control / ABS</td></tr>
     <tr><td>U</td><td>mph / km/h</td></tr>
     <tr><td>P / Shift+P</td><td>Photo (PNG, full size) / with the HUD</td></tr>
+    <tr><td>V</td><td>Cinematic view: hides all the GUI (speedo, minimap, labels, menu, messages). V again, H or Esc: back</td></tr>
     <tr><td>H</td><td>This menu</td></tr>
     <tr><td>Gamepad</td><td>RT/LT throttle/brake, left stick steer, A handbrake, Y camera, X reset, right stick look</td></tr>
   </table>
@@ -165,6 +167,8 @@
     <div class="q">
       <span title="The tornadoes marked: an arrow and label over each in the view, its dot and track on the minimap, the nearest one's distance and direction in the top-left. Off: find them by the radar, the warnings and your own eyes">Tornado markers</span><select data-k="markers"><option value="off">Off</option><option value="on">On</option></select>
       <span title="Rain and snow falling round you, at the model's rain rate there; snow when the model's air at the ground is below about 1 °C, drifting in its wind">Rain and snow</span><select data-k="precip"><option value="on">On</option><option value="off">Off</option></select>
+      <span title="The model's lightning: the flashes lighting the cloud, the cloud-to-ground bolts, thunder, the strike marks on the minimap and the flash rate in the HUD">Lightning</span><select data-k="lightning"><option value="on">On</option><option value="off">Off</option></select>
+      <span title="The other chasers' names and distances over their cars and over them on foot">Player tags</span><select data-k="tags"><option value="on">On</option><option value="off">Off</option></select>
       <span title="The engine, the tyres and road, the model's wind where you are, the rain (N: on / off)">Sound</span><span><input data-k="vol" type="range" min="0" max="1" step="0.05"><output></output></span>
     </div>
     <h3>Sun</h3>

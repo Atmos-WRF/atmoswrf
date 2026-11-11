@@ -59,7 +59,11 @@ const Chase = (() => {
   const VIS0 = { density: 0.5, rain: 1, detail: 0.7, relief: 0.6, haze: 180, sunMode: 'model', sunAz: 235, sunH: 30,
                  base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3, trees: 'full',
                  contrast: 1.3, bounce: 1, mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small',
-                 vol: 0.7, precip: 'on', map: 'detailed', far: 'on', nestStep: '2', markers: 'off' };
+                 vol: 0.7, precip: 'on', map: 'detailed', far: 'on', nestStep: '2', markers: 'off', lightning: 'on', tags: 'on' };
+  // Settings -> Lightning off: no flashes, bolts, thunder or strike marks (nothing is fetched either)
+  const NO_FLASH = { p: [0, 0, 0], I: 0, amb: [0, 0, 0] };
+  const lightningOn = () => !st.vis || st.vis.lightning !== 'off';
+  const flashAt = (now, eye) => (lightningOn() ? Lightning.light(now, eye) : NO_FLASH);
   const QUICK = ['cref', 'REF', 'VEL', 'SRV', 'RHO', 'none'];          // K steps through these
   const TREE_BUDGET = { off: 0, light: 25000, full: 70000 };
 
@@ -386,7 +390,7 @@ const Chase = (() => {
     const I = wx.rainI;
     if (I < 0.01) return null;
     const sun = sunDir(), inside = !st.foot && st.cam.mode !== 'chase';
-    const nk = st.night ? st.night.dayK : 1, fl = Lightning.light(performance.now(), view.eye).amb[2];
+    const nk = st.night ? st.night.dayK : 1, fl = flashAt(performance.now(), view.eye).amb[2];
     const L = (0.32 + 0.5 * Math.min(1, Math.max(0, sun[2]) * 2.2)) * (1 - 0.35 * I) * Math.max(0.06, nk) + 0.3 * Math.min(1, fl);
     return { n: I * (9000 * (1 - wx.snow) + 15000 * wx.snow), snow: wx.snow, cube: wx.snow > 0.5 ? 20 : 24,
              minD: inside ? 1.4 : 0.4, wind: [wx.u, wx.v], camV: wx.camV,
@@ -602,7 +606,7 @@ const Chase = (() => {
       loadVolume(false);
       Scenery.updateBuildings(c.p[0], c.p[1], Render.terrain, () => Render.setBuildings(Scenery.state.bMesh, Scenery.state.bOrigin));
       Stations.update(c.p[0], c.p[1]);
-      Lightning.poll(c.p[0], c.p[1]);
+      if (lightningOn()) Lightning.poll(c.p[0], c.p[1]);
       Damage.poll(c.p[0], c.p[1]);
       const wl = detailed() && WorldLink.ready();
       if (Stations.near(c.p[0], c.p[1], stationGround, wl ? 'world' : 'basic')) Scenery.setSkip(Stations.covers);
@@ -650,7 +654,7 @@ const Chase = (() => {
     const tor = Math.max(0, Math.min(1, (wx.gust - 38) / 30));
     const k = Math.max(lift, tor);
     if (k < 0.01) return null;
-    const L = 0.18 + 0.72 * night.dayK + Math.min(0.5, (Lightning.light(performance.now(), view.eye).amb[0]) * 0.3);
+    const L = 0.18 + 0.72 * night.dayK + Math.min(0.5, (flashAt(performance.now(), view.eye).amb[0]) * 0.3);
     return { k, gz: sf.h, wind: [wx.u, wx.v], col: [0.52 * L, 0.45 * L, 0.35 * L] };
   }
   // O: the way to the nearest gas station, on and off
@@ -924,19 +928,26 @@ const Chase = (() => {
     // the debris flying in the model's wind and coming to rest (damage.js)
     Damage.step(dt, windAt, (x, y) => surfAt(x, y).h, [Math.round(c.p[0]), Math.round(c.p[1])]);
     Render.setDebris(Damage.state.inst, Damage.state.n, Damage.state.origin);
-    Lightning.step(now, c.p, (x, y) => surfAt(x, y).h, (x, y) => Render.cloudBase(x, y), f => Sound.thunder(f.d, f.cg));
+    if (lightningOn()) Lightning.step(now, c.p, (x, y) => surfAt(x, y).h, (x, y) => Render.cloudBase(x, y), f => Sound.thunder(f.d, f.cg));
     st.night = night;
     const tw = treeWind();
     if (detailed() && WorldLink.ready() && WorldLink.wind) WorldLink.wind(tw);
     const world = detailed() && WorldLink.ready() ? WorldLink.drawer(view, sun) : null;
     const fr = Render.frame({ ...view, sun, world, treeWind: tw, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view),
-                              night, flash: Lightning.light(now, view.eye), heads: headlights(night), bolts: Lightning.bolts(now, view.eye, wx.rainI),
+                              night, flash: flashAt(now, view.eye), heads: headlights(night), bolts: lightningOn() ? Lightning.bolts(now, view.eye, wx.rainI) : [],
                               dust: dustView(view, night) }, cars);
     hud(fr, view);
     requestAnimationFrame(tick);
   }
 
   // ---------------------------------------------------------------- the HUD
+  // the cinematic view (V): every bit of GUI hidden -- the HUD canvas (speedo, minimap, labels, tags, messages,
+  // graphs) and the menu -- until V (or H / Esc) again
+  function setCinema(on) {
+    st.cinema = on;
+    document.body.classList.toggle('cinema', on);
+    if (on) $('help').classList.add('hidden');
+  }
   function say(m, ms) { st.msg = m; st.msgT = performance.now() + ms; }
   const COMPASS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
   const bearing = (dx, dy) => COMPASS[Math.round(((Math.atan2(dx, dy) * 180 / Math.PI + 360) % 360) / 22.5) % 16];
@@ -949,6 +960,7 @@ const Chase = (() => {
     g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
     const c = st.car, now = performance.now();
     if (st.cam.mode === 'driver' && !st.foot) dash(g, W, H);
+    if (st.cinema) return;                              // V: the cinematic view, no HUD at all (the dashboard is the car's)
     // the tornadoes on the screen (and on the minimap, and the nearest's distance in the HUD): only with Settings ->
     // Tornado markers on; off, you find them as a chaser does, by the radar, the warnings and your own eyes
     const marks = st.vis.markers === 'on', tors = marks ? tornadoes() : [];
@@ -961,8 +973,8 @@ const Chase = (() => {
       g.font = '600 12px Segoe UI'; g.fillStyle = '#ffd0d0'; g.textAlign = 'center';
       g.fillText(`T${t.id}${t.ef !== null && t.ef !== undefined ? ' EF' + t.ef : ''} · ${(d / 1000).toFixed(1)} km`, s[0], s[1] - 20);
     }
-    // the other chasers' names over their cars
-    if (fr) for (const o of st.lastOthers || []) {
+    // the other chasers' names over their cars (Settings -> Player tags)
+    if (fr && st.vis.tags !== 'off') for (const o of st.lastOthers || []) {
       const at = o.fp ? [o.fp[0], o.fp[1], o.fp[2] - 0.4] : o.p;
       const s = Render.project(fr.VP, fr.G, [at[0], at[1], at[2] + 2.4]);
       if (!s || s[0] < 0 || s[0] > W || s[1] < 0 || s[1] > H) continue;
@@ -1013,7 +1025,8 @@ const Chase = (() => {
     }
     {
       const Ls = Lightning.state;
-      if (Ls.total > 0) {
+      if (!lightningOn()) { /* Settings: off */ }
+      else if (Ls.total > 0) {
         let nd = Infinity, nm = null;
         for (const m of Ls.marks) { const d = Math.hypot(m.x - c.p[0], m.y - c.p[1]); if (m.cg && now - m.t < 60000 && d < nd) { nd = d; nm = m; } }
         lines.push(`Lightning ${Math.round(Ls.total * 60)} flashes/min in the area${nm ? ` · nearest strike ${fmtDist(nd)} ${bearing(nm.x - c.p[0], nm.y - c.p[1])}` : ''}`);
@@ -1254,7 +1267,7 @@ const Chase = (() => {
       g.fillStyle = off ? 'rgba(255,60,60,.6)' : '#ff3b3b'; g.beginPath(); g.arc(s[0], s[1], 6, 0, 7); g.fill();
       g.strokeStyle = '#fff'; g.lineWidth = 1.5; g.stroke();
     }
-    Lightning.map(g, P, performance.now());
+    if (lightningOn()) Lightning.map(g, P, performance.now());
     // the gas stations (close in) and the route to one
     {
       const R = Stations.route;
@@ -1634,7 +1647,12 @@ const Chase = (() => {
       if (e.code === 'KeyX' && !e.repeat && st.car && Probes.isProbe(st.car.kind)) { st.lightBar = !st.lightBar; say(`Light bar ${st.lightBar ? 'on' : 'off'}`, 1200); return; }
       if (e.code === 'KeyC') cycleCam();
       if (e.code === 'KeyR') resetCar();
-      if (e.code === 'KeyH' || e.code === 'F1' || e.code === 'Escape') { e.preventDefault(); $('help').classList.toggle('hidden'); }
+      if (e.code === 'KeyV') setCinema(!st.cinema);
+      if (e.code === 'KeyH' || e.code === 'F1' || e.code === 'Escape') {
+        e.preventDefault();
+        if (st.cinema) setCinema(false);                // the menu brings the GUI back
+        else $('help').classList.toggle('hidden');
+      }
       if (e.code === 'KeyU') st.units = st.units === 'mph' ? 'km/h' : 'mph';
       if (e.code === 'KeyT' && st.car) { st.car.tc = !st.car.tc; say(`Traction control ${st.car.tc ? 'on' : 'off'}`, 1200); }
       if (e.code === 'KeyB' && st.car) { st.car.abs = !st.car.abs; say(`ABS ${st.car.abs ? 'on' : 'off'}`, 1200); }

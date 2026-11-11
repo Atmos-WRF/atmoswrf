@@ -43,6 +43,38 @@ _HEARD: dict = {}               # (client, request line + status) -> when last l
 _SWATHS: dict = {}              # (run, swath, version) -> (PNG, box) of the placefiles' images, the newest few
 _SWATHS_LOCK = threading.Lock()
 _NET = {"port": 8830, "lan": []}   # this server's port and, with --lan, its addresses on the network
+# small answers polled every second or so (the tornadoes' places, chase mode's lightning): the newest made, by key
+# (and the run's id), handed out while the model holds its lock for a step (seconds with a tornado zoom's nests)
+# instead of waiting the step out -- chase mode's pages each had several such requests waiting behind every step,
+# and its start waited them out one after another
+_QUICK: dict = {}
+_QUICK_LOCK = threading.Lock()
+QUICK_WAIT, QUICK_AGE = 0.25, 30.0      # s: how long to wait for the lock before the cached answer; its oldest
+
+
+def _quick(sim, key, make):
+    """make() under the run's lock if it is free within QUICK_WAIT s (and cached), else the cached answer for key
+    (QUICK_AGE s old at most), else make() once the lock is free."""
+    k = (sim.run_id, key)
+    if sim.lock.acquire(timeout=QUICK_WAIT):
+        try:
+            d = make()
+        finally:
+            sim.lock.release()
+        with _QUICK_LOCK:
+            if len(_QUICK) > 64:
+                _QUICK.clear()
+            _QUICK[k] = (time.monotonic(), d)
+        return d
+    with _QUICK_LOCK:
+        c = _QUICK.get(k)
+    if c is not None and time.monotonic() - c[0] < QUICK_AGE:
+        return c[1]
+    with sim.lock:
+        d = make()
+    with _QUICK_LOCK:
+        _QUICK[k] = (time.monotonic(), d)
+    return d
 
 
 def _lan_addresses() -> list[str]:
@@ -350,8 +382,8 @@ class Handler(BaseHTTPRequestHandler):
                     box = [float(q[k]) for k in ("x0", "y0", "x1", "y1")]
                 except (KeyError, ValueError):
                     return self._error(400, "x0, y0, x1, y1 (world km)")
-                with sim.lock:
-                    return self._json(chase.lightning(sim, box))
+                return self._json(_quick(sim, ("lightning", tuple(round(v, 1) for v in box)),
+                                         lambda: chase.lightning(sim, box)))
             if path == "/api/defaults":
                 from . import backend
                 from .engine import CELL_BYTES
@@ -950,9 +982,7 @@ class Handler(BaseHTTPRequestHandler):
         if sim is None or sim.engine is None:
             return self._error(404, "no run")
         if path == "/api/pmw/targets":
-            with sim.lock:
-                d = pmw.targets(sim)
-            return self._json(d)
+            return self._json(_quick(sim, "targets", lambda: pmw.targets(sim)))
         try:
             since = float(q["since"]) if q.get("since") not in (None, "") else None
             cx = float(q["x"]) if q.get("x") not in (None, "") else None

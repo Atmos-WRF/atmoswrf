@@ -580,8 +580,16 @@ const Chase = (() => {
     st.car.reset(sx, sy, 0);
     st.spawnHint = { x: sx, y: sy, yaw: Math.atan2(s.y - sy, s.x - sx), what: s.what };
     say(s.none ? 'No storm in the run yet: a drive anyway (the storm comes in when one forms)…' : `Heading for ${s.what}: loading the storm and the roads…`, 4000);
-    await loadVolume(true);
-    if (!Render.head()) { say(`No cloud volume: ${st.volErr || 'no storm fields yet'}`, 1e9); }
+    // on flat ground: driving at once under an empty sky over the box, the storm coming in when its volume does
+    // (it is made under the model's lock, so the start waited out a whole model step -- seconds with a tornado
+    // zoom's nests -- before the first frame); with terrain the car waits for the model's ground under it
+    const terr = !!(st.run.settings && st.run.settings.terrain && st.run.settings.terrain.on);
+    if (terr) await loadVolume(true);
+    else {
+      const h = BOX_KM / 2, cx = Math.round(sx / 1000), cy = Math.round(sy / 1000), eb = [cx - h, cy - h, cx + h, cy + h];
+      Render.setVolume(eb, emptyVolume(eb), 0);
+      loadVolume(true);
+    }
     st.last = performance.now();
     requestAnimationFrame(tick);
     setInterval(poll, 4000);

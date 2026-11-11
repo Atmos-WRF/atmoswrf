@@ -501,6 +501,11 @@ class Simulation:
         grid = GRID_PRESETS[s["grid"]] if s["grid"] in GRID_PRESETS else GRID_PRESETS["1km"]
         ph = s.get("physics", {})
         self.notes = []
+        rc = s.get("recentred_from")
+        if rc:
+            self.notes.append(f"the map was centred on the storms ({s['map']['lat0']:.2f}, {s['map']['lon0']:.2f}; it was "
+                              f"{float(rc[0]):.2f}, {float(rc[1]):.2f}): the model's Lambert grid is north-up only near "
+                              "its centre, and storms thousands of km off ran turned from true north")
         from . import backend as _backend
         if _backend.note():
             self.notes.append(_backend.note())

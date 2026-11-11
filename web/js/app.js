@@ -684,6 +684,60 @@ async function reloadMap() {
   if (!S.centered) { map.center(0, 0, 1.6); S.centered = true; }
 }
 
+// The model's map is a Lambert projection about its centre: north is up only near it.  Storms placed thousands of
+// km away (Spain, 6600 km from a map centred on Oklahoma) ran on a grid turned ~50 degrees from true north, with
+// the base map turned with it.  A launch whose storms are all far off moves the centre onto them first.
+const RECENTRE_KM = 1000;
+
+// the setup's placed things kept where they are on the ground when the map's centre moves to (lat0, lon0): every
+// point through latitude / longitude into the new projection (boxes: the box round their moved corners)
+async function reprojectSetup(lat0, lon0) {
+  const s = S.setup, from = { proj: await projFor(s.map.lat0, s.map.lon0) }, to = { proj: await projFor(lat0, lon0) };
+  const km = (x, y) => map.fwd.call(to, ...map.inv.call(from, x, y));          // km -> km
+  const m = (x, y) => km(x / 1000, y / 1000).map(v => v * 1000);                // m -> m
+  const box = (x0, y0, x1, y1, f) => {
+    const c = [f(x0, y0), f(x1, y0), f(x0, y1), f(x1, y1)];
+    return [Math.min(...c.map(q => q[0])), Math.min(...c.map(q => q[1])), Math.max(...c.map(q => q[0])), Math.max(...c.map(q => q[1]))];
+  };
+  const turn = (x, y, v) => {          // a grid-relative vector at (x, y) m, turned as the grid turns there
+    const a = m(x, y), b = m(x, y + 1000), ang = Math.atan2(b[0] - a[0], b[1] - a[1]);
+    return [v[0] * Math.cos(ang) + v[1] * Math.sin(ang), -v[0] * Math.sin(ang) + v[1] * Math.cos(ang)];
+  };
+  for (const q of s.storms || []) [q.x, q.y] = m(q.x, q.y);
+  for (const q of s.cyclones || []) [q.x, q.y] = m(q.x, q.y);
+  for (const z of s.zones || []) [z.x0, z.y0, z.x1, z.y1] = box(z.x0, z.y0, z.x1, z.y1, m);
+  if (s.fire_area) s.fire_area = box(...s.fire_area, m);
+  for (const b of [...(s.boundaries || []), ...(s.wind_brushes || [])]) {
+    if (b.vel && b.vel.length === b.points.length) b.vel = b.vel.map((v, i) => turn(b.points[i][0], b.points[i][1], v));
+    b.points = b.points.map(([x, y]) => m(x, y));
+  }
+  for (const q of s.sounding_pockets || []) [q.x_km, q.y_km] = km(q.x_km, q.y_km).map(v => +v.toFixed(2));
+  const [tx, ty] = km(+$('terrainX').value || 0, +$('terrainY').value || 0);
+  $('terrainX').value = tx.toFixed(1); $('terrainY').value = ty.toFixed(1);
+  if (S.domainShapeAt) { const [a, b] = km(S.domainShapeAt[0], S.domainShapeAt[1]); S.domainShapeAt = [a, b, S.domainShapeAt[2], S.domainShapeAt[3]]; }
+  $('lat0').value = lat0.toFixed(2); $('lon0').value = lon0.toFixed(2);
+  s.map = { lat0: +lat0.toFixed(2), lon0: +lon0.toFixed(2) };
+}
+
+// before a launch: storms (and surface lows) all over RECENTRE_KM from the centre -> the centre onto them
+async function recentreOnStorms() {
+  const s = S.setup;
+  if (s.synoptic && s.synoptic.on) return false;        // the simulated weather is its own map
+  const pts = [...(s.storms || []), ...(s.cyclones || [])].map(q => [q.x / 1000, q.y / 1000]);
+  if (!pts.length || pts.some(([x, y]) => Math.hypot(x, y) < RECENTRE_KM)) return false;
+  const from = { proj: await projFor(s.map.lat0, s.map.lon0) }, was = [s.map.lat0, s.map.lon0];
+  const ll = pts.map(([x, y]) => map.inv.call(from, x, y));
+  const lat = ll.reduce((a, q) => a + q[0], 0) / ll.length;
+  const lon = Math.atan2(ll.reduce((a, q) => a + Math.sin(q[1] * Math.PI / 180), 0),
+                         ll.reduce((a, q) => a + Math.cos(q[1] * Math.PI / 180), 0)) * 180 / Math.PI;
+  await reprojectSetup(lat, lon);
+  readSetupFromForm();
+  s.recentred_from = was;                  // (the run's Log says so)
+  S.centered = false; await recenterSetup();
+  renderLists(); renderPockets(); map.redraw();
+  return true;
+}
+
 // Lambert parameters computed the same way as the server (geo.Lambert)
 async function projFor(lat0, lon0) {
   const d2r = Math.PI / 180, R = 6370000;
@@ -1824,6 +1878,10 @@ function bindUI() {
   $('terrainKind').onchange = showTerrain;
   $('newRun').onclick = async () => {
     readSetupFromForm();
+    delete S.setup.recentred_from;
+    if (!runActive() || confirm('Stop the current run and start a new one?')) {
+      try { await recentreOnStorms(); } catch (e) { console.warn('recentre', e); }
+    } else return;
     const s = S.setup;
     if (!(s.storms || []).length && !(s.zones || []).length && !(s.boundaries || []).length && !s.auto_storms.on &&
         !(s.synoptic && s.synoptic.on)) {
@@ -1842,7 +1900,6 @@ function bindUI() {
       if (span > s.domain.size_km - 60 && !confirm(`These storms are up to ${span.toFixed(0)} km apart, too far for ` +
           `the fixed ${s.domain.size_km} km domain to hold them all: the ones that do not fit will not start.\n\nStart anyway?`)) return;
     }
-    if (runActive() && !confirm('Stop the current run and start a new one?')) return;
     $('newRun').disabled = true;
     try {
       S.run = null; S.frames = []; S.lastFrameCount = -1; S.live = true; S.mapKey = ''; S.detached = false;

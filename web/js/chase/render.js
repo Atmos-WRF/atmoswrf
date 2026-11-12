@@ -524,7 +524,7 @@ const Render = (() => {
   // dustTex: two layers (the volume before, the newest: blended as the cloud is) of R the amount, G, B the wind (as
   // volume.py's codes) over dustBox[layer] (box units)
   const DUST_GLSL = `
-  uniform highp sampler2DArray dustTex; uniform vec4 dustBox[2]; uniform float dustF, dustT; uniform int dustOn;
+  uniform highp sampler2DArray dustTex; uniform vec4 dustBox[2]; uniform float dustF, dustT, dustK; uniform int dustOn;
   float gDust = 0.0;
   vec4 dustRead(vec2 xy, int l) {
     vec4 b = dustBox[l];
@@ -549,7 +549,7 @@ const Render = (() => {
     float n1 = texture(noiseTex, vec3((k - w * f1 * P) / 400.0, hm / 260.0)).r;
     float n2 = texture(noiseTex, vec3((k - w * f2 * P) / 400.0 + 0.37, hm / 260.0)).r;
     float n = mix(n1, n2, abs(2.0 * f1 - 1.0));
-    return 13.0 * D * exp(-hm / H) * (1.0 - smoothstep(2.0 * H, 3.0 * H, hm)) * max(0.0, 0.25 + 1.4 * (n - 0.2)) * density;   // (thin: see-through, the user 2026-11-11)
+    return 13.0 * D * exp(-hm / H) * (1.0 - smoothstep(2.0 * H, 3.0 * H, hm)) * max(0.0, 0.25 + 1.4 * (n - 0.2)) * density * dustK;   // (thin: see-through, the user 2026-11-11)
   }`;
 
   // volume.js's media(): the cloud and rain at box point p (extinction per km), its detail (mode > 0) carried along
@@ -1770,7 +1770,8 @@ const Render = (() => {
     gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_3D, noiseTex); gl.uniform1i(u.noiseTex, 4);
     // the tornado's dust (unit 14: free in the cloud pass)
     if (u.dustOn) {
-      const on = !!(dust.tex && (dust.prev || dust.cur));
+      const dk = view.tdust === undefined ? 1 : view.tdust;          // Settings -> Tornado dust (0: none)
+      const on = !!(dust.tex && (dust.prev || dust.cur)) && dk > 0;
       gl.activeTexture(gl.TEXTURE14); gl.bindTexture(gl.TEXTURE_2D_ARRAY, on ? dust.tex : null); gl.uniform1i(u.dustTex, 14);
       gl.uniform1i(u.dustOn, on ? 1 : 0);
       if (on) {
@@ -1781,6 +1782,7 @@ const Render = (() => {
         });
         gl.uniform4fv(u.dustBox, DB);
         gl.uniform1f(u.dustF, Math.min(1, blendFrac(performance.now())));
+        gl.uniform1f(u.dustK, dk);
         gl.uniform1f(u.dustT, ft === null ? 0 : ft - flowEpoch);
       }
     }

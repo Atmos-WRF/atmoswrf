@@ -59,7 +59,7 @@ const Chase = (() => {
   const VIS0 = { density: 0.5, rain: 1, detail: 0.7, relief: 0.6, haze: 180, sunMode: 'model', sunAz: 235, sunH: 30,
                  base: 'plain', scale: 0.75, tricubic: 1, blend: 0.3, trees: 'full',
                  contrast: 1.3, bounce: 1, mmBase: 'osmdark', mmProduct: 'cref', mmSite: 'nearest', mmOpacity: 0.8, mmDim: 0.15, mmBig: 'small',
-                 vol: 0.7, precip: 'on', map: 'detailed', far: 'on', nestStep: '2', markers: 'off', lightning: 'on', tags: 'on' };
+                 vol: 0.7, precip: 'on', map: 'detailed', far: 'on', nestStep: '2', markers: 'off', lightning: 'on', tags: 'on', tdust: 1 };
   // Settings -> Lightning off: no flashes, bolts, thunder or strike marks (nothing is fetched either)
   const NO_FLASH = { p: [0, 0, 0], I: 0, amb: [0, 0, 0] };
   const lightningOn = () => !st.vis || st.vis.lightning !== 'off';
@@ -969,7 +969,7 @@ const Chase = (() => {
     const tw = treeWind();
     if (detailed() && WorldLink.ready() && WorldLink.wind) WorldLink.wind(tw);
     const world = detailed() && WorldLink.ready() ? WorldLink.drawer(view, sun) : null;
-    const fr = Render.frame({ ...view, sun, world, treeWind: tw, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view),
+    const fr = Render.frame({ ...view, sun, world, treeWind: tw, scale: q.scale, trees: q.trees !== 'off', density: 2 * q.density, rain: q.rain, detail: q.detail, relief: q.relief, haze: q.haze, base: q.base, wet: st.wet, contrast: q.contrast, bounce: q.bounce, far: q.far !== 'off', nestStep: Number.isFinite(+q.nestStep) ? +q.nestStep : 2, tdust: Number.isFinite(+q.tdust) ? +q.tdust : 1, quality: q.tricubic, blend: q.blend, seed: (now / 16.7) % 64, precip: q.precip === 'off' ? null : precipView(view),
                               night, flash: flashAt(now, view.eye), heads: headlights(night), bolts: lightningOn() ? Lightning.bolts(now, view.eye, wx.rainI) : [],
                               dust: dustView(view, night) }, cars);
     hud(fr, view);
@@ -1775,7 +1775,7 @@ const Chase = (() => {
         const k = el.dataset.k;
         el.value = String(st.vis[k]);
         const o = el.nextElementSibling;
-        if (o && o.tagName === 'OUTPUT') o.textContent = k === 'bounce' ? (st.vis[k] ? `×${st.vis[k]}` : 'off') : k === 'mmOpacity' || k === 'mmDim' || k === 'vol' ? `${Math.round(st.vis[k] * 100)} %` : k === 'sunAz' ? `${st.vis[k]}°` : k === 'sunH' ? `${st.vis[k]}°` : k === 'haze' ? `${st.vis[k]} km` : String(st.vis[k]);
+        if (o && o.tagName === 'OUTPUT') o.textContent = k === 'bounce' ? (st.vis[k] ? `×${st.vis[k]}` : 'off') : k === 'mmOpacity' || k === 'mmDim' || k === 'vol' || k === 'tdust' ? `${Math.round(st.vis[k] * 100)} %` : k === 'sunAz' ? `${st.vis[k]}°` : k === 'sunH' ? `${st.vis[k]}°` : k === 'haze' ? `${st.vis[k]} km` : String(st.vis[k]);
         if (k === 'sunAz' || k === 'sunH') el.disabled = st.vis.sunMode !== 'manual';
       }
     };

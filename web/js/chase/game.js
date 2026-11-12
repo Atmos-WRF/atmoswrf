@@ -221,7 +221,7 @@ const Chase = (() => {
     return probeState({ id: 'me', p: c.p, M: c.matrix, v: c.v, wind: c.wind || [0, 0, 0], steer: (ws[0].steer + ws[1].steer) / 2,
                         brake: c.in.brk > 0.05 || c.in.hand, reverse: c.gear === -1, bar: st.lightBar,
                         head: st.lights === 'on' || (st.lights !== 'off' && auto),
-                        glass: !(st.cam.mode !== 'chase' && !st.foot) }, 0, now);
+                        glass: !(st.cam.mode !== 'chase' && !st.foot) }, Net.local ? 0 : 1, now);   // (a friend over the link: the light model, LOD0 is 9-13 MB)
   }
   function sunDir() {
     let az = 240 * Math.PI / 180, el = 35 * Math.PI / 180;

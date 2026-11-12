@@ -77,9 +77,31 @@ def ground(f, X, Y):
     return cp.where((gi >= 0) & (gi <= f.nx - 1) & (gj >= 0) & (gj <= f.ny - 1), v, cp.nan)
 
 
+LIVE_CHANNELS = ("cloud", "precip", "wu", "wv", "ww")
+
+
+def _live_origin(f, patch):
+    """Where the grid's west / south edge is (m) for what is read from ``patch``'s state now: the patch's own place
+    now, not its radar fields' (made up to RADAR_FIELDS_EVERY s of model time ago) -- a nest that moves (the tornado
+    zoom's levels re-centring, its ~10 m vortex core following the vortex every 0.5 s) was drawn where it had been."""
+    if patch is not None:
+        try:
+            return float(patch.world_x0()), float(patch.world_y0())
+        except (AttributeError, TypeError):
+            pass
+    return f.x0, f.y0
+
+
+def _extent(f, patches):
+    """The ground box (m) a field's data can cover: its radar fields' and its patch's now (see _live_origin)."""
+    x0, y0, x1, y1 = f.x0, f.y0, f.x0 + f.nx * f.dx, f.y0 + f.ny * f.dx
+    lx, ly = _live_origin(f, _live_patch(patches, f.patch_id))
+    return min(x0, lx), min(y0, ly), max(x1, lx + f.nx * f.dx), max(y1, ly + f.ny * f.dx)
+
+
 def _sample(f, name: str, X, Y, zv, patch=None):
     """``name`` of radar fields ``f`` at ground points X, Y (2-D, m) and heights zv (m): trilinear, NaN outside.
-    The cloud's "cloud" / "precip" come from the patch's state."""
+    The cloud's "cloud" / "precip" (and the wind) come from the patch's state, placed where the patch is now."""
     import cupy as cp
     from cupyx.scipy import ndimage as cnd
     if name == "dbz":
@@ -96,9 +118,10 @@ def _sample(f, name: str, X, Y, zv, patch=None):
     else:
         a = getattr(f, "cyc", 1.0) * (cp.gradient(f.vc, f.dx, axis=2) - cp.gradient(f.uc, f.dx, axis=1))
     zh = np.asarray(cp.asnumpy(f.z_h) if hasattr(f.z_h, "device") else f.z_h, np.float64)
-    gi = (X - f.x0) / f.dx - 0.5
-    gj = (Y - f.y0) / f.dx - 0.5
-    inside = (gi >= 0) & (gi <= f.nx - 1) & (gj >= 0) & (gj <= f.ny - 1)
+    ox, oy = _live_origin(f, patch) if name in LIVE_CHANNELS and patch is not None else (f.x0, f.y0)
+    gi = (X - ox) / f.dx - 0.5
+    gj = (Y - oy) / f.dx - 0.5
+    inside = (gi >= 0) & (gi <= a.shape[-1] - 1) & (gj >= 0) & (gj <= a.shape[-2] - 1)
     if not inside.any():
         return None
     nz, (ny, nx) = len(zv), X.shape
@@ -142,7 +165,8 @@ def _wind_codes(fields, patches, box, nx, ny, ztop, nz):
     zv = (np.arange(wz) + 0.5) * ztop / wz
     best = [cp.full((wz, wy, wx), cp.nan, cp.float32) for _ in range(3)]
     for f in sorted(fields, key=lambda f: -f.dx):                  # coarse first: the finer ones overwrite
-        if f.x0 > x1 or f.x0 + f.nx * f.dx < x0 or f.y0 > y1 or f.y0 + f.ny * f.dx < y0:
+        ex = _extent(f, patches)
+        if ex[0] > x1 or ex[2] < x0 or ex[1] > y1 or ex[3] < y0:
             continue
         p = _live_patch(patches, f.patch_id)
         for c, ch in enumerate(("wu", "wv", "ww")):
@@ -329,7 +353,11 @@ def _insets_live(fields, box, name, res, patches, winds=None):
     nests are cropped to their own spacing (_plan_insets crop)."""
     import cupy as cp
     by = {f.patch_id: f for f in fields.values()}
-    ent = [(f.patch_id, f.x0, f.y0, f.x0 + f.nx * f.dx, f.y0 + f.ny * f.dx, f.dx) for f in fields.values()]
+    # each nest where its cloud is now (_live_origin): the vortex core moves every 0.5 s, its fields every 20 s
+    ent = []
+    for f in fields.values():
+        lx, ly = _live_origin(f, _live_patch(patches, f.patch_id))
+        ent.append((f.patch_id, lx, ly, lx + f.nx * f.dx, ly + f.ny * f.dx, f.dx))
     channels = ("cloud", "precip") if name == "cloud" else (name,)
     out = []
     for key, ib, r, nx, ny in _plan_insets(ent, box, res, crop=winds is not None):
@@ -383,7 +411,8 @@ def extract(fields: dict, box, name: str = "dbz", patches: dict | None = None, w
     gnd = None
     coarsest = max((f.dx for f in fields.values()), default=1000.0)
     for f in fields.values():
-        if f.x0 > x1 or f.x0 + f.nx * f.dx < x0 or f.y0 > y1 or f.y0 + f.ny * f.dx < y0:
+        ex = _extent(f, patches)
+        if ex[0] > x1 or ex[2] < x0 or ex[1] > y1 or ex[3] < y0:
             continue
         if not insets and f.dx < min(res / 4.0, coarsest):
             continue                          # a fine nest seen from far: its parent's grid shows it

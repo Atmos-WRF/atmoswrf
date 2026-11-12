@@ -547,7 +547,7 @@ const Render = (() => {
     float n1 = texture(noiseTex, vec3((k - w * f1 * P) / 400.0, hm / 260.0)).r;
     float n2 = texture(noiseTex, vec3((k - w * f2 * P) / 400.0 + 0.37, hm / 260.0)).r;
     float n = mix(n1, n2, abs(2.0 * f1 - 1.0));
-    return 28.0 * D * exp(-hm / H) * max(0.0, 0.25 + 1.4 * (n - 0.2)) * density;
+    return 13.0 * D * exp(-hm / H) * max(0.0, 0.25 + 1.4 * (n - 0.2)) * density;   // (thin: see-through, the user 2026-11-11)
   }`;
 
   // volume.js's media(): the cloud and rain at box point p (extinction per km), its detail (mode > 0) carried along

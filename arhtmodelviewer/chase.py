@@ -596,10 +596,10 @@ STALE = 6.0                                     # s without a sync: gone from th
 # what a joined page on another computer may read (GET) with its token while hosting is on
 READ = ("/api/state", "/api/pmw/targets", "/api/c/air", "/api/c/lightning", "/api/c/damage", "/api/volume", "/api/volume/times", "/api/volume/roads",
         "/api/volume/landcover", "/api/volume/ground", "/api/volume/buildings", "/api/volume/fuel", "/api/frames", "/api/frame", "/api/ppi")
-# (and the detailed map's module, tile worker and landmarks, and the cars' models)
+# (and the detailed map's module, tile worker and landmarks, and the cars' models: the mesonet probes' .glb too)
 STATIC = re.compile(r"^/(chase|static/chase\.html|static/js/(volume|landscape|colors)\.js|static/js/chase/[a-z0-9_]+\.js"
                     r"|static/js/chase/world/(world|tileworker)\.js|static/js/chase/world/landmarks\.json"
-                    r"|static/models/cars/[a-z0-9_]+\.json)$")
+                    r"|static/models/cars/[a-z0-9_]+\.json|static/models/cars/probes/PROBE_[0-9]+_[A-Za-z]+_LOD[01]\.glb)$")
 
 
 def host(on: bool | None = None, new_code: bool = False) -> dict:

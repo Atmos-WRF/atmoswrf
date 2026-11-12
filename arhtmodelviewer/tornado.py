@@ -478,6 +478,7 @@ class TornadoZoom:
         lvl = Nests(self.eng, r, size, 0, parent=fin, vertical=vert)
         fin.inner = lvl
         lvl.before_step = self._core_tick
+        lvl.replace_pin = 0.2                     # re-placed (a new grid) less often: it leads its vortex by CORE_LEAD
         self.core, self.core_on = lvl, True
         self.core_next, self.core_xy, self.core_last, self.core_v, self.core_lost = -math.inf, None, None, (0.0, 0.0), None
         self.eng.note("nest", f"vortex core on: {d:.3g} m on {vert[0]} levels from {vert[1]:.3g} m, a {size:.3g} km box "

@@ -369,6 +369,7 @@ class Nests:
         # called with the model time before this level steps inside its parent's sub-steps (tornado.py's vortex
         # core: it looks for its vortex and re-centres there, many times per run step), or None
         self.before_step = None
+        self.replace_pin = REPLACE_PIN        # x its side: how far off its pin a pinned nest may be before re-placed
         self._next_place = 0.0
         self._mem_wait = -math.inf            # model time: no new nest on this level before it (no GPU room)
         self.mem_note = None                  # why its last nest was refused (_room_for), for the page
@@ -681,7 +682,7 @@ class Nests:
                 self.place(self._parent_rect_at(x, y), None, pin=key)
                 continue
             d = n.patch.to_json()
-            if math.hypot(x - 0.5 * (d["x0"] + d["x1"]), y - 0.5 * (d["y0"] + d["y1"])) > REPLACE_PIN * side:
+            if math.hypot(x - 0.5 * (d["x0"] + d["x1"]), y - 0.5 * (d["y0"] + d["y1"])) > self.replace_pin * side:
                 self.place(self._parent_rect_at(x, y), None, old=n)
 
     def _manage_inner(self) -> None:
@@ -926,21 +927,31 @@ class Nests:
                 hydro_edge = self._parent_hydro(n, parent)
                 from .engine import _debug_nan
                 _debug_nan(n.patch, "boundary tables attached")
-                for k in range(nsub):
-                    sub_step(n.patch, t0 + k * h, h)
-                    cb = getattr(self.engine, "yield_cb", None)     # the page's requests in, mid-step (sim.py)
-                    if cb is not None:
-                        cb()
-                    self._relax_w(n, w_edge)
-                    self._relax_hydro(n, hydro_edge)
-                    _debug_nan(n.patch, "edge relaxation")
-                    if self.inner is not None and self.inner.before_step is not None:
-                        try:
-                            self.inner.before_step(t0 + k * h)
-                        except Exception:
-                            log.exception("inner level's before_step failed")
-                    if self.inner and self.inner.items:
-                        self.inner.step(t0 + k * h, h, sub_step, within=n.patch)
+                # gpuwm's scheme health words (microphysics, YSU, ...) recorded on the device through the nest's
+                # sub-steps and read once after them (gpuwm.core.health_ledger, as gpuwm's own driver does), not
+                # one blocking read a sub-step: on a tornado zoom's ~10 m core those reads held the run thread 28 %
+                # of the time (py-spy, 2026-11-11).  A sick sub-step still raises -- at the drain, still in this
+                # nest's try: the nest is dropped as before
+                from gpuwm.core import health_ledger
+                led = self._ledger()
+                with health_ledger.deferring(led):
+                    for k in range(nsub):
+                        sub_step(n.patch, t0 + k * h, h)
+                        cb = getattr(self.engine, "yield_cb", None)     # the page's requests in, mid-step (sim.py)
+                        if cb is not None:
+                            cb()
+                        self._relax_w(n, w_edge)
+                        self._relax_hydro(n, hydro_edge)
+                        _debug_nan(n.patch, "edge relaxation")
+                        if self.inner is not None and self.inner.before_step is not None:
+                            try:
+                                self.inner.before_step(t0 + k * h)
+                            except Exception:
+                                log.exception("inner level's before_step failed")
+                        if self.inner and self.inner.items:
+                            self.inner.step(t0 + k * h, h, sub_step, within=n.patch)
+                if led is not None:
+                    led.drain()
                 n.patch.state.elapsed_seconds = t0 + dt
                 if not _finite(n.patch.state):
                     # blown up: never fed back (a ~1 m zoom's NaNs reached the run's patch through every level and
@@ -952,6 +963,18 @@ class Nests:
             except Exception as exc:
                 log.exception("nest step failed")
                 self.drop(n, f"its step failed: {exc}")
+
+    def _ledger(self):
+        """This level's gpuwm health ledger (deferred scheme status words), or None (no CUDA: immediate reads)."""
+        led = getattr(self, "_health", False)
+        if led is False:
+            try:
+                from gpuwm.core import health_ledger
+                led = health_ledger.HealthLedger(label="nest step")
+            except Exception:                    # noqa: BLE001 - the CPU backend's stand-in, or no device
+                led = None
+            self._health = led
+        return led
 
     def _parent_w(self, n: Nest, parent: Patch):
         """The parent's w interpolated onto the nest (its frame is all that is used)."""

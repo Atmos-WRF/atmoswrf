@@ -743,31 +743,8 @@ const Render = (() => {
     ];
     if (nightHooks.every(([a]) => src.split(a).length === 2)) for (const [a, b] of nightHooks) src = src.replace(a, b);
     else console.warn('chase: night hooks not found:', nightHooks.filter(([a]) => src.split(a).length !== 2).map(([a]) => a.trim().slice(0, 40)));
-    // the nests' cloud (volume.js nested): each blended into the next coarser one round it, coarsest to finest, over
-    // its outer 20 % (and top 20 %) -- it went into the box's 500 m cloud over 8 %, so just inside a nest that lies
-    // in a coarser one (the zoom's 111 m in its 333 m) the box's smooth cloud showed in a thin band between the two
-    // finer ones: a sharp box edge in the storm, plainest frontlit (the user 2026-11-11, "you can clearly see the
-    // domain when its frontlit")
-    const nestHooks = [
-      ['    return clamp(min(min(e.x, e.y), 1.0 - u.z) / 0.08, 0.0, 1.0);\n  }\n  vec4 nested(',
-       '    return smoothstep(0.0, 1.0, clamp(min(min(e.x, e.y), 1.0 - u.z) / 0.2, 0.0, 1.0));\n  }\n  vec4 nested('],
-      ['    vec3 u; float w = insW(p, 0, u);\n' +
-       '    if (w > 0.0) return mix(base, textureLod(ins0, u, 0.0), w);\n' +
-       '    if (insN > 1) { w = insW(p, 1, u); if (w > 0.0) return mix(base, textureLod(ins1, u, 0.0), w); }\n' +
-       '    if (insN > 2) { w = insW(p, 2, u); if (w > 0.0) return mix(base, textureLod(ins2, u, 0.0), w); }\n' +
-       '    if (insN > 3) { w = insW(p, 3, u); if (w > 0.0) return mix(base, textureLod(ins3, u, 0.0), w); }\n' +
-       '    return base;',
-       '    vec3 u; float w = insW(p, 0, u);\n' +
-       '    if (w >= 1.0) return textureLod(ins0, u, 0.0);           // deep in the finest: nothing coarser shows\n' +
-       '    vec4 v = base; vec3 q; float wq;\n' +
-       '    if (insN > 3) { wq = insW(p, 3, q); if (wq > 0.0) v = mix(v, textureLod(ins3, q, 0.0), wq); }\n' +
-       '    if (insN > 2) { wq = insW(p, 2, q); if (wq > 0.0) v = mix(v, textureLod(ins2, q, 0.0), wq); }\n' +
-       '    if (insN > 1) { wq = insW(p, 1, q); if (wq > 0.0) v = mix(v, textureLod(ins1, q, 0.0), wq); }\n' +
-       '    if (w > 0.0) v = mix(v, textureLod(ins0, u, 0.0), w);\n' +
-       '    return v;'],
-    ];
-    if (nestHooks.every(([a]) => src.split(a).length === 2)) for (const [a, b] of nestHooks) src = src.replace(a, b);
-    else console.warn('chase: nest blend hooks not found; nests blend into the box alone');
+    // the nests' cloud (volume.js nested): each blended into the next coarser one round it -- in volume.js's own
+    // shaders now (both views had the frontlit box edge), so nothing to hook here
     // the tornado's dust (DUST_GLSL): its share of each step's extinction (taken before the light's own reads of
     // media()), a dull albedo and its colour, a grey-brown of dry soil
     const dustHooks = [

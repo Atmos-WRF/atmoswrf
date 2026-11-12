@@ -141,16 +141,21 @@ const Vol = (() => {
     u = vec3((p.x - b.x) / (b.z - b.x), (p.y - b.y) / (b.w - b.y), p.z / insTop[i]);
     if (any(lessThan(u, vec3(0.0))) || any(greaterThan(u, vec3(1.0)))) return 0.0;
     vec2 e = min(u.xy, 1.0 - u.xy);
-    return clamp(min(min(e.x, e.y), 1.0 - u.z) / 0.08, 0.0, 1.0);
+    return smoothstep(0.0, 1.0, clamp(min(min(e.x, e.y), 1.0 - u.z) / 0.2, 0.0, 1.0));
   }
   vec4 nested(vec3 p, vec4 base) {
     if (insN == 0) return base;
+    // each nest blended into the next coarser one round it, coarsest to finest, over its outer 20 % (and top
+    // 20 %): into the box's cloud over 8 %, a nest inside a coarser nest showed the box's smooth cloud in a thin
+    // band between the two -- a sharp box edge in the storm, plainest frontlit (2026-11-11)
     vec3 u; float w = insW(p, 0, u);
-    if (w > 0.0) return mix(base, textureLod(ins0, u, 0.0), w);
-    if (insN > 1) { w = insW(p, 1, u); if (w > 0.0) return mix(base, textureLod(ins1, u, 0.0), w); }
-    if (insN > 2) { w = insW(p, 2, u); if (w > 0.0) return mix(base, textureLod(ins2, u, 0.0), w); }
-    if (insN > 3) { w = insW(p, 3, u); if (w > 0.0) return mix(base, textureLod(ins3, u, 0.0), w); }
-    return base;
+    if (w >= 1.0) return textureLod(ins0, u, 0.0);           // deep in the finest: nothing coarser shows
+    vec4 v = base; vec3 q; float wq;
+    if (insN > 3) { wq = insW(p, 3, q); if (wq > 0.0) v = mix(v, textureLod(ins3, q, 0.0), wq); }
+    if (insN > 2) { wq = insW(p, 2, q); if (wq > 0.0) v = mix(v, textureLod(ins2, q, 0.0), wq); }
+    if (insN > 1) { wq = insW(p, 1, q); if (wq > 0.0) v = mix(v, textureLod(ins1, q, 0.0), wq); }
+    if (w > 0.0) v = mix(v, textureLod(ins0, u, 0.0), w);
+    return v;
   }
   float val(vec3 p) { return nested(p, texture(vol, vec3(p.x / size.x + 0.5, p.y / size.y + 0.5, p.z / size.z))).r * 255.0; }
   vec4 col(float code) { return texture(lut, vec2((code + 0.5) / 256.0, 0.5)); }
@@ -313,16 +318,21 @@ const Vol = (() => {
     u = vec3((p.x - b.x) / (b.z - b.x), (p.y - b.y) / (b.w - b.y), p.z / insTop[i]);
     if (any(lessThan(u, vec3(0.0))) || any(greaterThan(u, vec3(1.0)))) return 0.0;
     vec2 e = min(u.xy, 1.0 - u.xy);
-    return clamp(min(min(e.x, e.y), 1.0 - u.z) / 0.08, 0.0, 1.0);
+    return smoothstep(0.0, 1.0, clamp(min(min(e.x, e.y), 1.0 - u.z) / 0.2, 0.0, 1.0));
   }
   vec4 nested(vec3 p, vec4 base) {
     if (insN == 0) return base;
+    // each nest blended into the next coarser one round it, coarsest to finest, over its outer 20 % (and top
+    // 20 %): into the box's cloud over 8 %, a nest inside a coarser nest showed the box's smooth cloud in a thin
+    // band between the two -- a sharp box edge in the storm, plainest frontlit (2026-11-11)
     vec3 u; float w = insW(p, 0, u);
-    if (w > 0.0) return mix(base, textureLod(ins0, u, 0.0), w);
-    if (insN > 1) { w = insW(p, 1, u); if (w > 0.0) return mix(base, textureLod(ins1, u, 0.0), w); }
-    if (insN > 2) { w = insW(p, 2, u); if (w > 0.0) return mix(base, textureLod(ins2, u, 0.0), w); }
-    if (insN > 3) { w = insW(p, 3, u); if (w > 0.0) return mix(base, textureLod(ins3, u, 0.0), w); }
-    return base;
+    if (w >= 1.0) return textureLod(ins0, u, 0.0);           // deep in the finest: nothing coarser shows
+    vec4 v = base; vec3 q; float wq;
+    if (insN > 3) { wq = insW(p, 3, q); if (wq > 0.0) v = mix(v, textureLod(ins3, q, 0.0), wq); }
+    if (insN > 2) { wq = insW(p, 2, q); if (wq > 0.0) v = mix(v, textureLod(ins2, q, 0.0), wq); }
+    if (insN > 1) { wq = insW(p, 1, q); if (wq > 0.0) v = mix(v, textureLod(ins1, q, 0.0), wq); }
+    if (w > 0.0) v = mix(v, textureLod(ins0, u, 0.0), w);
+    return v;
   }
   vec3 SUN;                                                   // the sunlight: warmer and dimmer as the sun gets low
   // smooth (C2) tricubic B-spline read from 8 trilinear ones (Sigg & Hadwiger 2005): no grid facets in the light

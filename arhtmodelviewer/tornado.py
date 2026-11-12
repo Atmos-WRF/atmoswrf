@@ -50,8 +50,8 @@ PIN = "tornado"
 # fields (which resolve the core already), so the vortex carries on and sharpens instead of forming again, and goes
 # CORE_LOST after the vortex weakens (the finest level keeps what it fed back).
 CORE_PIN = "core"
-CORE_DX = 10.0          # m: about the core's spacing
-CORE_KM = 0.8           # km: its box
+CORE_DX = 10.0          # m: about the core's spacing (the default; 5-25 m)
+CORE_KM = 0.8           # km: its box (the default; at most half the zoom's box)
 CORE_ON_WIND = 29.0     # m/s near the ground at the vortex (EF0)
 CORE_ON_ZETA = 0.1      # 1/s near the ground
 CORE_OFF = 0.75         # x those: once placed, it stays until the vortex is weaker than this (no on-off flicker)
@@ -112,11 +112,13 @@ def vertical_for(dx: float, ztop: float, dz_top: float) -> tuple[int, float]:
 
 
 class TornadoZoom:
-    def __init__(self, eng, x: float, y: float, size_km: float, detail: str = "high", core: bool = False):
+    def __init__(self, eng, x: float, y: float, size_km: float, detail: str = "high", core: bool = False,
+                 core_dx: float | None = None, core_km: float | None = None):
         from .nest import Nests
         self.eng = eng
         self.core = None                     # the vortex core's level (Nests), or None
         self.core_on = False
+        self.core_dx, self.core_km = CORE_DX, CORE_KM   # its spacing (m) and box (km) as asked
         self.core_next = -math.inf
         self.core_xy = None                  # where its vortex was last found (pressure minimum)
         self.core_last = None                # (t, x, y) of that, for its motion
@@ -172,7 +174,7 @@ class TornadoZoom:
         eng.note("nest", f"tornado zoom ({self.detail}): {len(self.chain)} nest level(s) down to {fine.dx:.3g} m"
                          f"{levels}, {self.size_km:.3g} km box at {self.x / 1000:.1f}, {self.y / 1000:.1f} km{on}")
         if core:
-            self.set_core(True)
+            self.set_core(True, core_dx, core_km)
 
     def _plan_levels(self, dx: float, detail: str):
         """(ratios, spacings, vertical) of the new levels under a grid of dx m for ``detail``: the finest on its own
@@ -274,7 +276,7 @@ class TornadoZoom:
                          f"{k} level(s) kept, {len(ratios) - k} new")
         if core_was:
             try:
-                self.set_core(True)
+                self.set_core(True, self.core_dx, self.core_km)
             except ValueError as exc:             # (the new finest level is ~10 m itself, or no room left)
                 eng.note("nest", f"vortex core not put back: {exc}")
 
@@ -454,26 +456,35 @@ class TornadoZoom:
                 "track": self.track[-600:], "core": self._core_json()}
 
     # ---------------------------------------------------------------- the vortex core
-    def set_core(self, on: bool) -> None:
-        """The ~10 m vortex core on (it goes onto the vortex whenever there is one) or off."""
+    def set_core(self, on: bool, dx: float | None = None, km: float | None = None) -> None:
+        """The vortex core on (it goes onto the vortex whenever there is one) or off: ``dx`` its spacing (m, about;
+        5-25), ``km`` its box (at most half the zoom's).  A running core asked for another spacing or box is built
+        again from the level outside it (which carries the tornado into it again)."""
         if not on:
             self._core_remove("turned off")
             return
+        want_dx = min(25.0, max(5.0, float(dx))) if dx else self.core_dx
+        want_km = min(5.0, max(0.2, float(km))) if km else self.core_km
         if self.core is not None:
-            return
+            if abs(want_dx - self.core_dx) < 0.5 and abs(want_km - self.core_km) < 0.01:
+                return
+            self._core_remove(f"rebuilt at ~{want_dx:g} m, {want_km:g} km")
+        self.core_dx, self.core_km = want_dx, want_km
         from .nest import Nests
         fin = self.chain[-1]
         fdx = fin.env.grid.dx
         if fin.inner is not None:
             raise ValueError("the zoom's finest level already has a level inside it")
-        if fdx < 1.5 * CORE_DX:
-            raise ValueError(f"the zoom's finest grid is {fdx:.3g} m already: a vortex core goes inside a ~20-60 m one "
-                             "(Ultra or Extreme)")
-        r = max(2, int(round(fdx / CORE_DX)))
+        if fdx < 1.5 * self.core_dx:
+            raise ValueError(f"the zoom's finest grid is {fdx:.3g} m already: a ~{self.core_dx:g} m core goes inside a "
+                             f"grid of at least {1.5 * self.core_dx:.0f} m (Ultra ~55 m or Extreme ~37 m)")
+        r = max(2, int(round(fdx / self.core_dx)))
         d = fdx / r
         g = self.eng.env.grid
         vert = vertical_for(d, g.ztop, g.dz_top)
-        size = min(CORE_KM, self.size_km / OUT, FINE_CELLS_MAX * d / 1000.0)
+        size = min(self.core_km, self.size_km / OUT, FINE_CELLS_MAX * d / 1000.0)
+        if size < self.core_km - 1e-6:
+            self.eng.note("nest", f"vortex core box {size:.3g} km (asked {self.core_km:g}): at most half the zoom's box")
         size = self._fit_memory([], [r], [d], [vert], size)
         lvl = Nests(self.eng, r, size, 0, parent=fin, vertical=vert)
         fin.inner = lvl
@@ -558,7 +569,7 @@ class TornadoZoom:
             return {"on": False}
         n = next((m for m in lvl.items if m.pin == CORE_PIN), None)
         d = n.patch.to_json() if n is not None else None
-        return {"on": True, "dx": lvl.env.grid.dx, "placed": n is not None,
+        return {"on": True, "dx": lvl.env.grid.dx, "ask_dx": self.core_dx, "km": lvl.size_km, "placed": n is not None,
                 "box": [d["x0"], d["y0"], d["x1"], d["y1"]] if d else None,
                 "x": self.core_xy[0] if self.core_xy else None, "y": self.core_xy[1] if self.core_xy else None}
 

@@ -956,7 +956,8 @@ class Simulation:
             self.engine.add_nest(1000.0 * float(kw["x"]), 1000.0 * float(kw["y"]))
         elif name == "tornado_box":
             self.engine.tornado_box(1000.0 * float(kw["x"]), 1000.0 * float(kw["y"]), float(kw.get("size_km", 5.0)),
-                                    str(kw.get("detail") or "high"), core=bool(kw.get("core")))
+                                    str(kw.get("detail") or "high"), core=bool(kw.get("core")),
+                                    core_dx=kw.get("core_dx"), core_km=kw.get("core_km"))
             self._frame_now = True            # the map shows the zoom's grid after this step, not the next frame
             self._time_left = 6               # ARHTMODELVIEWER_DEBUG_TIMING: the next steps' timings in the log
         elif name == "tornado_detail":
@@ -968,7 +969,7 @@ class Simulation:
         elif name == "tornado_core":
             if self.engine.tornado is None:
                 raise ValueError("no tornado zoom for a vortex core")
-            self.engine.tornado.set_core(bool(kw.get("on")))
+            self.engine.tornado.set_core(bool(kw.get("on")), kw.get("dx"), kw.get("km"))
             self._frame_now = True
         elif name == "tornado_clear":
             self.engine.tornado_clear()

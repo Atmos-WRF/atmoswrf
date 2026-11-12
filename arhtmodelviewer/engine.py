@@ -339,13 +339,14 @@ class Engine:
                                          self.opt.refine_max, parent=self.nests)
         self.tornado = None                   # the tornado zoom (tornado.py): a box the user put on a vortex
 
-    def tornado_box(self, x: float, y: float, size_km: float, detail: str = "high", core: bool = False) -> None:
+    def tornado_box(self, x: float, y: float, size_km: float, detail: str = "high", core: bool = False,
+                    core_dx: float | None = None, core_km: float | None = None) -> None:
         """The tornado zoom on ground point (x, y) m, a box of size_km (a new one replaces the old); ``detail``
         "high" (~110 m), "ultra" (~55 m), "extreme" (~37 m), "pc10" (~10 m) or "pc1" (~1 m), the finest on its own
         levels (tornado.DETAIL)."""
         from .tornado import TornadoZoom
         self.tornado_clear()
-        self.tornado = TornadoZoom(self, x, y, size_km, detail, core=core)
+        self.tornado = TornadoZoom(self, x, y, size_km, detail, core=core, core_dx=core_dx, core_km=core_km)
 
     def tornado_clear(self) -> None:
         if self.tornado is not None:

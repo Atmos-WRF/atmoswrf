@@ -1040,6 +1040,12 @@ async function changeZoomDetail() {
   catch (e) { alert('Tornado zoom: ' + e.message); $('tornadoDetail').value = tz.detail; }
 }
 
+// the tornado zoom's vortex core as asked: off, ~10 or ~20 m, and its box (km)
+function coreAsk() {
+  const v = $('tornadoCore').value, km = Math.min(3, Math.max(0.2, +$('tornadoCoreKm').value || 0.8));
+  return { core: v !== 'off', core_dx: v === 'off' ? null : +v, core_km: km };
+}
+
 // a grid spacing in m for a label: whole metres from 10 m, two figures under (the pc grids: 6.2, 0.83)
 function fmtM(m) { return m >= 10 ? String(Math.round(m)) : String(+m.toPrecision(2)); }
 
@@ -1464,7 +1470,7 @@ async function onZoneDrawn(x0, y0, x1, y1) {
     const size = Math.min(60, Math.max(0.05, Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))));
     const det = $('tornadoDetail').value;
     if (!pcConfirm(det, size)) return;
-    try { await api('/api/run/tornado', { x: (x0 + x1) / 2, y: (y0 + y1) / 2, size_km: size, detail: det, core: $('tornadoCore').checked }); }
+    try { await api('/api/run/tornado', { x: (x0 + x1) / 2, y: (y0 + y1) / 2, size_km: size, detail: det, ...coreAsk() }); }
     catch (e) { alert('Tornado zoom: ' + e.message); }
     return;
   }
@@ -1909,11 +1915,12 @@ function bindUI() {
   $('toolDomShape').onclick = () => { S.shapeDraft = []; setTool('domshape'); };
   $('refineRatio').onchange = () => $('refineRow').classList.toggle('hidden', !(+$('refineRatio').value));
   $('tornadoDetail').onchange = changeZoomDetail;       // a running zoom switches in place
-  $('tornadoCore').onchange = async () => {             // the running zoom's vortex core on / off
+  $('tornadoCore').onchange = $('tornadoCoreKm').onchange = async () => {   // the running zoom's vortex core
     const tz = S.run && S.run.tornado;
     if (!runActive() || !tz) return;
-    try { await api('/api/run/tornado/core', { on: $('tornadoCore').checked }); }
-    catch (e) { alert('Vortex core: ' + e.message); $('tornadoCore').checked = !!(tz.core && tz.core.on); }
+    const a = coreAsk();
+    try { await api('/api/run/tornado/core', { on: a.core, dx: a.core_dx, km: a.core_km }); }
+    catch (e) { alert('Vortex core: ' + e.message); }
   };
   $('terrainKind').onchange = showTerrain;
   $('newRun').onclick = async () => {

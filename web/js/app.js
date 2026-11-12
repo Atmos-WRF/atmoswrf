@@ -88,6 +88,40 @@ async function boot() {
   setInterval(libraryPoll, 1500);
   libraryPoll(true);
   poll();
+  checkUpdate(true);
+  setInterval(() => checkUpdate(false), 60000);
+}
+
+// Atmos-WRF's own code changed since its server started (server.py _update_state): reloading the page (Ctrl+F5)
+// restarts the server on it -- at once with no run going, else a note with a button (restarting ends the run)
+async function checkUpdate(onLoad) {
+  let u;
+  try { u = await getJSON('/api/update'); } catch (e) { return; }
+  const note = $('updateNote');
+  if (!u.changed || !u.supervised) { if (note) note.remove(); return; }
+  if (!u.busy && onLoad) { await restartForUpdate(false); return; }
+  if (note) return;
+  const d = document.createElement('div');
+  d.id = 'updateNote';
+  d.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:9999;padding:8px 12px;' +
+    'border-radius:8px;background:#1e3a5f;color:#e6f0ff;font:13px Segoe UI,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.4)';
+  d.innerHTML = 'Atmos-WRF was updated. <button id="updateNow">Restart on it now</button> <span style="opacity:.75">' +
+    (u.busy ? '(ends the run)' : '') + '</span> <button id="updateLater">Later</button>';
+  document.body.appendChild(d);
+  $('updateNow').onclick = () => restartForUpdate(u.busy);
+  $('updateLater').onclick = () => d.remove();
+}
+
+async function restartForUpdate(force) {
+  setStatus('idle', 'Updating Atmos-WRF…');
+  try { await api('/api/update/restart', { force: !!force }); }
+  catch (e) { alert('Update: ' + e.message); return; }
+  await new Promise(r => setTimeout(r, 1500));
+  for (let i = 0; i < 180; i++) {               // the server goes down and comes back on the new code: then reload
+    try { const u = await getJSON('/api/update'); if (!u.changed) { location.reload(); return; } } catch (e) { /* down */ }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  setStatus('error', 'Server did not come back');
 }
 
 function adoptRun(st) {

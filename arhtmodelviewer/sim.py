@@ -208,6 +208,7 @@ CLASSIC_STARTS = True
 FRAME_WALL_ZOOM = 20.0  # s of real time: the longest a running tornado zoom goes without a new map frame
 FRAME_SHARE = 0.2       # ... unless those frames would take more than this share of the run's real time
 RESTART_CODE = 75
+UPDATE_CODE = 76            # the server exits with this to come back on new code (server.py /api/update)
 GPU_FAULT_FILE = OUTPUT / "last_gpu_error.json"
 
 

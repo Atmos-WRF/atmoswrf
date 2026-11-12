@@ -13,6 +13,7 @@ import threading
 import time
 
 RESTART_CODE = 75
+UPDATE_CODE = 76          # (sim.UPDATE_CODE) the page asked for the new code: restarted on it
 
 
 def main(argv=None):
@@ -51,6 +52,11 @@ def supervise(port: int, open_browser: bool, lan: bool = False) -> None:
             except subprocess.TimeoutExpired:
                 proc.kill()
             return
+        if code == UPDATE_CODE:
+            print("Atmos-WRF was updated; restarting on the new code (your browser page reloads by itself)...",
+                  flush=True)
+            time.sleep(0.5)
+            continue
         if code != RESTART_CODE:
             sys.exit(code)
         print("The GPU engine hit an error; restarting Atmos-WRF (your browser page reconnects by itself)...",

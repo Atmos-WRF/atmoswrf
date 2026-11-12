@@ -363,6 +363,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._poll(path[len("/poll"):])
             if path == "/api/state":
                 return self._state()
+            if path == "/api/update":
+                return self._json(_update_state())
             if path == "/api/c/air":
                 return self._chase_air(q)
             if path == "/api/c/damage":
@@ -642,6 +644,21 @@ class Handler(BaseHTTPRequestHandler):
         if p.suffix == ".js":
             ctype = "text/javascript"
         self._send(200, p.read_bytes(), ctype)
+
+    def _update_restart(self, body):
+        """The page found the code changed (_update_state): this server process exits with UPDATE_CODE and the
+        supervisor starts it again on the new code.  This PC's page only; a run going on needs ``force``."""
+        if not self._is_local():
+            return self._error(403, "only this PC's page can restart Atmos-WRF")
+        u = _update_state()
+        if not u["supervised"]:
+            return self._error(409, "Atmos-WRF was not started from its launcher: close it and start it again")
+        if u["busy"] and not body.get("force"):
+            return self._error(409, "a run is going: restarting ends it")
+        from .sim import UPDATE_CODE
+        log.info("restarting on the updated code (asked by the page)")
+        threading.Timer(0.4, os._exit, args=(UPDATE_CODE,)).start()
+        return self._json({"ok": True})
 
     def _state(self):
         sim = APP.sim
@@ -1199,6 +1216,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._remote_refused(path):
             return None
         try:
+            if path == "/api/update/restart":
+                return self._update_restart(body)
             if path == "/api/sounding/load":
                 from .sim import load_sounding
                 spec = body.get("spec", {})
@@ -1405,6 +1424,37 @@ def _parent_alive(pid: int) -> bool:
     ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
     k32.CloseHandle(h)
     return bool(ok) and code.value == 259              # STILL_ACTIVE
+
+
+# Updates without restarting by hand: the page's code is sent fresh every time (no-store), and the server's own is
+# checked here -- when its files have changed since it started, a reload of the page (Ctrl+F5) restarts it on them
+# (app.js checkUpdate), at once when no run is going, else after asking.
+_CODE_ROOT = Path(__file__).resolve().parent
+
+
+def _code_stamp() -> tuple:
+    n, latest = 0, 0.0
+    for p in _CODE_ROOT.rglob("*.py"):
+        if "__pycache__" in p.parts:
+            continue
+        try:
+            latest = max(latest, p.stat().st_mtime)
+            n += 1
+        except OSError:
+            pass
+    return n, round(latest, 3)
+
+
+_CODE_AT_START = _code_stamp()
+
+
+def _update_state() -> dict:
+    """{"changed": the server's code is newer than this process, "busy": a run would end, "supervised": it can
+    restart itself}."""
+    sim = APP.sim
+    busy = sim is not None and getattr(sim, "status", "none") not in ("stopped", "error", "none", "done")
+    return {"changed": _code_stamp() != _CODE_AT_START, "busy": bool(busy),
+            "supervised": bool(os.environ.get("ARHTMODELVIEWER_SUPERVISED"))}
 
 
 def _orphan_guard() -> None:

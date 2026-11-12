@@ -538,8 +538,10 @@ const Render = (() => {
     float D = c.r;
     if (D < 0.004) return 0.0;
     float hm = max(0.0, (p.z - gz(p.xy)) * toKm.z * 1000.0);  // m above the ground
-    float H = 40.0 + 180.0 * D;                                // its height scale: a stronger vortex lifts it higher
-    if (hm > 4.0 * H) return 0.0;
+    // its height scale: a stronger vortex lifts it higher, but it stays a skirt at the bottom (the user 2026-11-11:
+    // "going too high up"), gone by 3 H (240 m at most)
+    float H = 20.0 + 60.0 * D;
+    if (hm > 3.0 * H) return 0.0;
     vec2 w = (c.gb * 255.0 - 128.0) * 0.5;                     // the model's wind there, m/s
     vec2 k = (p.xy * toKm.xy + kmOrigin.xy) * 1000.0;          // m on the ground
     // its texture carried along that wind: two phases of a 2.5 s cycle, each faded out as it wraps
@@ -547,7 +549,7 @@ const Render = (() => {
     float n1 = texture(noiseTex, vec3((k - w * f1 * P) / 400.0, hm / 260.0)).r;
     float n2 = texture(noiseTex, vec3((k - w * f2 * P) / 400.0 + 0.37, hm / 260.0)).r;
     float n = mix(n1, n2, abs(2.0 * f1 - 1.0));
-    return 13.0 * D * exp(-hm / H) * max(0.0, 0.25 + 1.4 * (n - 0.2)) * density;   // (thin: see-through, the user 2026-11-11)
+    return 13.0 * D * exp(-hm / H) * (1.0 - smoothstep(2.0 * H, 3.0 * H, hm)) * max(0.0, 0.25 + 1.4 * (n - 0.2)) * density;   // (thin: see-through, the user 2026-11-11)
   }`;
 
   // volume.js's media(): the cloud and rain at box point p (extinction per km), its detail (mode > 0) carried along

@@ -194,11 +194,46 @@ def extract_live(patches, box, name: str = "cloud", ztop: float = 6000.0) -> byt
     res = max(min(p.env.grid.dx for p in hold) / 2.0, max(x1 - x0, y1 - y0) / MAX_SIDE)
     nx = max(2, int(math.ceil((x1 - x0) / res)))
     ny = max(2, int(math.ceil((y1 - y0) / res)))
+    zv = (np.arange(LIVE_NZ) + 0.5) * ztop / LIVE_NZ
+    channels = ("cloud", "precip") if name == "cloud" else (name,)
+    best = _live_sample(hold, (x0, y0, x1, y1), nx, ny, zv, channels)
+    if best is None:
+        return None
+    scale, offset, units = FIELDS[name]
+    data = _live_codes(best, name, ny, nx)
+    # the grids finer than the box's points (a tornado zoom's ~10 m vortex core in its 4 km box, 20 m apart) also at
+    # their own spacing, as insets (volume.js nested()), finest first
+    insets = []
+    for q in sorted((q for q in hold if q.env.grid.dx < 0.7 * res), key=lambda q: q.env.grid.dx)[:INSET_MAX]:
+        d = q.env.grid.dx
+        ib = (max(x0, q.world_x0()), max(y0, q.world_y0()),
+              min(x1, q.world_x0() + q.rect.nx * d), min(y1, q.world_y0() + q.rect.ny * d))
+        w, h = ib[2] - ib[0], ib[3] - ib[1]
+        r = max(d, max(w, h) / INSET_SIDE)
+        if r >= 0.7 * res or min(w, h) < 3 * r:
+            continue
+        inx, iny = max(2, int(math.ceil(w / r))), max(2, int(math.ceil(h / r)))
+        sub = [g for g in hold if g.env.grid.dx <= d]          # this grid and any finer inside it
+        ib_best = _live_sample(sub, ib, inx, iny, zv, channels)
+        if ib_best is None:
+            continue
+        insets.append(({"box": list(ib), "nx": inx, "ny": iny, "nz": LIVE_NZ, "ztop": ztop, "dx": d},
+                       cp.asnumpy(_live_codes(ib_best, name, iny, inx)).tobytes()))
+    head = {"field": name, "units": units, "nx": nx, "ny": ny, "nz": LIVE_NZ, "box": [x0, y0, x1, y1],
+            "ztop": ztop, "scale": scale, "offset": offset, "channels": len(channels), "ground": False,
+            "live": True, "dx": min(p.env.grid.dx for p in hold)}
+    return _pack(name, head, cp.asnumpy(data).tobytes(), insets)
+
+
+def _live_sample(hold, box, nx: int, ny: int, zv, channels):
+    """extract_live's points: (channels) x (nz, ny, nx) on an nx x ny grid over ``box`` (m), the finest of ``hold``
+    (sorted coarse first) wherever one holds a point; None when none does."""
+    import cupy as cp
+    from cupyx.scipy import ndimage as cnd
+    x0, y0, x1, y1 = box
     xs = x0 + (np.arange(nx) + 0.5) * (x1 - x0) / nx
     ys = y0 + (np.arange(ny) + 0.5) * (y1 - y0) / ny
     X, Y = np.meshgrid(xs, ys)
-    zv = (np.arange(LIVE_NZ) + 0.5) * ztop / LIVE_NZ
-    channels = ("cloud", "precip") if name == "cloud" else (name,)
     best = [None] * len(channels)
     for p in hold:
         dx = p.env.grid.dx
@@ -227,9 +262,13 @@ def extract_live(patches, box, name: str = "cloud", ztop: float = 6000.0) -> byt
             v = cnd.map_coordinates(a.astype(cp.float32), coords, order=1, mode="nearest")
             prev = best[c] if best[c] is not None else cp.full((nz, ny, nx), cp.nan, cp.float32)
             best[c] = cp.where(ok, v, prev)
-    if best[0] is None:
-        return None
-    scale, offset, units = FIELDS[name]
+    return None if best[0] is None else best
+
+
+def _live_codes(best, name: str, ny: int, nx: int):
+    """extract_live's points as the field's codes, channels last (device)."""
+    import cupy as cp
+    scale, offset, _ = FIELDS[name]
     codes = []
     for b in best:
         if b is None:
@@ -239,11 +278,7 @@ def extract_live(patches, box, name: str = "cloud", ztop: float = 6000.0) -> byt
                 (cp.log10(cp.maximum(b, 1e-3)) + 3.0) * scale + 1.0), 1, 255)).astype(cp.uint8))
         else:
             codes.append(cp.where(cp.isnan(b), 0, cp.clip(cp.rint(b * scale + offset), 1, 255)).astype(cp.uint8))
-    data = cp.stack(codes, axis=-1) if len(codes) > 1 else codes[0]
-    head = json.dumps({"field": name, "units": units, "nx": nx, "ny": ny, "nz": LIVE_NZ, "box": [x0, y0, x1, y1],
-                       "ztop": ztop, "scale": scale, "offset": offset, "channels": len(codes), "ground": False,
-                       "live": True, "dx": min(p.env.grid.dx for p in hold)}).encode()
-    return struct.pack("<I", len(head)) + head + cp.asnumpy(data).tobytes()
+    return cp.stack(codes, axis=-1) if len(codes) > 1 else codes[0]
 
 
 def _plan_insets(entries, box, res, crop=False):

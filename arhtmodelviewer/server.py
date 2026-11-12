@@ -1325,6 +1325,8 @@ class Handler(BaseHTTPRequestHandler):
                 sim.command("tornado_box", **body)
             elif path == "/api/run/tornado/detail":
                 sim.command("tornado_detail", **body)
+            elif path == "/api/run/tornado/core":
+                sim.command("tornado_core", **body)
             elif path == "/api/run/tornado/remove":
                 sim.command("tornado_clear")
             elif path == "/api/run/nudger":

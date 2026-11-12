@@ -1175,11 +1175,15 @@ const Vol = (() => {
     refreshTimes().then(() => load(true));
     map.redraw();
     clearInterval(timer);
+    // live: every 8 s; the tornado view (a zoom down to ~10 m, its air changing by the second) twice a second, a
+    // tick skipped while a load is still coming (none queued up behind it to hold the model's lock)
+    const every = tor ? 500 : 8000;
+    let ticks = 0;
     timer = setInterval(() => {
       if (document.hidden) return;
-      refreshTimes();
-      if ($('volLive').checked && S.run && S.live) load(false);
-    }, 8000);
+      if (!tor || ++ticks % 16 === 0) refreshTimes();
+      if ($('volLive').checked && S.run && S.live && !(tor && busy)) load(false);
+    }, every);
   }
   function close() {
     $('volWin').classList.add('hidden');

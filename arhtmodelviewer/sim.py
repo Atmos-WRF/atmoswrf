@@ -361,22 +361,42 @@ class HandOverLock:
         self._lock = threading.RLock()
         self._count = threading.Lock()
         self.waiting = 0
+        self.owner = None                 # the thread holding it, and how many times (held_once)
+        self.depth = 0
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
         if self._lock.acquire(blocking=False):
+            self._got()
             return True
         if not blocking:
             return False
         with self._count:
             self.waiting += 1
         try:
-            return self._lock.acquire(True, timeout)
+            ok = self._lock.acquire(True, timeout)
+            if ok:
+                self._got()
+            return ok
         finally:
             with self._count:
                 self.waiting -= 1
 
+    def _got(self) -> None:
+        me = threading.get_ident()
+        if self.owner == me:
+            self.depth += 1
+        else:
+            self.owner, self.depth = me, 1
+
     def release(self) -> None:
+        self.depth -= 1
+        if self.depth <= 0:
+            self.owner, self.depth = None, 0
         self._lock.release()
+
+    def held_once(self) -> bool:
+        """This thread holds it, once (it can be let go and taken back)."""
+        return self.owner == threading.get_ident() and self.depth == 1
 
     def __enter__(self):
         return self.acquire()
@@ -642,6 +662,7 @@ class Simulation:
             refine_inner_ratio=self._refine_inner(grid), refine_inner_km=float((s.get("refine") or {}).get("inner_km") or 16.0),
             ls_w_cms=self._large_scale_w(), ls_top_km=float((s.get("large_scale") or {}).get("top_km") or 10.0)))
         self.engine.domain_motion = self._domain_motion
+        self.engine.yield_cb = self._yield_lock      # the page's requests in between the nests' sub-steps
         # a physics suite: new air takes on the suite's own day (no growth seams); with the steady environment too
         # (it then holds only the wind steady)
         self.engine.opt.follow_environment = bool(self.env.suite and not hc.get("on") and not self._syn_cfg().get("on"))
@@ -934,7 +955,7 @@ class Simulation:
             self.engine.add_nest(1000.0 * float(kw["x"]), 1000.0 * float(kw["y"]))
         elif name == "tornado_box":
             self.engine.tornado_box(1000.0 * float(kw["x"]), 1000.0 * float(kw["y"]), float(kw.get("size_km", 5.0)),
-                                    str(kw.get("detail") or "high"))
+                                    str(kw.get("detail") or "high"), core=bool(kw.get("core")))
             self._frame_now = True            # the map shows the zoom's grid after this step, not the next frame
             self._time_left = 6               # ARHTMODELVIEWER_DEBUG_TIMING: the next steps' timings in the log
         elif name == "tornado_detail":
@@ -943,6 +964,11 @@ class Simulation:
             self.engine.tornado.change_detail(str(kw.get("detail") or "high"))
             self._frame_now = True
             self._time_left = 6
+        elif name == "tornado_core":
+            if self.engine.tornado is None:
+                raise ValueError("no tornado zoom for a vortex core")
+            self.engine.tornado.set_core(bool(kw.get("on")))
+            self._frame_now = True
         elif name == "tornado_clear":
             self.engine.tornado_clear()
         elif name == "remove_zone":
@@ -2716,6 +2742,26 @@ class Simulation:
                     pa[name][b0:b0 + pr.ny - 2 * m, a0:a0 + pr.nx - 2 * m] = 0
                     per.setdefault(name, []).append((meta, arr[f:arr.shape[0] - f, f:arr.shape[1] - f]))
             lv = lv.inner
+
+    def _yield_lock(self) -> None:
+        """Between the nests' sub-steps (nest.Nests.step, Engine.yield_cb): the page's waiting requests let in, at
+        most every YIELD_EVERY s.  A step with a tornado zoom down to ~10 m takes 10+ s of real time, and they only
+        got the lock between steps: the Tornado 3-D view, asked twice a second, sat on "Loading..." that long.
+        They read the levels as they are mid-step (the coarser grids already at the step's end)."""
+        lk = self.lock
+        if lk.waiting <= 0 or not lk.held_once():
+            return
+        now = time.perf_counter()
+        if now - getattr(self, "_yielded", 0.0) < self.YIELD_EVERY:
+            return
+        self._yielded = now
+        lk.release()
+        try:
+            lk.hand_over(limit=1.0)
+        finally:
+            lk.acquire()
+
+    YIELD_EVERY = 0.25
 
     def _ef_step(self) -> None:
         """The EF swath (efswath.py) after each model step: the fine grids' wind round the tornadoes followed,

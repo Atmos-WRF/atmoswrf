@@ -366,6 +366,9 @@ class Nests:
         self.vmaps = VMaps(self.base.coord, self.env.coord) if vertical else None
         self.items: list[Nest] = []
         self.inner: Nests | None = None       # the next level in, if any
+        # called with the model time before this level steps inside its parent's sub-steps (tornado.py's vortex
+        # core: it looks for its vortex and re-centres there, many times per run step), or None
+        self.before_step = None
         self._next_place = 0.0
         self._mem_wait = -math.inf            # model time: no new nest on this level before it (no GPU room)
         self.mem_note = None                  # why its last nest was refused (_room_for), for the page
@@ -925,9 +928,17 @@ class Nests:
                 _debug_nan(n.patch, "boundary tables attached")
                 for k in range(nsub):
                     sub_step(n.patch, t0 + k * h, h)
+                    cb = getattr(self.engine, "yield_cb", None)     # the page's requests in, mid-step (sim.py)
+                    if cb is not None:
+                        cb()
                     self._relax_w(n, w_edge)
                     self._relax_hydro(n, hydro_edge)
                     _debug_nan(n.patch, "edge relaxation")
+                    if self.inner is not None and self.inner.before_step is not None:
+                        try:
+                            self.inner.before_step(t0 + k * h)
+                        except Exception:
+                            log.exception("inner level's before_step failed")
                     if self.inner and self.inner.items:
                         self.inner.step(t0 + k * h, h, sub_step, within=n.patch)
                 n.patch.state.elapsed_seconds = t0 + dt

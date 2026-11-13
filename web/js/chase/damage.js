@@ -9,7 +9,7 @@
 // panels) carried by the model's wind where they are (its 10 m wind grid round the car), falling and coming to rest
 // on the ground, at most MAX of them.  World metres; gusts m/s.
 const Damage = (() => {
-  const POLL_MS = 1500, BOX_KM = 8, MAX = 3000, REST_MS = 600000;
+  const POLL_MS = 1500, BOX_KM = 8, STEP_KM = 2, MAX = 3000, REST_MS = 600000;
   const st = { ver: -1, fine: new Map(), coarse: new Map(), cell: [25, 250], busy: false, last: 0, gen: 0, err: '',
                deg: new Map(), debris: [], inst: null, n: 0 };
   // degrees of damage by kind (0 house, 1 shop / office, 2 farm / industrial, 3 tall, 4 shed / garage, 5 civic;
@@ -31,7 +31,11 @@ const Damage = (() => {
     if (st.busy || now - st.last < POLL_MS) return;
     st.busy = true; st.last = now;
     try {
-      const h = BOX_KM / 2, b = [x / 1000 - h, y / 1000 - h, x / 1000 + h, y / 1000 + h].map(v => v.toFixed(2));
+      // the box in STEP_KM steps round the car (always at least BOX_KM / 2 - STEP_KM / 2 inside it): following the
+      // car to 10 m made every poll while driving a new box -- all of it again, taken as a new start, and the town's
+      // buildings, lamps and trees built again every 1.5 s, a rhythmic hitch (the user, 2026-11-12)
+      const h = BOX_KM / 2, cx = Math.round(x / 1000 / STEP_KM) * STEP_KM, cy = Math.round(y / 1000 / STEP_KM) * STEP_KM;
+      const b = [cx - h, cy - h, cx + h, cy + h].map(v => v.toFixed(2));
       const box = b.join(',');
       const since = box === st.box ? st.ver : -1;          // a new box: all of it again
       const r = await fetch(`/api/c/damage?x0=${b[0]}&y0=${b[1]}&x1=${b[2]}&y1=${b[3]}&since=${since}`, { headers: window.ChaseAuth ? window.ChaseAuth() : {} });
@@ -40,11 +44,19 @@ const Damage = (() => {
       else {
         const d = await r.json();
         if (d.fine) {
-          if (d.reset) { st.fine.clear(); st.coarse.clear(); }
+          // the maps start again only for a new run or a rollback (the server's version behind what we asked for or
+          // last had); a new box is all of its cells again, merged in (the cells are the world's, not the box's)
+          let changed = false;
+          if (d.reset && (since >= 0 || d.ver < st.ver)) {
+            changed = st.fine.size > 0 || st.coarse.size > 0;
+            st.fine.clear(); st.coarse.clear();
+          }
           st.cell = d.cell;
-          for (const [i, j, g] of d.fine) st.fine.set(key(i, j), g / 10);
-          for (const [i, j, g] of d.coarse) st.coarse.set(key(i, j), g / 10);
-          if (d.reset || d.fine.length || d.coarse.length) st.gen++;
+          for (const [M, cells] of [[st.fine, d.fine], [st.coarse, d.coarse]]) for (const [i, j, g] of cells) {
+            const k = key(i, j), v = g / 10;
+            if (M.get(k) !== v) { M.set(k, v); changed = true; }
+          }
+          if (changed) st.gen++;                             // only then are the buildings and trees built again
           st.box = box;
         }
         st.ver = d.ver; st.err = '';

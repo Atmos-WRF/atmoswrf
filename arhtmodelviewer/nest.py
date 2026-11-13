@@ -348,6 +348,14 @@ class Nest:
         return d
 
 
+def _pin_label(pin) -> str:
+    """What a pinned nest is kept on, for the Log: the tornado zoom (tornado.py) or a cyclone (eyenest.py)."""
+    k = str(pin)
+    if k.startswith("cyclone"):
+        return f"cyclone {k[len('cyclone'):]}"
+    return "the vortex core" if k == "core" else "the tornado zoom"
+
+
 class Nests:
     """The engine's nests: placement, the per-step FORCE / sub-steps / FEEDBACK, radar holes."""
 
@@ -533,7 +541,7 @@ class Nests:
             n.pin = pin
             self.items.append(n)
             on = (f"storm {track_id}" if self.parent is None else f"the mesocyclone in nest {track_id}") if pin is None \
-                else "the tornado zoom"
+                else _pin_label(pin)
             self.engine.note("nest", f"nest {p.id}: {self.env.grid.label} grid, {pr.nx * self.base.grid.dx / 1000:.0f} km "
                                      f"a side, on {on}{why}")
         n.placed_at = self.engine.t
@@ -674,7 +682,7 @@ class Nests:
         """A nest centred on every pin of this level (re-placed when the pin is REPLACE_PIN of its side off);
         a pinned nest whose pin is gone is dropped."""
         for n in [n for n in self.items if n.pin is not None and n.pin not in self.pins]:
-            self.drop(n, "the tornado zoom was removed")
+            self.drop(n, f"{_pin_label(n.pin)}: no longer there")
         side = self._side_cells() * self.base.grid.dx
         for key, (x, y) in list(self.pins.items()):
             n = next((m for m in self.items if m.pin == key), None)

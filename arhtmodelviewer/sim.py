@@ -98,10 +98,12 @@ DEFAULT_SETTINGS = {
     # hurricane mode (hurricane.py): the sea under the run -- a procedural SST map (seed, offset C), the sea's
     # drag, evaporation and heat, a mixed-layer cold wake (mld m) -- in a fixed domain_km x domain_km_y domain on
     # the cyclone; "core_pushes": updraft pushes near the core every push_every_min until push_until_kt
-    # (genesis sooner); "cyclones": the surface lows (seed vortices) placed for the next run
+    # (genesis sooner); "nest_dx" (m, 0 off) / "nest_km": a finer box kept on each cyclone (eyenest.py);
+    # "cyclones": the surface lows (seed vortices) placed for the next run
     "hurricane": {"on": False, "sst_seed": 1, "sst_offset": 0.0, "wake": True, "mld": 50.0, "domain_km": 900.0,
                   "domain_km_y": 900.0,
-                  "core_pushes": True, "push_every_min": 10.0, "push_until_kt": 64.0, "ambient": 0.3},
+                  "core_pushes": True, "push_every_min": 10.0, "push_until_kt": 64.0, "ambient": 0.3,
+                  "nest_dx": 0.0, "nest_km": 250.0},
     "cyclones": [],
     "engine": {"steady_environment": True},
 }
@@ -456,6 +458,7 @@ class Simulation:
             s["seed"] = random.SystemRandom().randrange(1, 2 ** 31)   # a new outbreak every run (kept in settings.json)
         self._rng = random.Random(int(s["seed"]))
         self.cyclones: list[dict] = []          # hurricane mode: the tracked surface lows (_cyclones_step)
+        self._cyc_nest_failed = False           # the hurricane nests asked for could not be built (said once)
         self._next_cyclone = 0.0
         self._line_last = {}
         self._next_latch = 0.0
@@ -928,7 +931,7 @@ class Simulation:
     # for the next run)
     SETTINGS_COMMANDS = ("add_radar", "remove_radar", "plan_nudger", "remove_nudger_plan", "add_boundary",
                          "update_boundary", "remove_boundary", "set_auto", "set_low", "speed", "frame_interval",
-                         "radar_refine", "grid_motion")
+                         "radar_refine", "grid_motion", "cyclone_nest")
 
     def _handle(self, name, kw):
         if name == "add_storm":
@@ -970,6 +973,9 @@ class Simulation:
             if self.engine.tornado is None:
                 raise ValueError("no tornado zoom for a vortex core")
             self.engine.tornado.set_core(bool(kw.get("on")), kw.get("dx"), kw.get("km"))
+            self._frame_now = True
+        elif name == "cyclone_nest":
+            self._cyclone_nests_set(kw)
             self._frame_now = True
         elif name == "tornado_clear":
             self.engine.tornado_clear()
@@ -1912,6 +1918,47 @@ class Simulation:
                 lead = c
         if lead is not None:
             eng.hold_point = (lead["x"], lead["y"], 150000.0)
+        self._cyclone_nests_step()
+
+    def _cyclone_nests_step(self) -> None:
+        """The hurricane nests asked for (hurricane nest_dx, nest_km): built once a cyclone has a fix, then each
+        cyclone's box onto its newest fix."""
+        eng = self.engine
+        hc = self._hurricane()
+        want = float(hc.get("nest_dx") or 0.0)
+        if want <= 0.0:
+            return
+        if eng.cyc_nests is None:
+            if self._cyc_nest_failed or not any(c["active"] and c["track"] for c in self.cyclones):
+                return
+            try:
+                eng.cyclone_nests(want, float(hc.get("nest_km") or 250.0))
+            except ValueError as exc:
+                self._cyc_nest_failed = True
+                eng.note("nest", f"hurricane nests not placed: {exc}")
+                return
+        eng.cyc_nests.follow(self.cyclones)
+
+    def _cyclone_nests_set(self, kw: dict) -> None:
+        """The page changed the hurricane nests during the run: off (dx 0), or about dx m with a km box."""
+        if not self._hurricane().get("on"):
+            raise ValueError("hurricane nests are for hurricane runs (Tropics tab)")
+        dx = max(0.0, float(kw.get("dx") or 0.0))
+        km = float(kw.get("km") or 250.0)
+        h = dict(self.settings.get("hurricane") or {})
+        h.update(nest_dx=dx, nest_km=km)
+        self.settings["hurricane"] = h
+        self._cyc_nest_failed = False
+        eng = self.engine
+        if dx <= 0.0:
+            eng.cyclone_nests(0.0, km)
+            return
+        if not any(c["active"] and c["track"] for c in self.cyclones):
+            eng.cyclone_nests(0.0, km)
+            eng.note("nest", "hurricane nests asked for: they go on once a cyclone has been fixed")
+            return
+        eng.cyclone_nests(dx, km)
+        eng.cyc_nests.follow(self.cyclones)
 
     def _core_push(self, c: dict) -> None:
         """An updraft push in the cyclone (genesis sooner): 6-9 m/s for 15 min, 6-9 km wide, moving with it, on a

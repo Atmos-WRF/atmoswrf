@@ -26,6 +26,9 @@ const Trop = (() => {
     $('hurPush').checked = h.core_pushes !== false;
     $('hurPushEvery').value = h.push_every_min ?? 10;
     $('hurPushUntil').value = h.push_until_kt ?? 64;
+    $('hurNestOn').checked = (h.nest_dx || 0) > 0;
+    if (h.nest_dx > 0) $('hurNestDx').value = h.nest_dx;
+    $('hurNestKm').value = h.nest_km ?? 250;
     s.cyclones = s.cyclones || [];
     const tr = (s.sounding || {}).tropical;
     if (tr) {
@@ -33,6 +36,7 @@ const Trop = (() => {
                              ['tsShear', 'shear_kt'], ['tsShearFrom', 'shear_from']]) if (tr[k] !== undefined) $(id).value = tr[k];
     }
     domainInfo();
+    nestInfo();
     render();
   }
 
@@ -40,7 +44,57 @@ const Trop = (() => {
     return { on: $('hurOn').checked, sst_seed: Math.round(num('hurSeed', 1, 2 ** 31 - 1, 1)), sst_offset: num('hurOffset', -4, 3, 0),
       mld: num('hurMld', 10, 150, 50), domain_km: num('hurDomain', 200, 2400, 900),
       domain_km_y: num('hurDomainY', 200, 2400, 900), wake: $('hurWake').checked, ambient: num('hurAmbient', 0, 1, 0.3),
-      core_pushes: $('hurPush').checked, push_every_min: num('hurPushEvery', 2, 60, 10), push_until_kt: num('hurPushUntil', 20, 140, 64) };
+      core_pushes: $('hurPush').checked, push_every_min: num('hurPushEvery', 2, 60, 10), push_until_kt: num('hurPushUntil', 20, 140, 64),
+      ...nestAsk() };
+  }
+
+  // the hurricane nest (eyenest.py): off (nest_dx 0) or about nest_dx m, a nest_km box
+  const nestAsk = () => ({ nest_dx: $('hurNestOn').checked ? num('hurNestDx', 250, 1000, 500) : 0, nest_km: num('hurNestKm', 60, 800, 250) });
+  // eyenest.plan: the 2-4x steps from the run's grid that land nearest the spacing asked (fewer when about as near)
+  function nestPlan(dx, want) {
+    let best = [], score = Math.abs(Math.log(dx / want));
+    const R = [4, 3, 2];
+    const walk = (rs, from) => {
+      if (rs.length) {
+        const d = dx / rs.reduce((a, b) => a * b, 1);
+        const s = Math.abs(Math.log(d / want)) + 0.04 * rs.length;
+        if (d >= 0.75 * 250 && s < score - 1e-9) { best = rs.slice(); score = s; }
+      }
+      if (rs.length < 4) for (let i = from; i < R.length; i++) walk(rs.concat([R[i]]), i);
+    };
+    walk([], 0);
+    return best;
+  }
+  function nestInfo() {
+    const live = S.run && S.run.tornado !== undefined && runActive() ? (S.run.cyclone_nests || null) : null;
+    const g = S.defaults && S.defaults.grids[$('grid').value];
+    const el = $('hurNestInfo');
+    if (!el) return;
+    if (live) {
+      el.textContent = `Running: ${live.levels.map(d => Math.round(d) + ' m').join(' → ')}, a ${Math.round(live.km)} km box on ` +
+        `${live.boxes.length} cyclone${live.boxes.length === 1 ? '' : 's'}.`;
+      return;
+    }
+    if (!$('hurNestOn').checked || !g) { el.textContent = ''; return; }
+    const rs = nestPlan(g.dx, num('hurNestDx', 250, 1000, 500));
+    if (!rs.length) { el.textContent = `The ${g.label} grid is already about that fine: no nest needed.`; return; }
+    const km = num('hurNestKm', 60, 800, 250), cb = (S.defaults.cell_bytes || 600) * 1.3;
+    let d = g.dx, bytes = 0;
+    const steps = [];
+    rs.forEach((r, k) => {
+      const side = km * 1.25 ** (rs.length - 1 - k), cells = Math.max(8, Math.ceil(side * 1000 / d / 4) * 4) * r;
+      bytes += cells * cells * g.nz * cb;
+      d /= r; steps.push(Math.round(d) + ' m');
+    });
+    el.textContent = `${g.label} → ${steps.join(' → ')}: about ${(bytes / 2 ** 30).toFixed(1)} GB of GPU memory per cyclone` +
+      (d < 400 ? ' (sub-400 m over a big box is slow: several times the domain’s cost)' : '') + '.';
+  }
+  async function nestLive() {
+    nestInfo();
+    if (!runActive() || !(S.run.settings.hurricane || {}).on) return;
+    const a = nestAsk();
+    try { await api('/api/run/cyclone/nest', { dx: a.nest_dx, km: a.nest_km }); }
+    catch (e) { alert('Hurricane nest: ' + e.message); }
   }
 
   const tropicalSpec = () => ({ tropical: { sst: num('tsSst', 24, 32, 29), rh_mid: num('tsRh', 20, 95, 70),
@@ -285,6 +339,7 @@ const Trop = (() => {
   // a live card follows its cyclone from poll to poll
   function onPoll() {
     render();
+    if (runActive()) nestInfo();
     if (cardId === null) return;
     const c = (cyclones() || []).find(q => q.id === cardId);
     if (c) card({ c, live: true }); else card(null);
@@ -297,7 +352,9 @@ const Trop = (() => {
       $('grid').dispatchEvent(new Event('change'));
       domainInfo();
     };
-    $('grid').addEventListener('change', domainInfo);
+    $('grid').addEventListener('change', () => { domainInfo(); nestInfo(); });
+    for (const id of ['hurNestOn', 'hurNestDx', 'hurNestKm']) $(id).onchange = nestLive;
+    for (const id of ['hurNestDx', 'hurNestKm']) $(id).addEventListener('input', nestInfo);
     $('hurShape').onchange = () => {
       const v = $('hurShape').value;
       if (!v) return;

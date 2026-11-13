@@ -1322,6 +1322,8 @@ class Handler(BaseHTTPRequestHandler):
                 sim.command("add_storm", **body)
             elif path == "/api/run/cyclone":
                 sim.command("add_cyclone", **body)
+            elif path == "/api/run/cyclone/nest":
+                sim.command("cyclone_nest", **body)
             elif path == "/api/run/radar":
                 sim.command("add_radar", **body)
             elif path == "/api/run/radar/remove":

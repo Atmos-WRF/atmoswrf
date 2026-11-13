@@ -406,6 +406,12 @@
         <label title="Shape presets">Shape <select id="hurShape"><option value="">Custom</option><option value="600x600">Small 600 km</option><option value="900x900">Standard 900 km</option><option value="1400x900">Wide 1400 x 900</option><option value="900x1400">Tall 900 x 1400</option><option value="1800x1200">Large 1800 x 1200</option></select></label>
       </div>
       <p id="hurDomainInfo" class="hint"></p>
+      <div class="row checks"><label title="A finer grid kept on each cyclone: a box of nests from the run's grid down to the spacing below, centred on the cyclone's lowest pressure and moved with it as the tracker fixes it (every minute of model time). It goes on once the low has been fixed, can be turned on, off or changed during the run (each change builds it again), and costs about as much again as the domain or more"><input id="hurNestOn" type="checkbox"> Hurricane nest on the cyclone</label></div>
+      <div class="row grid2">
+        <label title="The nest's grid spacing (250 m to 1 km). It is reached in steps of 2-4x from the run's grid, so it lands on the nearest step: the line below says which">Spacing (m) <input id="hurNestDx" type="number" min="250" max="1000" step="50" value="500"></label>
+        <label title="The finest box's side, centred on the cyclone (made smaller if the GPU memory left cannot hold it). Each coarser step around it is 1.25x bigger">Box (km) <input id="hurNestKm" type="number" min="60" max="800" step="10" value="250"></label>
+      </div>
+      <p id="hurNestInfo" class="hint"></p>
       <p class="hint">The dashed box on the map is where the domain starts, centred on the first surface low; it moves with the cyclone during the run.</p>
       <h3>Tropical sounding</h3>
       <div class="row grid2">

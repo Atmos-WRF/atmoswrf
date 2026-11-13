@@ -338,6 +338,7 @@ class Engine:
                 self.nests.inner = Nests(self, self.opt.refine_inner_ratio, self.opt.refine_inner_km,
                                          self.opt.refine_max, parent=self.nests)
         self.tornado = None                   # the tornado zoom (tornado.py): a box the user put on a vortex
+        self.cyc_nests = None                 # hurricane runs: finer boxes kept on the cyclones (eyenest.py)
 
     def tornado_box(self, x: float, y: float, size_km: float, detail: str = "high", core: bool = False,
                     core_dx: float | None = None, core_km: float | None = None) -> None:
@@ -345,6 +346,8 @@ class Engine:
         "high" (~110 m), "ultra" (~55 m), "extreme" (~37 m), "pc10" (~10 m) or "pc1" (~1 m), the finest on its own
         levels (tornado.DETAIL)."""
         from .tornado import TornadoZoom
+        if self.cyc_nests is not None:
+            raise ValueError("turn the hurricane nests off first (Tropics tab): the tornado zoom cannot go inside them")
         self.tornado_clear()
         self.tornado = TornadoZoom(self, x, y, size_km, detail, core=core, core_dx=core_dx, core_km=core_km)
 
@@ -352,6 +355,16 @@ class Engine:
         if self.tornado is not None:
             self.tornado.clear()
             self.tornado = None
+
+    def cyclone_nests(self, dx: float, km: float) -> None:
+        """Hurricane nests (eyenest.py) of about ``dx`` m (250-1000), a box of ``km`` on each cyclone; dx 0: off.
+        A new spacing or box builds them again."""
+        if self.cyc_nests is not None:
+            self.cyc_nests.clear()
+            self.cyc_nests = None
+        if dx and dx > 0:
+            from .eyenest import CycloneNests
+            self.cyc_nests = CycloneNests(self, dx, km)
 
     def nest_patches(self) -> list:
         """The refinement nests' patches, every level (none without nests)."""
@@ -2197,6 +2210,7 @@ class Engine:
             "nudgers": [n.to_json() for n in self.nudgers],
             "nests": self.nests.to_json() if self.nests else [],
             "tornado": self.tornado.to_json() if self.tornado is not None else None,
+            "cyclone_nests": self.cyc_nests.to_json() if self.cyc_nests is not None else None,
             "large_scale": self.ls.describe() if self.ls is not None else None,
             "grid_motion": list(self.env.motion),
             "follow": ({"every": self.opt.follow_interval, "next": self._next_follow,

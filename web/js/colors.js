@@ -73,6 +73,19 @@ if (window.IR_TT) {
   DEFAULT_PALETTES.ir = { units: '°C', stops: [{ v: -120, c: hex(IR_TT[0]) }]
     .concat(IR_TT.map((h, i) => ({ v: -90 + 0.5 * i, c: hex(h) }))) };
 }
+// built-in alternatives offered in the colour-table menu (app.js fillPaletteSelect), by family: the IR in College of
+// DuPage's table (codir.js: their colorbars/ir.png sampled every 0.5 K, 163-330 K; the same as GOESPainter's)
+const BUILTIN_PALETTES = { ir: [] };
+if (DEFAULT_PALETTES.ir) BUILTIN_PALETTES.ir.push({ key: 'builtin:ir-tt', name: 'Tropical Tidbits IR', pal: DEFAULT_PALETTES.ir });
+if (window.CODIR) {
+  const C = window.CODIR, n = C.rgb.length / 3, stops = [];
+  for (let i = 0; i < n; i++) {
+    const c = [C.rgb[3 * i], C.rgb[3 * i + 1], C.rgb[3 * i + 2], 255];
+    if (!i) stops.push({ v: -150, c });                    // held flat past the coldest end
+    stops.push({ v: C.k0 + C.step * i - 273.15, c });
+  }
+  BUILTIN_PALETTES.ir.push({ key: 'builtin:ir-cod', name: 'College of DuPage IR', pal: { units: '°C', stops } });
+}
 DEFAULT_PALETTES.sst = { units: '°C', stops: [
   { v: 0, c: [40, 20, 90, 255] }, { v: 10, c: [40, 70, 180, 255] }, { v: 18, c: [40, 150, 220, 255] },
   { v: 22, c: [60, 200, 190, 255] }, { v: 25, c: [120, 210, 90, 255] }, { v: 26.5, c: [235, 230, 60, 255] },
@@ -169,4 +182,4 @@ function legendGradient(pal, lo, hi, n = 64) {
   return out;
 }
 
-window.Colors = { DEFAULT_PALETTES, PRODUCT_PALETTE, PAL_FAMILY, buildLUT, adaptGR, colorAt, legendGradient };
+window.Colors = { DEFAULT_PALETTES, BUILTIN_PALETTES, PRODUCT_PALETTE, PAL_FAMILY, buildLUT, adaptGR, colorAt, legendGradient };

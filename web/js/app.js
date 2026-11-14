@@ -896,6 +896,8 @@ function isRadarProduct(p) { return RADAR_PRODUCTS.some(r => r[0] === p); }
 async function paletteFor(product) {
   const fam = Colors.PRODUCT_PALETTE[product];
   const sel = $('palette').value;
+  const built = (Colors.BUILTIN_PALETTES[fam] || []).find(b => b.key === sel);
+  if (built) return built.pal;
   if (sel && sel !== 'default' && (Colors.PAL_FAMILY[fam] || []).length) {
     if (!S.palCache[sel]) {
       const pal = await getJSON('/api/palette?path=' + encodeURIComponent(sel));
@@ -912,13 +914,18 @@ function fillPaletteSelect() {
   const sel = $('palette'), cur = sel.value;
   sel.innerHTML = '';
   sel.add(new Option('Default colors', 'default'));
+  const built = Colors.BUILTIN_PALETTES[fam] || [];
+  for (const b of built) sel.add(new Option(b.name, b.key));
   for (const p of S.palettes) {
     if (!keys.length) break;
     if (p.product && !keys.includes(p.product)) continue;
     sel.add(new Option(p.name, p.path));
   }
-  sel.value = [...sel.options].some(o => o.value === cur) ? cur : 'default';
-  sel.disabled = !keys.length;
+  // a family with built-in tables (the IR) keeps its own choice (switching to reflectivity and back keeps it)
+  let want = cur;
+  if (built.length) { try { want = localStorage.getItem('pal.' + fam) || 'default'; } catch (e) { want = 'default'; } }
+  sel.value = [...sel.options].some(o => o.value === want) ? want : 'default';
+  sel.disabled = !keys.length && !built.length;
 }
 
 // One frame request at a time.  A change made while one loads (another product, radar, color table
@@ -2004,7 +2011,11 @@ function bindUI() {
   };
   $('product').onchange = () => { S.product = $('product').value; fillPaletteSelect(); showFrame(); };
   $('radarSel').onchange = () => { S.radar = $('radarSel').value; showFrame(); };
-  $('palette').onchange = () => showFrame();
+  $('palette').onchange = () => {
+    const fam = Colors.PRODUCT_PALETTE[S.product];
+    if ((Colors.BUILTIN_PALETTES[fam] || []).length) { try { localStorage.setItem('pal.' + fam, $('palette').value); } catch (e) { /* not kept */ } }
+    showFrame();
+  };
   $('smooth').onchange = () => {
     if (map.raster) map.raster.smooth = $('smooth').checked;
     if (map.ppi) { map.ppi.smooth = $('smooth').checked; map._ppiCache = null; }

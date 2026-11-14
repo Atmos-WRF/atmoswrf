@@ -976,6 +976,9 @@ function packedToRaster(buf, pal) {
   const { header, data } = unpack(buf);
   const [scale, offset] = header.codec;
   const lut = Colors.buildLUT(pal, scale, offset);
+  // the band outlines look across a patch's edge into the patch next to it (the EF swath's world-fixed tiles, at
+  // different spacings): a tile seam inside a band is no edge
+  const across = pal.edges ? nextPatchCodes(header.patches, data) : null;
   const patches = header.patches.map(p => {
     const codes = data.subarray(p.offset, p.offset + p.nx * p.ny);
     const cv = document.createElement('canvas');
@@ -990,16 +993,29 @@ function packedToRaster(buf, pal) {
         img.data[o] = lut[c]; img.data[o + 1] = lut[c + 1]; img.data[o + 2] = lut[c + 2]; img.data[o + 3] = lut[c + 3];
       }
     }
-    if (pal.edges) bandEdges(img.data, codes, p.nx, p.ny, pal, scale, offset);
+    if (pal.edges) bandEdges(img.data, codes, p.nx, p.ny, pal, scale, offset, (i, j) => across(p, i, j));
     g.putImageData(img, 0, 0);
     return { x0: p.x0 / 1000, y0: p.y0 / 1000, x1: p.x1 / 1000, y1: p.y1 / 1000, nx: p.nx, ny: p.ny, canvas: cv, codes };
   });
   return { header, patches, scale, offset };
 }
 
+// the code at pixel (i, j) of patch p when that is outside it: from the patch that holds that point, 0 if none
+function nextPatchCodes(list, data) {
+  return (p, i, j) => {
+    const x = p.x0 + (i + 0.5) * (p.x1 - p.x0) / p.nx, y = p.y0 + (j + 0.5) * (p.y1 - p.y0) / p.ny;
+    for (const q of list) {
+      if (q === p || x < q.x0 || x >= q.x1 || y < q.y0 || y >= q.y1) continue;
+      const a = Math.floor((x - q.x0) / (q.x1 - q.x0) * q.nx), b = Math.floor((y - q.y0) / (q.y1 - q.y0) * q.ny);
+      return data[q.offset + b * q.nx + a];
+    }
+    return 0;
+  };
+}
+
 // a banded palette's outlines (the EF swath): a pixel of a band next to a weaker one (or to nothing) goes white,
-// as on a damage survey's EF map
-function bandEdges(px, codes, nx, ny, pal, scale, offset) {
+// as on a damage survey's EF map; ``outside(i, j)``: the code past the patch's edge (its neighbour's), else nothing
+function bandEdges(px, codes, nx, ny, pal, scale, offset, outside) {
   const band = new Int8Array(256);
   for (let c = 1; c < 256; c++) {
     const v = (c - offset) / scale;
@@ -1007,7 +1023,7 @@ function bandEdges(px, codes, nx, ny, pal, scale, offset) {
     for (const s of pal.stops) if (v >= s.v) b++;
     band[c] = b;
   }
-  const at = (i, j) => (i < 0 || j < 0 || i >= nx || j >= ny) ? 0 : band[codes[j * nx + i]];
+  const at = (i, j) => (i < 0 || j < 0 || i >= nx || j >= ny) ? (outside ? band[outside(i, j)] : 0) : band[codes[j * nx + i]];
   for (let j = 0; j < ny; j++) {
     for (let i = 0; i < nx; i++) {
       const b = band[codes[j * nx + i]];

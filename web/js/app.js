@@ -958,7 +958,8 @@ async function drawFrame() {
       map.setPPI(null); S.ppiInfo = null;
       const buf = await (await api(`/api/frame?i=${i}&product=${product}`)).arrayBuffer();
       S.rasterInfo = packedToRaster(buf, pal);
-      map.setRaster({ patches: S.rasterInfo.patches, smooth: $('smooth').checked });
+      map.setRaster({ patches: S.rasterInfo.patches, smooth: $('smooth').checked,
+                      bg: product === 'ir' ? clearSky(S.rasterInfo, pal) : null });
       drawLegend(pal, Colors.PRODUCT_PALETTE[product]);
     }
   } catch (e) {
@@ -1011,6 +1012,23 @@ function nextPatchCodes(list, data) {
     }
     return 0;
   };
+}
+
+// the IR satellite's clear sky outside a run's grids: the colour of the grids' own edges (clear air round the storms
+// in a normal run's patches, the warm ground or sea) -- their median code; none for a hurricane run (one domain over
+// the sea, the base map round it)
+function clearSky(info, pal) {
+  if (S.run && S.run.settings && (S.run.settings.hurricane || {}).on) return null;
+  const edge = [];
+  for (const p of info.patches) {
+    const c = p.codes, nx = p.nx, ny = p.ny, step = Math.max(1, Math.floor((nx + ny) / 200));
+    for (let i = 0; i < nx; i += step) { edge.push(c[i], c[(ny - 1) * nx + i]); }
+    for (let j = 0; j < ny; j += step) { edge.push(c[j * nx], c[j * nx + nx - 1]); }
+  }
+  const ok = edge.filter(c => c > 0).sort((a, b) => a - b);
+  if (!ok.length) return null;
+  const rgba = Colors.colorAt(pal.stops, (ok[ok.length >> 1] - info.offset) / info.scale);
+  return rgba ? `rgba(${rgba[0]},${rgba[1]},${rgba[2]},${(rgba[3] ?? 255) / 255})` : null;
 }
 
 // a banded palette's outlines (the EF swath): a pixel of a band next to a weaker one (or to nothing) goes white,

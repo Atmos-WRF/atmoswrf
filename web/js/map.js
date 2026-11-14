@@ -280,6 +280,9 @@ class MapView {
     }
     // grid products
     if (this.raster) {
+      // bg: the product's own colour everywhere outside the grids (the IR satellite's clear sky round a run's
+      // storm patches), over the base map
+      if (this.raster.bg) { g.setTransform(dpr, 0, 0, dpr, 0, 0); g.fillStyle = this.raster.bg; g.fillRect(0, 0, W, H); }
       g.save(); g.setTransform(dpr * s, 0, 0, -dpr * s, dpr * ox, dpr * oy);
       g.imageSmoothingEnabled = !!this.raster.smooth;
       for (const p of this.raster.patches) {

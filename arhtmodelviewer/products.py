@@ -6,9 +6,12 @@ same convention the Level II moments use.
 """
 from __future__ import annotations
 
+import logging
 import zlib
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 # name: (scale, offset, units, label)
 CODECS = {
@@ -140,10 +143,14 @@ def patch_products(patch, fields=None) -> dict:
     rain = st._scratch.get("mp_rainnc") if hasattr(st, "_scratch") else None
     if rain is not None and rain.shape == (patch.rect.ny, patch.rect.nx):
         out["rain"] = _encode(cp.log2(1.0 + rain), "rain", rain > 0.05)
+    from . import hurricane
+    # the simulated IR satellite in every run (its anvils, overshooting tops and cold rings), not only hurricanes
+    try:
+        out["ir"] = _encode(hurricane.ir_brightness(patch), "ir")
+    except Exception:                                    # a state without what it needs: no IR, never no frame
+        log.debug("no IR for patch %s", patch.id, exc_info=True)
     ocean = getattr(env, "ocean", None)
     if ocean is not None:
-        from . import hurricane
-        out["ir"] = _encode(hurricane.ir_brightness(patch), "ir")
         sst, water = ocean.maps(patch, env.clock)
         out["sst"] = _encode(sst - 273.15, "sst", water)
         out["slp"] = _encode(hurricane.surface_pressure(env, st) / 100.0, "slp")

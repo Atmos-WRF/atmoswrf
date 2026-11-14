@@ -223,7 +223,7 @@ def _sounding_payload(s: snd.Sounding) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Atmos-WRF/2.1"
+    server_version = "Atmos-WRF/2.2"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):

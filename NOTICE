@@ -39,3 +39,5 @@ Chase mode:
   tiles ((c) OpenMapTiles, data (c) OpenStreetMap contributors, ODbL); AWS Terrain Tiles (Mapzen terrarium: SRTM,
   GMTED, NED, ETOPO and others); NAIP and Sentinel-2 imagery and USDA Cropland Data Layer through Microsoft's
   Planetary Computer; ESA WorldCover (CC BY 4.0); Poly Haven textures (CC0).
+- Satellite IR colour tables (web/js/irtable.js, web/js/codir.js): sampled from the colour bars published with
+  Tropical Tidbits' and the College of DuPage's satellite imagery, so the simulated IR reads like theirs.

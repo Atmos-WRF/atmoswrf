@@ -1,3 +1,16 @@
+# Atmos-WRF 2.2
+
+**New:** vortex core for the tornado zoom (a ~10 or ~20 m grid that follows the vortex, box size on the toolbar), tornado 3-D view updated twice a second, hurricane nests (a 250 m - 1 km box kept on each tracked cyclone, Tropics tab), simulated IR satellite in every run (not only hurricanes), College of DuPage IR colour table, updates by reloading the page (Ctrl+F5 restarts Atmos-WRF on new code), chase tornado dust slider
+
+**Changed:** EF swath drawn at the finest grid's own spacing where the strongest winds are (10 m under a vortex core), tornado zoom detail changes keep the levels they share, faster nested steps, chase tornado dust kept low as a skirt under the funnel, probe car models load for friends
+
+**Fixed:**
+- a box edge in the clouds where a nest sits inside another (plainest frontlit), in the 3-D view and chase mode
+- rhythmic lag while driving in chase mode
+- white lines across the EF swath at tile seams
+- the 3-D view stuck on Loading during long model steps
+- moving nests drawn where they were, not where they are, in chase mode
+
 # Atmos-WRF 2.1
 
 **New:** tornado detection by vortex strength (200 m and finer grids, nests and the tornado zoom), EF swath map, purely simulated velocities on nests and the tornado zoom, sounding pockets (multiple soundings blended across the map), rectangular, elliptical and hand-drawn fixed domains, southern-hemisphere storms, map re-centred on far-off storms, AMD GPU support (ROCm on Linux / WSL2), mesonet probe chase vehicles (SUV, pickup, sedan, minivan), chase lightning and player-tag settings, cinematic view (V), tornado dust cloud in chase mode
